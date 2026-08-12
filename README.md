@@ -99,10 +99,13 @@ grok --trust
 **Pi**
 
 ```sh
+npm install -g @earendil-works/pi-coding-agent
 pi
 # or, when the signed wrapper is installed
 FM_PI_HARNESS=pi-signed pi-signed
 ```
+
+Pi's npm package is [`@earendil-works/pi-coding-agent`](https://github.com/earendil-works/pi), which provides the `pi` executable; the older `@mariozechner/pi-coding-agent` name is stale and should not be installed.
 
 For Grok, `--trust` is needed once per clone so project hooks and the turn-end guard load; `/hooks-trust` inside Grok works too.
 For Pi, approve the project trust prompt once per clone on first launch so the tracked `.pi/extensions/*.ts` files auto-load.
