@@ -256,7 +256,7 @@ test_ship_mode_is_explicit_not_registry() {
   brief="$home/data/brief-explicit-a5/brief.md"
   grep -qx "Delivery contract: mode=no-mistakes" "$brief" \
     || fail "registered direct-PR posture overrode the explicit --mode"
-  assert_grep "Firstmate will then instruct you to run /no-mistakes" "$brief" \
+  assert_grep "you invoke /no-mistakes yourself once the work is committed" "$brief" \
     "explicit no-mistakes brief did not render the pipeline definition of done"
 
   # An unregistered project is not a blocker either, because nothing is looked up.
@@ -352,6 +352,95 @@ test_no_mistakes_dod_wording() {
   assert_grep "firstmate's authority check" "$brief" \
     "no-mistakes DOD lost the apostrophe prose that the structural fix makes parse-safe"
   pass "fm-brief.sh: no-mistakes DOD keeps its apostrophe prose, now parse-safe"
+}
+
+# A ship brief must define "done" exactly once. The no-mistakes scaffold used to
+# stop the worker at its implementation commit with an earlier `done: {summary}`
+# and wait for firstmate to relay "run /no-mistakes", so one generated document
+# named two done gates and every ship task paid a supervision round trip for a
+# reply whose only content was "start the pipeline". The single gate per mode is
+# the ready signal AGENTS.md section 7 describes, so pin the payload-carrying
+# `done:` instructions rather than any one sentence around them.
+test_ship_modes_declare_one_done_gate() {
+  local home id brief gates expect
+  home="$TMP_ROOT/one-done-gate-home"
+  mkdir -p "$home/data"
+  while IFS='|' read -r id expect; do
+    [ -n "$id" ] || continue
+    FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --mode "${id#brief-gate-}" >/dev/null 2>&1 \
+      || fail "$id: scaffold exited non-zero"
+    brief="$home/data/$id/brief.md"
+    # shellcheck disable=SC2016  # the backticks delimit the gate in the generated markdown
+    gates=$(grep -o '`done: [^`]*`' "$brief" | sort -u)
+    [ "$gates" = "$expect" ] \
+      || fail "$id: expected exactly one done gate <$expect>, got <$gates>"
+  done <<'ROWS'
+brief-gate-no-mistakes|`done: PR {url} checks green`
+brief-gate-direct-PR|`done: PR {url}`
+brief-gate-local-only|`done: ready in branch fm/brief-gate-local-only`
+ROWS
+
+  # The relay is gone, but every safety contract layered on the pipeline stays.
+  brief="$home/data/brief-gate-no-mistakes/brief.md"
+  assert_no_grep "instruct you to run /no-mistakes" "$brief" \
+    "no-mistakes brief reintroduced the firstmate relay before the pipeline"
+  assert_grep "start /no-mistakes as soon as your change is committed" "$brief" \
+    "no-mistakes brief lost the instruction to start the pipeline without a firstmate steer"
+  assert_grep "ask-user findings are never yours to answer: escalate to firstmate (rule 6) and stop" "$brief" \
+    "no-mistakes brief lost the ask-user escalate-and-stop contract"
+  assert_grep "Avoid \`--yes\`" "$brief" \
+    "no-mistakes brief lost the --yes prohibition"
+  assert_grep "You drive no-mistakes by responding to its gates, not by implementing fixes." "$brief" \
+    "no-mistakes brief lost the gate-driven pipeline contract"
+  assert_grep "Do not hand-edit, commit, or fix findings yourself while a run is active" "$brief" \
+    "no-mistakes brief lost the no-hand-edits-during-a-run contract"
+  pass "fm-brief.sh: each ship mode declares exactly one done gate"
+}
+
+# The relay removal is scoped to no-mistakes. direct-PR must still raise its own
+# PR without the pipeline, and local-only must still never push and never open a
+# PR, so pin both definitions of done whole rather than one clause each. The
+# expected bodies go to files through plain heredocs, never through the
+# `VAR=$(cat <<EOF ...)` class that test_no_heredoc_in_command_substitution
+# guards against: this file is in the stock-Bash-3.2 parse sweep too.
+test_faster_path_definitions_of_done_are_unchanged() {
+  local home id expected actual
+  home="$TMP_ROOT/faster-path-dod-home"
+  mkdir -p "$home/data"
+  expected="$TMP_ROOT/faster-path-dod-expected"
+  actual="$TMP_ROOT/faster-path-dod-actual"
+
+  cat > "$expected" <<'DOD'
+# Definition of done
+Delivery contract: mode=direct-PR
+This task ships **direct-PR**: you raise the PR yourself, without the no-mistakes pipeline.
+The task is complete only when committed on your branch.
+When it is implemented and committed, push your branch and open a PR with `gh-axi`, then append `done: PR {url}` to the status file and stop.
+Do NOT run /no-mistakes. The configured merge authority decides whether to merge the PR; firstmate relays the outcome.
+DOD
+  id=brief-dod-direct-PR
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --mode direct-PR >/dev/null 2>&1 \
+    || fail "$id: scaffold exited non-zero"
+  awk '/^# Definition of done$/ { seen = 1 } seen' "$home/data/$id/brief.md" > "$actual"
+  diff -u "$expected" "$actual" \
+    || fail "direct-PR definition of done changed"
+
+  cat > "$expected" <<'DOD'
+# Definition of done
+Delivery contract: mode=local-only
+This task ships **local-only**: no remote, no PR, no pipeline.
+The task is complete only when committed on your branch `fm/brief-dod-local-only`. Do NOT push, do NOT open a PR, do NOT merge.
+Keep your branch a clean fast-forward onto the current default branch - if `main` has advanced, rebase onto it so the eventual merge stays a fast-forward.
+When it is implemented and committed, append `done: ready in branch fm/brief-dod-local-only` to the status file and stop.
+The configured merge authority approves the ready branch, then firstmate merges it into local `main` through the guarded fast-forward path.
+DOD
+  id=brief-dod-local-only
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --mode local-only >/dev/null 2>&1 \
+    || fail "$id: scaffold exited non-zero"
+  awk '/^# Definition of done$/ { seen = 1 } seen' "$home/data/$id/brief.md" > "$actual"
+  diff -u "$expected" "$actual" \
+    || fail "local-only definition of done changed"
+  pass "fm-brief.sh: direct-PR and local-only definitions of done are unchanged"
 }
 
 test_ship_project_memory_wording() {
@@ -719,6 +808,8 @@ test_ship_mode_is_explicit_not_registry
 test_delivery_flags_are_refused_where_they_do_not_apply
 test_faster_paths_use_configured_authority_without_stacked_review
 test_no_mistakes_dod_wording
+test_ship_modes_declare_one_done_gate
+test_faster_path_definitions_of_done_are_unchanged
 test_ship_project_memory_wording
 test_herdr_lab_contract_is_explicit_and_complete
 test_herdr_lab_contract_quotes_foreign_firstmate_path
