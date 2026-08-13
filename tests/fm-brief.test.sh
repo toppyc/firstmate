@@ -256,7 +256,7 @@ test_ship_mode_is_explicit_not_registry() {
   brief="$home/data/brief-explicit-a5/brief.md"
   grep -qx "Delivery contract: mode=no-mistakes" "$brief" \
     || fail "registered direct-PR posture overrode the explicit --mode"
-  assert_grep "you invoke /no-mistakes yourself once the work is committed" "$brief" \
+  assert_grep "you invoke the no-mistakes skill yourself, using your own harness's skill invocation form" "$brief" \
     "explicit no-mistakes brief did not render the pipeline definition of done"
 
   # An unregistered project is not a blocker either, because nothing is looked up.
@@ -384,8 +384,15 @@ ROWS
   brief="$home/data/brief-gate-no-mistakes/brief.md"
   assert_no_grep "instruct you to run /no-mistakes" "$brief" \
     "no-mistakes brief reintroduced the firstmate relay before the pipeline"
-  assert_grep "start /no-mistakes as soon as your change is committed" "$brief" \
+  assert_grep "start the no-mistakes skill as soon as your change is committed" "$brief" \
     "no-mistakes brief lost the instruction to start the pipeline without a firstmate steer"
+  # The brief is harness-agnostic (fm-brief.sh takes no harness input), so the
+  # actionable self-start must not hardcode claude's `/<skill>` form: codex
+  # rejects it as "Unrecognized command", and opencode and pi have no verified
+  # skill form at all. harness-adapters owns the per-harness table; the brief
+  # only names the form neutrally and allows the natural-language fallback.
+  assert_grep "Natural language is acceptable if you are uncertain of your harness's exact skill invocation form" "$brief" \
+    "no-mistakes brief lost the harness-neutral invocation fallback"
   assert_grep "ask-user findings are never yours to answer: escalate to firstmate (rule 6) and stop" "$brief" \
     "no-mistakes brief lost the ask-user escalate-and-stop contract"
   assert_grep "Avoid \`--yes\`" "$brief" \

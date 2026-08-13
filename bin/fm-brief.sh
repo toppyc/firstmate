@@ -384,8 +384,9 @@ EOF
     IFS= read -r -d '' DOD <<EOF || true
 # Definition of done
 Delivery contract: mode=no-mistakes
-This task ships **no-mistakes**: you invoke /no-mistakes yourself once the work is committed, and drive it through to a green PR.
-Committing is a prerequisite, not the finish line - start /no-mistakes as soon as your change is committed, rather than reporting done and waiting for firstmate to tell you to.
+This task ships **no-mistakes**: once your work is committed you invoke the no-mistakes skill yourself, using your own harness's skill invocation form, and drive it through to a green PR.
+Committing is a prerequisite, not the finish line - start the no-mistakes skill as soon as your change is committed, rather than reporting done and waiting for firstmate to tell you to.
+Natural language is acceptable if you are uncertain of your harness's exact skill invocation form.
 This mode has exactly one \`done:\` gate, the terminal one at the end of this section; the implementation commit is at most a \`working:\` line under rule 4.
 
 You drive no-mistakes by responding to its gates, not by implementing fixes.
