@@ -425,7 +425,7 @@ The task is complete only when committed on your branch.
 When it is implemented and committed, push your branch and open a PR with `gh-axi`, then append `done: PR {url}` to the status file and stop.
 Do NOT run /no-mistakes. The configured merge authority decides whether to merge the PR; firstmate relays the outcome.
 DOD
-  id=brief-dod-direct-PR
+  id="brief-dod-direct-PR"
   FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --mode direct-PR >/dev/null 2>&1 \
     || fail "$id: scaffold exited non-zero"
   awk '/^# Definition of done$/ { seen = 1 } seen' "$home/data/$id/brief.md" > "$actual"
@@ -441,7 +441,7 @@ Keep your branch a clean fast-forward onto the current default branch - if `main
 When it is implemented and committed, append `done: ready in branch fm/brief-dod-local-only` to the status file and stop.
 The configured merge authority approves the ready branch, then firstmate merges it into local `main` through the guarded fast-forward path.
 DOD
-  id=brief-dod-local-only
+  id="brief-dod-local-only"
   FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --mode local-only >/dev/null 2>&1 \
     || fail "$id: scaffold exited non-zero"
   awk '/^# Definition of done$/ { seen = 1 } seen' "$home/data/$id/brief.md" > "$actual"
