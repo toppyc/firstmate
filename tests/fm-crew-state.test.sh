@@ -342,6 +342,83 @@ run:
 EOF
 }
 
+# --- advanced-pipeline-head fixtures ----------------------------------------
+
+# A commit the PIPELINE made on top of this worktree's HEAD in its own gate
+# clone and has not pushed back, so the crew's worktree does not hold the object
+# at all. That is the ordinary shape of a healthy no-mistakes fix round ("the
+# pipeline head has moved but has not been successfully pushed"), not a
+# corrupted repo. Sets PIPELINE_HEAD, and fails loudly if the fixture ever stops
+# being unresolvable locally so none of these cases can pass vacuously.
+PIPELINE_HEAD=""
+make_unpushed_pipeline_head() {  # <case-dir>
+  local d=$1 branch
+  branch=$(git -C "$d/wt" symbolic-ref --quiet --short HEAD)
+  [ -n "$branch" ] || fail "pipeline-head fixture needs a checked-out branch"
+  git -C "$d" clone -q "$d/wt" "$d/gate"
+  git -C "$d/gate" checkout -q "$branch"
+  git -C "$d/gate" commit -q --allow-empty -m 'pipeline fix round'
+  PIPELINE_HEAD=$(git -C "$d/gate" rev-parse HEAD)
+  if git -C "$d/wt" rev-parse --verify --quiet "${PIPELINE_HEAD}^{commit}" >/dev/null 2>&1; then
+    fail "fixture is vacuous: the pipeline head already resolves in the crew worktree"
+  fi
+}
+
+# Mid-fix-round shape: the run's own head has advanced past the head the crew
+# submitted, and both identities are reported.
+run_running_advanced_head() {  # <branch> <pipeline-head> <submitted-head>
+  cat <<EOF
+run:
+  id: "01M0EMJBH0YTEDJB8VPZC61X7P"
+  branch: $1
+  status: running
+  head: "$2"
+  submitted_head: "$3"
+  pr: ""
+  findings: none
+  steps[2]{step,status,findings,duration_ms}:
+    review,completed,2,0
+    test,running,0,0
+EOF
+}
+
+# Same run, rendered with dotted branch-sync keys instead of a bare
+# submitted_head line.
+run_running_advanced_head_dotted() {  # <branch> <pipeline-head> <submitted-head>
+  cat <<EOF
+run:
+  id: "01DOTTED"
+  branch: $1
+  status: running
+  head: "$2"
+  pr: ""
+  findings: none
+branch_sync:
+  state: pipeline_owned
+  pipeline.submitted_head: "$3"
+  pipeline.current_head: "$2"
+  note: the pipeline head has moved but has not been successfully pushed
+EOF
+}
+
+# A run reporting only an unreachable head, alongside a local.head key carrying
+# the WORKTREE's own head. Nothing here binds the run to this crew.
+run_running_unreachable_head_with_local_head() {  # <branch> <pipeline-head> <local-head>
+  cat <<EOF
+run:
+  id: "01LOCALHEAD"
+  branch: $1
+  status: running
+  head: "$2"
+  pr: ""
+  findings: none
+branch_sync:
+  state: pipeline_owned
+  local.head: "$3"
+  pipeline.current_head: "$2"
+EOF
+}
+
 # ---------------------------------------------------------------------------
 # (a) active run-step is authoritative
 test_active_run_is_authoritative() {
@@ -1309,6 +1386,185 @@ test_missing_run_head_falls_back_to_current_state() {
   pass "missing run head falls back instead of matching by branch"
 }
 
+# --- advanced pipeline head -------------------------------------------------
+#
+# The defect these pin: a no-mistakes run commits its fix rounds in the local
+# gate, so mid-round the run's own head is a commit this worktree has never
+# seen. Treating "I cannot resolve that object" the same as "that object proves
+# the run is not mine" discarded a demonstrably live run, and the crew then had
+# no current-state source at all - an idle pane is silent because the worker
+# correctly handed the round to the pipeline, and a status log ending in a
+# routine resolved: event is not a state. The lane read exactly like a worker
+# that had vanished, which is what wedge-escalated a healthy lane repeatedly.
+
+# The run the crew submitted is still binding while the pipeline head runs ahead
+# of it, so a live lane reports working even with an idle pane and a status log
+# whose last line is a decision-closing event.
+test_advanced_pipeline_head_still_reports_working() {
+  reset_fakes
+  local d local_head out
+  d=$(new_case advanced-head)
+  make_repo_on_branch "$d/wt" fm/feat-adv-head
+  local_head=$(git -C "$d/wt" rev-parse HEAD)
+  make_unpushed_pipeline_head "$d"
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/advhead.meta" "window=fm:fm-advhead" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'working: implementing\nneeds-decision: pick A or B\nresolved: firstmate chose A\n' > "$d/state/advhead.status"
+  FM_FAKE_AXI_STATUS="$(run_running_advanced_head fm/feat-adv-head "$PIPELINE_HEAD" "$local_head")"
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" advhead
+  out=$(run_crew_state "$d" advhead)
+  assert_contains "$out" "state: working" "live run with an advanced pipeline head reports working"
+  assert_contains "$out" "source: run-step" "advanced pipeline head stays run-step authoritative"
+  assert_not_contains "$out" "state: unknown" "a live advancing run is never sourceless"
+  pass "advanced pipeline head with an idle pane still reports working"
+}
+
+# Same binding through the dotted branch-sync rendering of the submitted head.
+test_advanced_pipeline_head_dotted_rendering_binds() {
+  reset_fakes
+  local d local_head out
+  d=$(new_case advanced-head-dotted)
+  make_repo_on_branch "$d/wt" fm/feat-adv-dotted
+  local_head=$(git -C "$d/wt" rev-parse HEAD)
+  make_unpushed_pipeline_head "$d"
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/advdotted.meta" "window=fm:fm-advdotted" "worktree=$d/wt" "kind=ship" "harness=claude"
+  FM_FAKE_AXI_STATUS="$(run_running_advanced_head_dotted fm/feat-adv-dotted "$PIPELINE_HEAD" "$local_head")"
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" advdotted
+  out=$(run_crew_state "$d" advdotted)
+  assert_contains "$out" "state: working" "dotted submitted head binds the live run"
+  assert_contains "$out" "source: run-step" "dotted submitted head stays run-step authoritative"
+  pass "dotted submitted-head rendering binds the same run"
+}
+
+# --- the staleness guard the code-identity check protects -------------------
+
+# An unreachable head is INDETERMINATE, never a free pass: with no submitted
+# head to bind, the run must not be attributed.
+test_unreachable_head_alone_is_not_attributed() {
+  reset_fakes
+  local d out
+  d=$(new_case unreachable-head)
+  make_repo_on_branch "$d/wt" fm/feat-unreach
+  make_unpushed_pipeline_head "$d"
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/unreach.meta" "window=fm:fm-unreach" "worktree=$d/wt" "kind=ship" "harness=claude"
+  FM_FAKE_AXI_STATUS="$(run_parked fm/feat-unreach | sed "s|^  head: .*|  head: \"$PIPELINE_HEAD\"|")"
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" unreach
+  out=$(run_crew_state "$d" unreach)
+  assert_not_contains "$out" "source: run-step" "an unreachable head alone must not attribute a run"
+  assert_not_contains "$out" "parked at" "an unattributed run must not report its gate as current"
+  assert_contains "$out" "not attributed" "the refusal names itself"
+  pass "an unreachable head alone does not attribute a run"
+}
+
+# The worktree's own head is not a run identity: binding on a local.head key
+# would make every run on the branch match and delete the guard entirely.
+test_local_head_key_never_binds_a_run() {
+  reset_fakes
+  local d local_head out
+  d=$(new_case local-head-key)
+  make_repo_on_branch "$d/wt" fm/feat-localhead
+  local_head=$(git -C "$d/wt" rev-parse HEAD)
+  make_unpushed_pipeline_head "$d"
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/localhead.meta" "window=fm:fm-localhead" "worktree=$d/wt" "kind=ship" "harness=claude"
+  FM_FAKE_AXI_STATUS="$(run_running_unreachable_head_with_local_head fm/feat-localhead "$PIPELINE_HEAD" "$local_head")"
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" localhead
+  out=$(run_crew_state "$d" localhead)
+  assert_not_contains "$out" "source: run-step" "a local.head key must never bind a run"
+  assert_contains "$out" "not attributed" "the refusal names itself"
+  pass "a local.head key never binds a run"
+}
+
+# Consulting the submitted head must not resurrect a superseded run: local work
+# that advanced past BOTH of a run's reported heads still invalidates it.
+test_stale_submitted_head_does_not_resurrect_old_run() {
+  reset_fakes
+  local d old_head out
+  d=$(new_case stale-submitted-head)
+  make_repo_on_branch "$d/wt" fm/feat-stalesub
+  old_head=$(git -C "$d/wt" rev-parse HEAD)
+  git -C "$d/wt" commit -q --allow-empty -m 'local stage-2 work after that run'
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/stalesub.meta" "window=fm:fm-stalesub" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'working: stage 2 implementation in progress\n' > "$d/state/stalesub.status"
+  FM_FAKE_AXI_STATUS="$(run_running_advanced_head fm/feat-stalesub "$old_head" "$old_head")"
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" stalesub
+  out=$(run_crew_state "$d" stalesub)
+  assert_not_contains "$out" "source: run-step" "a superseded run must not be attributed via its submitted head"
+  assert_contains "$out" "state: working" "current state still comes from the live sources"
+  assert_contains "$out" "source: status-log" "the superseded run does not displace the current source"
+  assert_contains "$out" "not attributed" "the refusal is still visible on the verdict"
+  pass "an old submitted head does not resurrect a superseded run"
+}
+
+# The branch's newest listed run is its current one; an older terminal row must
+# not be reported as this crew's state just because its head still resolves
+# here while the live run has advanced beyond this worktree.
+test_older_terminal_row_does_not_outrank_live_advanced_run() {
+  reset_fakes
+  local d short_local short_pipe out
+  d=$(new_case newest-row-wins)
+  make_repo_on_branch "$d/wt" fm/feat-newest
+  short_local=$(git -C "$d/wt" rev-parse --short=7 HEAD)
+  make_unpushed_pipeline_head "$d"
+  short_pipe=$(printf '%s' "$PIPELINE_HEAD" | cut -c1-7)
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/newest.meta" "window=fm:fm-newest" "worktree=$d/wt" "kind=ship" "harness=claude"
+  FM_FAKE_AXI_STATUS="$(run_running fm/other-crew)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  running    fm/other-crew aaaaaaa  2026-08-20 10:10
+  running    fm/feat-newest ${short_pipe}  2026-08-20 10:05
+  failed     fm/feat-newest ${short_local}  2026-08-20 08:00
+EOF
+)"
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" newest
+  out=$(run_crew_state "$d" newest)
+  assert_not_contains "$out" "state: failed" "a superseded terminal row must not be reported as current"
+  assert_not_contains "$out" "source: run-step" "a superseded terminal row must not be attributed"
+  assert_contains "$out" "not attributed" "the newest row's refusal is reported"
+  pass "an older terminal row does not outrank the branch's newest run"
+}
+
+# --- a refused run is distinguishable from no run at all --------------------
+
+# Both used to read `unknown - source: none`, which is what sent a supervisor
+# acting on a deep-inspection demand to read `axi status` by hand.
+test_refused_run_is_distinguishable_from_no_run() {
+  reset_fakes
+  local d local_head refused vanished
+  d=$(new_case refused-vs-vanished)
+  make_repo_on_branch "$d/wt" fm/feat-refused
+  local_head=$(git -C "$d/wt" rev-parse HEAD)
+  make_unpushed_pipeline_head "$d"
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/refused.meta" "window=fm:fm-refused" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'resolved: firstmate chose A\n' > "$d/state/refused.status"
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" refused
+
+  FM_FAKE_AXI_STATUS="$(run_running_unreachable_head_with_local_head fm/feat-refused "$PIPELINE_HEAD" "$local_head")"
+  refused=$(run_crew_state "$d" refused)
+  assert_contains "$refused" "state: unknown" "a refused run still yields no usable state"
+  assert_contains "$refused" "source: run-unbound" "a refused run reports a source of its own"
+  assert_contains "$refused" "$PIPELINE_HEAD" "the refusal names the head it could not bind"
+
+  # Same crew, same idle pane and same log - but no run on this branch anywhere.
+  FM_FAKE_AXI_STATUS="$(run_running fm/other-crew)"
+  vanished=$(run_crew_state "$d" refused)
+  assert_contains "$vanished" "source: none" "a crew with no run of its own still reports no source"
+  assert_not_contains "$vanished" "not attributed" "no run means nothing was refused"
+  [ "$refused" != "$vanished" ] || fail "a refused run and a vanished crew must not read identically"
+  pass "a refused run is distinguishable from a crew with no run at all"
+}
+
 test_active_run_is_authoritative
 test_stale_needs_decision_superseded
 test_stale_blocked_superseded
@@ -1358,5 +1614,12 @@ test_historical_same_branch_rewritten_head_not_current
 test_active_run_descendant_fix_head_remains_current
 test_local_advanced_past_run_head_invalidates
 test_missing_run_head_falls_back_to_current_state
+test_advanced_pipeline_head_still_reports_working
+test_advanced_pipeline_head_dotted_rendering_binds
+test_unreachable_head_alone_is_not_attributed
+test_local_head_key_never_binds_a_run
+test_stale_submitted_head_does_not_resurrect_old_run
+test_older_terminal_row_does_not_outrank_live_advanced_run
+test_refused_run_is_distinguishable_from_no_run
 
 echo "all fm-crew-state tests passed"

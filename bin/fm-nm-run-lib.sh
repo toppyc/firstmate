@@ -71,3 +71,72 @@ fm_nm_head_matches_worktree() {  # <worktree> <run_head>
   [ "$run_full" = "$local_full" ] && return 0
   git -C "$wt" merge-base --is-ancestor "$local_full" "$run_full" 2>/dev/null
 }
+
+# --- run-object identity binding -------------------------------------------
+#
+# fm_nm_head_matches_worktree answers "does THIS head match" as a boolean,
+# which is all a caller needs when it is about to ACT on one head:
+# fm-teardown.sh's parked-run abort deliberately keeps using it, because an
+# unproven identity must stay a no there. A state READER needs two things that
+# boolean cannot carry.
+#
+# First, a run reports more than one head identity for itself. Once the
+# pipeline commits a fix round it advances the run's own head past the head the
+# crew submitted, and it commits those rounds in the local gate - "the pipeline
+# head has moved but has not been successfully pushed" - so the advanced head
+# is routinely an object the crew's worktree has never seen. no-mistakes' own
+# reattach rule is that a run still matches your HEAD "either as the submitted
+# head or as the current pipeline head" (its /no-mistakes skill), so both are
+# identities of the same run and either one binding is a bind.
+#
+# Second, failing to bind has two very different meanings. A head that resolves
+# here and does not match DISPROVES the run - a rewritten tip, or local work
+# that advanced past it - and that is the staleness guard, which must keep
+# rejecting. A head this worktree does not even have proves nothing either way.
+# Collapsing both into a bare "no" is what made a healthy advancing run read as
+# no current-state source at all.
+
+# The head identities a run object reports for itself, most authoritative
+# first: its current pipeline head, then the head the crew submitted. Tolerates
+# the nested and the dotted `pipeline.`-prefixed renderings, and optional
+# quoting. Deliberately never matches a `local.`-prefixed key: that reports the
+# WORKTREE's own head, so binding on it would make every run match and silently
+# delete the staleness guard.
+fm_nm_run_heads() {  # <toon-output>
+  local key
+  for key in head submitted_head; do
+    printf '%s\n' "$1" \
+      | sed -n -E "s/^[[:space:]]*(pipeline\\.)?${key}:[[:space:]]*\"?([0-9a-fA-F]{4,40})\"?[[:space:]]*\$/\\2/p" \
+      | head -1
+  done
+}
+
+# Three-way identity verdict for ONE reported head $2 against worktree $1:
+#   match       equal, or the worktree HEAD is an ancestor of it
+#   mismatch    resolves here and does not match: the run is DISPROVED
+#   unresolved  reported, but its object is not in this worktree: indeterminate
+#   absent      nothing reported
+fm_nm_head_verdict() {  # <worktree> <head>
+  local wt=$1 head=$2
+  [ -n "$head" ] || { printf 'absent'; return 0; }
+  git -C "$wt" rev-parse --verify --quiet "${head}^{commit}" >/dev/null 2>&1 \
+    || { printf 'unresolved'; return 0; }
+  if fm_nm_head_matches_worktree "$wt" "$head"; then printf 'match'; else printf 'mismatch'; fi
+}
+
+# Bind a whole run object (`axi status` TOON $2) to worktree $1. Echoes
+# "<verdict> <head>": match on the first reported head that binds, else the
+# verdict of the run's most authoritative reported head, else a bare "absent".
+# A caller may attribute the run ONLY on match; every other verdict is a reason
+# it can show instead of reporting no source at all.
+fm_nm_run_binding() {  # <worktree> <toon-output>
+  local wt=$1 head verdict first_verdict='' first_head=''
+  while IFS= read -r head; do
+    [ -n "$head" ] || continue
+    verdict=$(fm_nm_head_verdict "$wt" "$head")
+    [ "$verdict" = match ] && { printf 'match %s' "$head"; return 0; }
+    [ -n "$first_verdict" ] || { first_verdict=$verdict; first_head=$head; }
+  done <<< "$(fm_nm_run_heads "$2")"
+  [ -n "$first_verdict" ] || { printf 'absent'; return 0; }
+  printf '%s %s' "$first_verdict" "$first_head"
+}
