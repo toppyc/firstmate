@@ -449,6 +449,15 @@ pause_handover_recheck() {  # <window> <task>
 # callers that hand a pane back to wedge tracking on that crossing owe it one
 # pause_handover_recheck first, so a still-declared wait is confirmed before it is
 # alarmed on.
+#
+# The .paused-rechecked-<key> marker is owned exclusively by the classifications
+# that came from the crew state or a dead agent, because the shortcut it arms
+# (below) can only ever answer `paused` for an agent that is confidently DEAD. A
+# classification justified by the declaration's age must therefore leave the
+# marker alone: recording one would arm that shortcut for a LIVE agent, whose only
+# outcome there is `none`, and an honored pause would flip between absorbed and
+# unclassified on alternate polls. Age is cheap to re-derive, so this path simply
+# recomputes it every poll.
 pause_state_class() {  # <window> <task>
   local win=$1 task=$2 key last recheck_file class agent_alive declared_age
   key=${win//:/_}
@@ -479,7 +488,6 @@ pause_state_class() {  # <window> <task>
     # yields to wedge tracking rather than suppressing it.
     declared_age=$(status_declaration_age "$task")
     if [ -n "$declared_age" ] && [ "$declared_age" -lt "$PAUSE_RESURFACE_SECS" ]; then
-      date +%s > "$recheck_file"
       printf 'paused'
       return
     fi

@@ -1301,6 +1301,61 @@ test_lapsed_declared_pause_hands_over_with_one_recheck() {
   pass "a lapsing declared pause is handed back to wedge tracking with exactly one confirming recheck"
 }
 
+# Once absorbed, a pane must STAY on the bounded pause cadence for as long as its
+# declaration is current - including while the captured pane keeps moving, which
+# over a multi-hour wait it will (a ticking clock, a token counter, a redraw).
+# The incident's worker is LIVE, so this also pins that the absorb decision is
+# re-derived from the declaration on every poll rather than cached behind the
+# recheck marker, whose shortcut can only answer paused for a confidently DEAD
+# agent: cached, a live worker's honored pause alternates between absorbed and
+# unclassified, and an unclassified poll drops the pane off the cadence entirely.
+# The pane is established through real polls rather than by seeding its markers,
+# so the classifier is entered in the state it actually produces.
+test_current_declared_pause_survives_a_moving_pane_under_a_live_worker() {
+  local dir state fakebin out capture_file statusf window key sig pid i dropped
+  dir=$(make_case current-pause-moving-pane); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  window="test:fm-pause-moving"; statusf="$state/pause-moving.status"
+  printf 'idle pane, suite running elsewhere, tick 0\n' > "$capture_file"
+  printf 'window=%s\nkind=ship\nharness=claude\nbackend=tmux\n' "$window" > "$state/pause-moving.meta"
+  printf 'working: implementing\npaused: waiting on the backend suite\n' > "$statusf"
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-pause-moving_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+
+  # A claude pane command makes the agent probe report a LIVE agent, unlike the
+  # zsh (confidently dead) panes the fixtures above use.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=claude \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_STALE_ESCALATE_SECS=240 FM_PAUSE_RESURFACE_SECS=3600 FM_POLL=0.3 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  i=0
+  while [ "$i" -lt 100 ] && [ ! -e "$state/.paused-$key" ]; do sleep 0.1; i=$((i + 1)); done
+  [ -e "$state/.paused-$key" ] \
+    || { reap "$pid"; unset FM_FAKE_CREW_STATE; fail "a current declared pause never entered the bounded pause cadence: $(cat "$out")"; }
+
+  dropped=0; i=0
+  while [ "$i" -lt 24 ]; do
+    i=$((i + 1))
+    printf 'idle pane, suite running elsewhere, tick %s\n' "$i" > "$capture_file"
+    sleep 0.15
+    kill -0 "$pid" 2>/dev/null \
+      || { reap "$pid"; unset FM_FAKE_CREW_STATE; fail "a current declared pause with a moving pane surfaced: $(cat "$out")"; }
+    [ -e "$state/.paused-$key" ] || dropped=$((dropped + 1))
+  done
+  [ "$dropped" -eq 0 ] \
+    || { reap "$pid"; unset FM_FAKE_CREW_STATE; fail "a current declared pause was dropped off the bounded cadence on $dropped of $i polls while its worker stayed live"; }
+  if [ -s "$out" ]; then
+    grep -F "awaiting external" "$out" >/dev/null \
+      || { reap "$pid"; unset FM_FAKE_CREW_STATE; fail "a current declared pause was surfaced without the declared-pause wording: $(cat "$out")"; }
+  fi
+  reap "$pid"
+  unset FM_FAKE_CREW_STATE
+  pass "a current declared pause holds the bounded cadence across a moving pane under a live worker"
+}
+
 # --- consecutive wedge escalations on the same pane demand deep inspection ----
 # Root cause of the PR #252 incident's ~20 minutes of unnoticed green: each
 # wedge escalation fires, gets classified as "still validating" one poll later
@@ -2174,6 +2229,7 @@ test_paused_authoritative_working_preserves_wedge_timer
 test_current_declared_pause_absorbed_despite_prior_wedge_escalation
 test_stale_declared_pause_still_wedge_escalates
 test_lapsed_declared_pause_hands_over_with_one_recheck
+test_current_declared_pause_survives_a_moving_pane_under_a_live_worker
 test_nonterminal_stale_repairs_missing_or_corrupt_timer
 test_triage_log_size_cap_accepts_spaced_wc_counts
 test_procevent_captured_result_surfaces_proactively
