@@ -100,10 +100,8 @@ set_mtime() {  # <epoch> <file>
 # anchor: handle_paused_stale paces its recheck on it, and pause_state_class reads
 # it to decide whether a declared pause is still current.
 backdate_status() {  # <status-file> <secs>
-  local f=$1 secs=$2 back
-  back=$(( $(date +%s) - secs ))
-  if [ "$(uname)" = Darwin ]; then touch -mt "$(date -r "$back" '+%Y%m%d%H%M.%S')" "$f"
-  else touch -m -d "@$back" "$f"; fi
+  local f=$1 secs=$2
+  set_mtime "$(( $(date +%s) - secs ))" "$f"
 }
 
 # Signature a primed .seen-* marker must hold so the per-poll signal scan does not
@@ -1040,13 +1038,26 @@ test_nonterminal_paused_rechecks_authoritative_state() {
   : > "$state/.paused-$key"
   export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
 
+  # The pane leaves an honored declaration here, so it is owed exactly one paused
+  # handover recheck first. Spend it, then assert the guarantee this test exists
+  # for: from the poll after that, the authoritative run decides.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 \
+    FM_PAUSE_RESURFACE_SECS=3600 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || { reap "$pid"; unset FM_FAKE_CREW_STATE; fail "the lapsed declaration was not handed back with its one recheck: $(cat "$out")"; }
+  ack_stopped_cycle "$state" || { unset FM_FAKE_CREW_STATE; fail "could not acknowledge the intentional pause-handover stop"; }
+  : > "$out"
+
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 \
     FM_PAUSE_RESURFACE_SECS=3600 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
   if ! wait_live "$pid" 30; then
-    reap "$pid"; fail "an active run behind a stale declared pause surfaced instead of resuming wedge tracking: $(cat "$out")"
+    reap "$pid"; unset FM_FAKE_CREW_STATE
+    fail "an active run behind a stale declared pause surfaced instead of resuming wedge tracking: $(cat "$out")"
   fi
   [ ! -e "$state/.paused-$key" ] || { reap "$pid"; fail "authoritative active run retained paused mode"; }
   [ -s "$state/.stale-since-$key" ] || { reap "$pid"; fail "authoritative active run did not resume wedge tracking"; }
@@ -1073,6 +1084,17 @@ test_paused_authoritative_working_preserves_wedge_timer() {
   printf '1\n' > "$state/.count-$key"
   : > "$state/.paused-$key"
   export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+
+  # Spend the one paused handover recheck the pane is owed for leaving its
+  # declaration, so what follows exercises the wedge-timer guarantee itself.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 \
+    FM_PAUSE_RESURFACE_SECS=3600 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || { reap "$pid"; unset FM_FAKE_CREW_STATE; fail "the lapsed declaration was not handed back with its one recheck: $(cat "$out")"; }
+  ack_stopped_cycle "$state" || { unset FM_FAKE_CREW_STATE; fail "could not acknowledge the intentional pause-handover stop"; }
+  : > "$out"
 
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 \
@@ -1199,6 +1221,84 @@ test_stale_declared_pause_still_wedge_escalates() {
     || { unset FM_FAKE_CREW_STATE; fail "the stale-pause escalation was not queued"; }
   unset FM_FAKE_CREW_STATE
   pass "a stale declared pause still wedge-escalates, so a worker cannot mute the alarm by never re-declaring"
+}
+
+# The handover between the two directions above. A pane being absorbed on the
+# pause cadence whose declaration lapses is not silently promoted to a wedge: the
+# worker is never asked to re-declare (the status contract asks for sparse
+# reporting, and a rate-limit reset or upstream release routinely outlives the
+# window), so the crossing owes exactly one paused recheck that confirms the wait
+# before routine tracking resumes. Exactly one: the pause flag the recheck is
+# gated on is consumed by the same poll, so the alarm ladder is not muted by a
+# recheck that could recur forever.
+test_lapsed_declared_pause_hands_over_with_one_recheck() {
+  local dir state fakebin out drain_out capture_file statusf window key pane_hash sig pid since
+  dir=$(make_case lapsed-pause-handover); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
+  window="test:fm-pause-handover"; statusf="$state/pause-handover.status"
+  printf 'idle pane, suite running elsewhere\n' > "$capture_file"
+  printf 'window=%s\nkind=ship\nharness=claude\nbackend=tmux\n' "$window" > "$state/pause-handover.meta"
+  printf 'working: implementing\npaused: waiting on the backend suite\n' > "$statusf"
+  backdate_status "$statusf" 4000
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-pause-handover_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle pane, suite running elsewhere")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '2\n' > "$state/.count-$key"
+  printf '%s' "$pane_hash" > "$state/.stale-$key"
+  # Arrive mid-absorb: the pane is on the pause cadence, which is why no wedge
+  # timer and no escalation count are running. The declaration has just lapsed.
+  : > "$state/.paused-$key"
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+
+  # (i) one recheck, in the declared-pause register, never the wedge one.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=zsh \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_STALE_ESCALATE_SECS=240 FM_PAUSE_RESURFACE_SECS=3600 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || { reap "$pid"; unset FM_FAKE_CREW_STATE; fail "a lapsing declaration was handed over with no recheck at all"; }
+  grep -F "awaiting external" "$out" >/dev/null || { unset FM_FAKE_CREW_STATE; fail "the handover was not worded as a declared-pause recheck: $(cat "$out")"; }
+  grep -F "confirm the wait still holds" "$out" >/dev/null || { unset FM_FAKE_CREW_STATE; fail "the handover recheck did not ask for the wait to be confirmed: $(cat "$out")"; }
+  grep -F "possible wedge" "$out" >/dev/null && { unset FM_FAKE_CREW_STATE; fail "the handover opened with wedge wording instead of a paused recheck"; }
+  [ ! -e "$state/.paused-$key" ] || { unset FM_FAKE_CREW_STATE; fail "the handover left the pause flag set, so it can fire again"; }
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || { unset FM_FAKE_CREW_STATE; fail "drain after the handover recheck failed"; }
+  grep "$(printf '\tstale\t')" "$drain_out" | grep -F "$window" >/dev/null \
+    || { unset FM_FAKE_CREW_STATE; fail "the handover recheck was not queued"; }
+  ack_stopped_cycle "$state" || { unset FM_FAKE_CREW_STATE; fail "could not acknowledge the intentional handover stop"; }
+
+  # (ii) the same still-declared, still-lapsed status does not buy a second one:
+  # the pane resumes routine wedge tracking instead.
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=zsh \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_STALE_ESCALATE_SECS=999 FM_PAUSE_RESURFACE_SECS=3600 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_numeric_file "$state/.stale-since-$key" 30 \
+    || { reap "$pid"; unset FM_FAKE_CREW_STATE; fail "the handover did not resume wedge tracking: $(cat "$out")"; }
+  since=$(cat "$state/.stale-since-$key")
+  wait_live "$pid" 20 || { reap "$pid"; unset FM_FAKE_CREW_STATE; fail "the handover recheck repeated on a later cycle: $(cat "$out")"; }
+  [ -z "$(cat "$out")" ] || { reap "$pid"; unset FM_FAKE_CREW_STATE; fail "the handover recheck repeated on a later cycle: $(cat "$out")"; }
+  reap "$pid"
+  ack_stopped_cycle "$state" || { unset FM_FAKE_CREW_STATE; fail "could not acknowledge the intentional wedge-tracking stop"; }
+
+  # (iii) and the ladder behind it is unchanged: the wait was confirmed, not
+  # granted, so the pane still escalates once the timer crosses the threshold.
+  echo $(( since - 500 )) > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=zsh \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_STALE_ESCALATE_SECS=240 FM_PAUSE_RESURFACE_SECS=3600 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || { reap "$pid"; unset FM_FAKE_CREW_STATE; fail "the pane never escalated after its handover recheck"; }
+  grep -F "possible wedge" "$out" >/dev/null || { unset FM_FAKE_CREW_STATE; fail "the post-handover escalation omitted the wedge wording: $(cat "$out")"; }
+  unset FM_FAKE_CREW_STATE
+  pass "a lapsing declared pause is handed back to wedge tracking with exactly one confirming recheck"
 }
 
 # --- consecutive wedge escalations on the same pane demand deep inspection ----
@@ -2073,6 +2173,7 @@ test_nonterminal_paused_rechecks_authoritative_state
 test_paused_authoritative_working_preserves_wedge_timer
 test_current_declared_pause_absorbed_despite_prior_wedge_escalation
 test_stale_declared_pause_still_wedge_escalates
+test_lapsed_declared_pause_hands_over_with_one_recheck
 test_nonterminal_stale_repairs_missing_or_corrupt_timer
 test_triage_log_size_cap_accepts_spaced_wc_counts
 test_procevent_captured_result_surfaces_proactively

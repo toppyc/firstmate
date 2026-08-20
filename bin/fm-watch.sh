@@ -394,6 +394,41 @@ clear_pause_tracking() {  # <window>
   rm -f "$STATE/.stale-$key" "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
 }
 
+# 0 iff <window> is about to LEAVE a declaration it was being absorbed under: the
+# pause flag is still set and <task>'s last status line still declares the wait,
+# so the only thing that changed is that the declaration went un-redeclared past
+# its window. Ask this BEFORE the caller clears the pause state, because that
+# clear is what consumes the flag, and that is what bounds the handover below to
+# exactly one per declaration.
+pause_handover_due() {  # <window> <task>
+  local win=$1 task=$2 key
+  key=${win//:/_}
+  key=${key//\//_}
+  key=${key//./_}
+  [ -e "$STATE/.paused-$key" ] || return 1
+  status_is_paused_or_captain_held "$(last_status_line "$STATE/$task.status")"
+}
+
+# The single recheck a pane owes on that crossing. The worker cannot be asked to
+# keep re-declaring a wait (the status contract asks for sparse reporting, and its
+# own examples - an upstream release, a rate-limit reset - routinely outlive the
+# window), so the watcher confirms the wait itself rather than opening with wedge
+# wording: this carries handle_paused_stale's sense, in the same terms the
+# away-mode daemon uses for the same state. The wait is confirmed, not granted -
+# the escalation ladder resumes from the next poll and reaches
+# demand-deep-inspection exactly as before. Wakes, and wake() exits the process,
+# so every state change the poll owes must already be persisted before this is
+# called; otherwise the flag is never consumed and the crossing re-fires forever.
+pause_handover_recheck() {  # <window> <task>
+  local win=$1 task=$2 age reason
+  age=$(status_declaration_age "$task")
+  [ -n "$age" ] || age=0
+  reason="stale: $win (paused ${age}s, awaiting external - a declared pause left un-redeclared past its recheck window, so routine stale tracking resumes; confirm the wait still holds)"
+  fm_wake_append stale "$win" "$reason" || exit 1
+  triage_log "handed a lapsed declared pause back to stale tracking (age ${age}s): $win"
+  wake "$reason"
+}
+
 # Reconcile a declared pause or captain-held status with authoritative crew state.
 # Only a confidently dead ordinary crew may recover paused classification after
 # fm-crew-state has fallen back to stopped or unknown.
@@ -410,7 +445,10 @@ clear_pause_tracking() {  # <window>
 # that long without being re-declared the working verdict takes over and wedge
 # tracking resumes. That keeps the guarantee this override exists for - one stale
 # `paused:` line can never mute a wedge indefinitely - on a bound the watcher
-# evaluates itself, rather than on the worker's continued good behavior.
+# evaluates itself, rather than on the worker's continued good behavior. The
+# callers that hand a pane back to wedge tracking on that crossing owe it one
+# pause_handover_recheck first, so a still-declared wait is confirmed before it is
+# alarmed on.
 pause_state_class() {  # <window> <task>
   local win=$1 task=$2 key last recheck_file class agent_alive declared_age
   key=${win//:/_}
@@ -1152,10 +1190,13 @@ EOF
             task=$(window_to_task "$w" "$STATE")
             case "$(pause_state_class "$w" "$task")" in
               working)
+                handover=0
+                pause_handover_due "$w" "$task" && handover=1
                 clear_pause_tracking "$w"
                 printf '%s' "$h" > "$sf"
                 date +%s > "$ssf"
                 triage_log "absorbed non-terminal stale (provably working): $w"
+                [ "$handover" -eq 1 ] && pause_handover_recheck "$w" "$task"
                 ;;
               paused)
                 handle_paused_stale "$w" "$task" "$h"
@@ -1169,8 +1210,11 @@ EOF
             if [ -e "$pf" ] || status_is_paused_or_captain_held "$(last_status_line "$STATE/$task.status")"; then
               case "$(pause_state_class "$w" "$task")" in
                 paused)  handle_paused_stale "$w" "$task" "$h" ;;
-                working) clear_pause_state "$w"
+                working) handover=0
+                         pause_handover_due "$w" "$task" && handover=1
+                         clear_pause_state "$w"
                          printf '%s' "$h" > "$sf"
+                         [ "$handover" -eq 1 ] && pause_handover_recheck "$w" "$task"
                          wedge_timer_check "$w" "$ssf" "non-terminal stale (provably working after a declared pause)" "$ewf"
                          triage_log "absorbed non-terminal stale (provably working): $w" ;;
                 *)       handle_paused_stale "$w" "$task" "$h" ;;
