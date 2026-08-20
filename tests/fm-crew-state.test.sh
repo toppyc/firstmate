@@ -451,6 +451,33 @@ branch_sync:
 EOF
 }
 
+# The crew submitted at one head, the pipeline advanced the run to a head it has
+# not pushed, and the crew has SINCE committed local work: the run's own head is
+# unresolvable here while the submitted head resolves and disproves the run.
+run_advanced_head_local_moved_on() {  # <branch> <pipeline-head> <submitted-head> <local-head>
+  cat <<EOF
+run:
+  id: "01LOCALMOVED"
+  branch: $1
+  status: running
+  head: "$2"
+  pr: ""
+  findings: none
+branch_sync:
+  state: pipeline_owned
+  local:
+    branch: $1
+    head: "$4"
+    clean: true
+  pipeline:
+    run: "01LOCALMOVED"
+    status: running
+    submitted_head: "$3"
+    current_head: "$2"
+    pushed_head: ""
+EOF
+}
+
 # The same field flattened to a dotted key instead of a nested block.
 run_no_usable_head_with_dotted_local() {  # <branch> <pipeline-head> <local-head>
   cat <<EOF
@@ -1594,7 +1621,10 @@ test_stale_submitted_head_does_not_resurrect_old_run() {
   assert_not_contains "$out" "source: run-step" "a superseded run must not be attributed via its submitted head"
   assert_contains "$out" "state: working" "current state still comes from the live sources"
   assert_contains "$out" "source: status-log" "the superseded run does not displace the current source"
-  assert_contains "$out" "not attributed" "the refusal is still visible on the verdict"
+  # A verdict that names a real state already answered the question, so the
+  # refusal note stays off it: a superseded previous run is the ordinary case,
+  # and annotating a healthy line trains a supervisor to skip it.
+  assert_not_contains "$out" "not attributed" "a healthy verdict carries no refusal note"
   pass "an old submitted head does not resurrect a superseded run"
 }
 
@@ -1625,6 +1655,42 @@ EOF
   assert_not_contains "$out" "source: run-step" "a superseded terminal row must not be attributed"
   assert_contains "$out" "not attributed" "the newest row's refusal is reported"
   pass "an older terminal row does not outrank the branch's newest run"
+}
+
+# When no head binds, the reason must be the PROVEN one. The run's own head is
+# unresolvable here (the pipeline advanced it without pushing) and the head the
+# crew submitted resolves and disproves the run, because local work moved on
+# past it. Reporting the first verdict encountered would blame "unpushed
+# pipeline commits?" - a description of a HEALTHY advancing run - for a refusal
+# that is in fact proved. A diagnostic that asserts what it does not know stops
+# the reader looking further, which is the failure this whole reader exists to
+# fix.
+test_proven_mismatch_outranks_unresolved_head() {
+  reset_fakes
+  local d submitted_head local_head out
+  d=$(new_case proven-mismatch)
+  make_repo_on_branch "$d/wt" fm/feat-proven
+  submitted_head=$(git -C "$d/wt" rev-parse HEAD)
+  make_unpushed_pipeline_head "$d"
+  git -C "$d/wt" commit -q --allow-empty -m 'local stage-2 work after submitting'
+  local_head=$(git -C "$d/wt" rev-parse HEAD)
+  git -C "$d/wt" merge-base --is-ancestor "$submitted_head" "$local_head" \
+    || fail "fixture is vacuous: the submitted head must be a strict ancestor of the worktree head"
+  [ "$submitted_head" != "$local_head" ] || fail "fixture is vacuous: local work must have advanced"
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/proven.meta" "window=fm:fm-proven" "worktree=$d/wt" "kind=ship" "harness=claude"
+  FM_FAKE_AXI_STATUS="$(run_advanced_head_local_moved_on fm/feat-proven "$PIPELINE_HEAD" "$submitted_head" "$local_head")"
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" proven
+  out=$(run_crew_state "$d" proven)
+  assert_not_contains "$out" "source: run-step" "no head binds, so the run must not be attributed"
+  assert_contains "$out" "state: unknown" "a refused run leaves no usable current state here"
+  assert_contains "$out" "$submitted_head is not this worktree's code identity" \
+    "the reason names the head whose verdict is actually proved"
+  assert_not_contains "$out" "not an object in this worktree" \
+    "the indeterminate verdict must not mask the proven one"
+  assert_not_contains "$out" "$PIPELINE_HEAD" "the unresolvable head is not the head to blame"
+  pass "a proven mismatch outranks an unresolvable head in the reported reason"
 }
 
 # --- a refused run is distinguishable from no run at all --------------------
@@ -1717,5 +1783,6 @@ test_worktree_head_in_dotted_local_key_never_binds_a_run
 test_stale_submitted_head_does_not_resurrect_old_run
 test_older_terminal_row_does_not_outrank_live_advanced_run
 test_refused_run_is_distinguishable_from_no_run
+test_proven_mismatch_outranks_unresolved_head
 
 echo "all fm-crew-state tests passed"

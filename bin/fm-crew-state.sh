@@ -49,8 +49,8 @@
 #   5. Missing meta or torn-down worktree: report unknown · none. If no run is
 #      attributed to this crew, a dead endpoint also reports unknown · none rather
 #      than trusting a stale status log. When a run WAS found on this crew's
-#      branch and refused, every non-run-step verdict carries why, and a verdict
-#      that would otherwise have had no source at all reports source run-unbound:
+#      branch and refused, every verdict that still reports `unknown` carries
+#      why, and one with no source at all reports source run-unbound instead:
 #      `unknown · none` used to read identically for a crew whose worker has
 #      vanished and for one whose live run this reader silently discarded, which
 #      sends a supervisor acting on a deep-inspection demand to a dead end.
@@ -568,16 +568,22 @@ fi
 # is no run to consult, so a dead/unreadable target means the crew is gone: report
 # unknown rather than trusting a possibly-stale status log as the current state.
 #
-# Every verdict from here down answers from something other than a run - or from
-# nothing - so each one carries why a run on this crew's branch was refused when
-# there was one, and a verdict with no source at all names run-unbound instead of
-# none. That is the whole difference between "this crew has vanished" and "its
-# run is right there and this reader would not bind it", which a supervisor sent
-# here by a deep-inspection demand has to be able to tell apart without going and
-# reading `axi status` by hand.
+# A verdict from here down that still cannot name a current state carries why a
+# run on this crew's branch was refused when there was one, and names the source
+# run-unbound instead of none. That is the whole difference between "this crew
+# has vanished" and "its run is right there and this reader would not bind it",
+# which a supervisor sent here by a deep-inspection demand has to be able to tell
+# apart without going and reading `axi status` by hand.
+#
+# ONLY on `unknown`, deliberately. A verdict that names a real state - working
+# from a busy pane, working from the status log - is not a dead end: it already
+# answered the question, and a refused run there is usually just the branch's
+# superseded previous run, exactly what the guard is for. Detail on a healthy
+# line trains a supervisor to skip the line, and then the one occurrence that
+# mattered gets skipped with it. Put the reason where somebody is stuck.
 emit_fallback() {  # <state> <source> [detail]
   local state=$1 source=$2 detail=${3:-}
-  if [ -n "$RUN_REJECT" ]; then
+  if [ -n "$RUN_REJECT" ] && [ "$state" = unknown ]; then
     if [ -n "$detail" ]; then detail="$detail${SEP}$RUN_REJECT"; else detail="$RUN_REJECT"; fi
     [ "$source" = none ] && source=run-unbound
   fi

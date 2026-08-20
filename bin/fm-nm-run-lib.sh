@@ -175,17 +175,33 @@ fm_nm_head_verdict() {  # <worktree> <head>
 
 # Bind a whole run object (`axi status` TOON $2) to worktree $1. Echoes
 # "<verdict> <head>": match on the first reported head that binds, else the
-# verdict of the run's most authoritative reported head, else a bare "absent".
-# A caller may attribute the run ONLY on match; every other verdict is a reason
-# it can show instead of reporting no source at all.
+# STRONGEST verdict any reported head produced, paired with that head, else a
+# bare "absent". A caller may attribute the run ONLY on match; every other
+# verdict is a reason it can show instead of reporting no source at all.
+#
+# Binding order is unchanged - the first head that matches still wins - but the
+# non-binding verdict reported is the strongest, not the first: a proven
+# `mismatch` outranks an indeterminate `unresolved`, which outranks `absent`.
+# Reporting the first one lets an unresolvable run head hide a submitted head
+# that RESOLVES here and disproves the run, and the reason then reads "unpushed
+# pipeline commits?" - a healthy advancing run - when local work has in fact
+# advanced past the run. A reason is only worth having if it is accurate when a
+# supervisor reads it, so report the head whose verdict is actually proved.
 fm_nm_run_binding() {  # <worktree> <toon-output>
-  local wt=$1 head verdict first_verdict='' first_head=''
+  local wt=$1 head verdict rank best_rank=0 best_verdict='' best_head=''
   while IFS= read -r head; do
     [ -n "$head" ] || continue
     verdict=$(fm_nm_head_verdict "$wt" "$head")
     [ "$verdict" = match ] && { printf 'match %s' "$head"; return 0; }
-    [ -n "$first_verdict" ] || { first_verdict=$verdict; first_head=$head; }
+    case "$verdict" in
+      mismatch)   rank=3 ;;
+      unresolved) rank=2 ;;
+      *)          rank=1 ;;
+    esac
+    if [ "$rank" -gt "$best_rank" ]; then
+      best_rank=$rank; best_verdict=$verdict; best_head=$head
+    fi
   done <<< "$(fm_nm_run_heads "$2")"
-  [ -n "$first_verdict" ] || { printf 'absent'; return 0; }
-  printf '%s %s' "$first_verdict" "$first_head"
+  [ -n "$best_verdict" ] || { printf 'absent'; return 0; }
+  printf '%s %s' "$best_verdict" "$best_head"
 }
