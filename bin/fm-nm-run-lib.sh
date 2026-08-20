@@ -87,7 +87,9 @@ fm_nm_head_matches_worktree() {  # <worktree> <run_head>
 # is routinely an object the crew's worktree has never seen. no-mistakes' own
 # reattach rule is that a run still matches your HEAD "either as the submitted
 # head or as the current pipeline head" (its /no-mistakes skill), so both are
-# identities of the same run and either one binding is a bind.
+# identities of the same run and either one binding is a bind. Which keys count
+# as a run's own identity is a structural question, not a spelling one - see
+# fm_nm_run_heads.
 #
 # Second, failing to bind has two very different meanings. A head that resolves
 # here and does not match DISPROVES the run - a rewritten tip, or local work
@@ -96,19 +98,66 @@ fm_nm_head_matches_worktree() {  # <worktree> <run_head>
 # Collapsing both into a bare "no" is what made a healthy advancing run read as
 # no current-state source at all.
 
-# The head identities a run object reports for itself, most authoritative
-# first: its current pipeline head, then the head the crew submitted. Tolerates
-# the nested and the dotted `pipeline.`-prefixed renderings, and optional
-# quoting. Deliberately never matches a `local.`-prefixed key: that reports the
-# WORKTREE's own head, so binding on it would make every run match and silently
-# delete the staleness guard.
+# The head identities a run reports for itself, most authoritative first: the
+# run object's own heads, then its pipeline block's.
+#
+# Block-aware on purpose. `axi status` also reports the WORKTREE's own head, as
+# an indented bare `head:` inside branch_sync's `local:` block (verified against
+# no-mistakes v1.48.0, whose branch_sync renders `local:` with `branch`, `head`,
+# `clean` and `pipeline:` with `submitted_head`, `current_head`, `pushed_head`).
+# A flat "first key that looks like a head" match can therefore read the
+# worktree's own head as the run's identity, which would make every run on the
+# branch bind and silently delete the staleness guard. Excluding it by key
+# SPELLING does not hold: an indented `head:` under `local:` and a flattened
+# `local.head:` are one field rendered two ways, and the next field added inside
+# `local:` would reopen the hole. So the boundary is the enclosing BLOCK - only
+# the `run:` object and the `pipeline:` block supply run identities, and nothing
+# under `local:` can, whatever it is called or added later.
+#
+# Within those blocks any `head`/`*_head` key counts, so a head field the vendor
+# adds to the pipeline block keeps working; an unrecognized one merely goes
+# unconsulted, which refuses loudly rather than binding wrongly. Both renderings
+# are accepted: nested blocks, and keys flattened with a dotted prefix
+# (`pipeline.submitted_head:`), the spelling in the originally reported evidence.
 fm_nm_run_heads() {  # <toon-output>
-  local key
-  for key in head submitted_head; do
-    printf '%s\n' "$1" \
-      | sed -n -E "s/^[[:space:]]*(pipeline\\.)?${key}:[[:space:]]*\"?([0-9a-fA-F]{4,40})\"?[[:space:]]*\$/\\2/p" \
-      | head -1
-  done
+  printf '%s\n' "$1" | awk '
+    function block_path(   i, p) {
+      p = ""
+      for (i = 1; i <= top; i++) p = (p == "" ? sname[i] : p "." sname[i])
+      return p
+    }
+    {
+      match($0, /^[ \t]*/); ind = RLENGTH
+      rest = substr($0, ind + 1)
+      # Only `key:` and `key: value` lines carry structure. TOON table headers
+      # (`steps[9]{...}:`), their rows, and blank lines are skipped without
+      # disturbing the block stack.
+      if (match(rest, /^[A-Za-z_][A-Za-z0-9_.]*:/) == 0) next
+      key = substr(rest, 1, RLENGTH - 1)
+      val = substr(rest, RLENGTH + 1)
+      sub(/^[ \t]+/, "", val); sub(/[ \t]+$/, "", val)
+      while (top > 0 && sind[top] >= ind) top--
+      if (val == "") { top++; sind[top] = ind; sname[top] = key; next }
+      leaf = key; prefix = ""
+      if (index(key, ".") > 0) {
+        n = split(key, part, ".")
+        leaf = part[n]
+        for (i = 1; i < n; i++) prefix = (prefix == "" ? part[i] : prefix "." part[i])
+      }
+      path = block_path()
+      if (prefix != "") path = (path == "" ? prefix : path "." prefix)
+      if (leaf != "head" && leaf !~ /_head$/) next
+      if (path != "run" && path != "pipeline" && path != "branch_sync.pipeline") next
+      gsub(/^"|"$/, "", val)
+      if (val !~ /^[0-9a-fA-F]{4,40}$/) next
+      if (seen[val]++) next
+      if (path == "run") run_head[++nrun] = val; else pipe_head[++npipe] = val
+    }
+    END {
+      for (i = 1; i <= nrun; i++) print run_head[i]
+      for (i = 1; i <= npipe; i++) print pipe_head[i]
+    }
+  '
 }
 
 # Three-way identity verdict for ONE reported head $2 against worktree $1:

@@ -104,11 +104,17 @@
 #     crew's worktree, so they are not orphaned by removing the worktree.
 #     conclude_task_no_mistakes_run attributes the active-or-most-recent run to
 #     THIS task only when its branch AND code identity (bin/fm-nm-run-lib.sh's
-#     fm_nm_head_matches_worktree, the same rule bin/fm-crew-state.sh uses) both
-#     match this worktree, then runs `no-mistakes axi abort --run <id>` for
+#     fm_nm_head_matches_worktree) both match this worktree, then runs
+#     `no-mistakes axi abort --run <id>` for
 #     that verified run instance. A run already terminal
 #     (an outcome is set) or not parked at a gate is left untouched. Idempotent:
 #     an already-aborted run reads back terminal and is skipped on retry.
+#     This is DELIBERATELY narrower than the binding bin/fm-crew-state.sh uses
+#     (fm_nm_run_binding, which accepts either of a run's reported head
+#     identities and distinguishes a disproved run from an unresolvable one):
+#     teardown is about to ABORT a run, so an unproven identity must stay a no
+#     here, while a reader that refuses to bind must still say so rather than go
+#     silent. bin/fm-nm-run-lib.sh owns both rules and why they differ.
 #   Fix 2 - reap leaked descendant processes. A backgrounded/disowned process
 #     started under the worktree (or its per-task tasktmp) does not receive the
 #     SIGHUP/SIGTERM that closing the backend pane sends to its own foreground

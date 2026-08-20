@@ -401,15 +401,64 @@ branch_sync:
 EOF
 }
 
-# A run reporting only an unreachable head, alongside a local.head key carrying
-# the WORKTREE's own head. Nothing here binds the run to this crew.
-run_running_unreachable_head_with_local_head() {  # <branch> <pipeline-head> <local-head>
+# The real nested branch_sync rendering: the run's submitted head sits in the
+# `pipeline:` block while `local:` carries the WORKTREE's own head.
+run_running_advanced_head_nested() {  # <branch> <pipeline-head> <submitted-head>
   cat <<EOF
 run:
-  id: "01LOCALHEAD"
+  id: "01NESTED"
   branch: $1
   status: running
   head: "$2"
+  pr: ""
+  findings: none
+branch_sync:
+  state: pipeline_owned
+  local:
+    branch: $1
+    head: "$3"
+    clean: true
+  pipeline:
+    run: "01NESTED"
+    status: running
+    submitted_head: "$3"
+    current_head: "$2"
+    pushed_head: ""
+EOF
+}
+
+# A run whose OWN heads are all unusable, next to a `local:` block carrying the
+# worktree's own head. Binding on that head is the only way this run could be
+# reported as current, so it is the decisive case for the block boundary.
+run_no_usable_head_with_local_block() {  # <branch> <pipeline-head> <local-head>
+  cat <<EOF
+run:
+  id: "01LOCALBLOCK"
+  branch: $1
+  status: running
+  head: ""
+  pr: ""
+  findings: none
+branch_sync:
+  state: pipeline_owned
+  local:
+    branch: $1
+    head: "$3"
+    clean: true
+  pipeline:
+    current_head: "$2"
+    pushed_head: ""
+EOF
+}
+
+# The same field flattened to a dotted key instead of a nested block.
+run_no_usable_head_with_dotted_local() {  # <branch> <pipeline-head> <local-head>
+  cat <<EOF
+run:
+  id: "01DOTTEDLOCAL"
+  branch: $1
+  status: running
+  head: ""
   pr: ""
   findings: none
 branch_sync:
@@ -1461,24 +1510,69 @@ test_unreachable_head_alone_is_not_attributed() {
   pass "an unreachable head alone does not attribute a run"
 }
 
-# The worktree's own head is not a run identity: binding on a local.head key
-# would make every run on the branch match and delete the guard entirely.
-test_local_head_key_never_binds_a_run() {
+# The run's submitted head binds through the real nested branch_sync rendering,
+# where it sits in the `pipeline:` block rather than on the run object.
+test_advanced_pipeline_head_nested_branch_sync_binds() {
   reset_fakes
   local d local_head out
-  d=$(new_case local-head-key)
-  make_repo_on_branch "$d/wt" fm/feat-localhead
+  d=$(new_case advanced-head-nested)
+  make_repo_on_branch "$d/wt" fm/feat-adv-nested
   local_head=$(git -C "$d/wt" rev-parse HEAD)
   make_unpushed_pipeline_head "$d"
   make_fakebin "$d" >/dev/null
-  fm_write_meta "$d/state/localhead.meta" "window=fm:fm-localhead" "worktree=$d/wt" "kind=ship" "harness=claude"
-  FM_FAKE_AXI_STATUS="$(run_running_unreachable_head_with_local_head fm/feat-localhead "$PIPELINE_HEAD" "$local_head")"
+  fm_write_meta "$d/state/advnested.meta" "window=fm:fm-advnested" "worktree=$d/wt" "kind=ship" "harness=claude"
+  FM_FAKE_AXI_STATUS="$(run_running_advanced_head_nested fm/feat-adv-nested "$PIPELINE_HEAD" "$local_head")"
   FM_FAKE_BUSY=0
-  arm_idle_record "$d/state" localhead
-  out=$(run_crew_state "$d" localhead)
-  assert_not_contains "$out" "source: run-step" "a local.head key must never bind a run"
+  arm_idle_record "$d/state" advnested
+  out=$(run_crew_state "$d" advnested)
+  assert_contains "$out" "state: working" "the pipeline block's submitted head binds the live run"
+  assert_contains "$out" "source: run-step" "nested branch_sync binding stays run-step authoritative"
+  pass "nested branch_sync submitted head binds the live run"
+}
+
+# The worktree's own head is NOT a run identity. `axi status` reports it as an
+# indented bare `head:` inside branch_sync's `local:` block, so a reader that
+# matches head-shaped keys anywhere in the document can bind it and report every
+# run on the branch as current - deleting the staleness guard. Both cases below
+# give the run no usable head of its own, so the worktree head is the only thing
+# that COULD bind: document order cannot mask the fault the way it does when the
+# run object reports a head first.
+test_worktree_head_in_local_block_never_binds_a_run() {
+  reset_fakes
+  local d local_head out
+  d=$(new_case local-head-block)
+  make_repo_on_branch "$d/wt" fm/feat-localblock
+  local_head=$(git -C "$d/wt" rev-parse HEAD)
+  make_unpushed_pipeline_head "$d"
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/localblock.meta" "window=fm:fm-localblock" "worktree=$d/wt" "kind=ship" "harness=claude"
+  FM_FAKE_AXI_STATUS="$(run_no_usable_head_with_local_block fm/feat-localblock "$PIPELINE_HEAD" "$local_head")"
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" localblock
+  out=$(run_crew_state "$d" localblock)
+  assert_not_contains "$out" "source: run-step" "a head under local: must never bind a run"
+  assert_not_contains "$out" "state: working" "the worktree's own head must not report the run as current"
   assert_contains "$out" "not attributed" "the refusal names itself"
-  pass "a local.head key never binds a run"
+  pass "a head inside the local: block never binds a run"
+}
+
+test_worktree_head_in_dotted_local_key_never_binds_a_run() {
+  reset_fakes
+  local d local_head out
+  d=$(new_case local-head-dotted)
+  make_repo_on_branch "$d/wt" fm/feat-localdotted
+  local_head=$(git -C "$d/wt" rev-parse HEAD)
+  make_unpushed_pipeline_head "$d"
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/localdotted.meta" "window=fm:fm-localdotted" "worktree=$d/wt" "kind=ship" "harness=claude"
+  FM_FAKE_AXI_STATUS="$(run_no_usable_head_with_dotted_local fm/feat-localdotted "$PIPELINE_HEAD" "$local_head")"
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" localdotted
+  out=$(run_crew_state "$d" localdotted)
+  assert_not_contains "$out" "source: run-step" "a flattened local.head key must never bind a run"
+  assert_not_contains "$out" "state: working" "the worktree's own head must not report the run as current"
+  assert_contains "$out" "not attributed" "the refusal names itself"
+  pass "a flattened local.head key never binds a run"
 }
 
 # Consulting the submitted head must not resurrect a superseded run: local work
@@ -1550,7 +1644,7 @@ test_refused_run_is_distinguishable_from_no_run() {
   FM_FAKE_BUSY=0
   arm_idle_record "$d/state" refused
 
-  FM_FAKE_AXI_STATUS="$(run_running_unreachable_head_with_local_head fm/feat-refused "$PIPELINE_HEAD" "$local_head")"
+  FM_FAKE_AXI_STATUS="$(run_no_usable_head_with_local_block fm/feat-refused "$PIPELINE_HEAD" "$local_head")"
   refused=$(run_crew_state "$d" refused)
   assert_contains "$refused" "state: unknown" "a refused run still yields no usable state"
   assert_contains "$refused" "source: run-unbound" "a refused run reports a source of its own"
@@ -1617,7 +1711,9 @@ test_missing_run_head_falls_back_to_current_state
 test_advanced_pipeline_head_still_reports_working
 test_advanced_pipeline_head_dotted_rendering_binds
 test_unreachable_head_alone_is_not_attributed
-test_local_head_key_never_binds_a_run
+test_advanced_pipeline_head_nested_branch_sync_binds
+test_worktree_head_in_local_block_never_binds_a_run
+test_worktree_head_in_dotted_local_key_never_binds_a_run
 test_stale_submitted_head_does_not_resurrect_old_run
 test_older_terminal_row_does_not_outrank_live_advanced_run
 test_refused_run_is_distinguishable_from_no_run
