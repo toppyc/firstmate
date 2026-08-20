@@ -20,7 +20,14 @@
 #                          line, since the crew's own log gets no new entry once
 #                          firstmate hands it to a no-mistakes validation. A declared
 #                          external-wait pause is absorbed instead with its own long
-#                          re-surface cadence, never as a wedge. Only when neither
+#                          re-surface cadence, never as a wedge, for as long as
+#                          the declaration stays current: a running pipeline does
+#                          not retire it (crew_absorb_class gives the run
+#                          precedence over the log, so a worker working through
+#                          its own declared wait reports working throughout), but
+#                          leaving it un-redeclared past FM_PAUSE_RESURFACE_SECS
+#                          does, so one stale paused: line cannot mute a wedge
+#                          forever. Only when neither
 #                          absorb class applies does the log's last line decide:
 #                          terminal (captain-relevant) or non-terminal (no verb),
 #                          both surfaced at once. A provably-working stale past the
@@ -323,6 +330,22 @@ busy_turn_over_age() {  # <task>
   [ "$(age_of "$f")" -ge "$BUSY_TURN_MAX_SECS" ]
 }
 
+# Age in seconds of <task>'s current status DECLARATION, anchored on the status
+# file's mtime. This is the one anchor for "how long ago did the worker last say
+# this": handle_paused_stale paces its re-surface on it, and pause_state_class
+# decides on it whether a declared pause is still current. Anchoring on the file
+# rather than a per-hash marker is what stops a churny idle pane from resetting
+# the cadence; and because any later status line ends the pause outright (the
+# last-line check in pause_state_class), only re-declaring the pause refreshes it.
+# Prints nothing when the mtime is unreadable, leaving each caller to state its
+# own fallback rather than sharing one that suits only one of them.
+status_declaration_age() {  # <task>
+  local task=$1 mtime
+  mtime=$(stat_mtime "$STATE/$task.status")
+  case "$mtime" in ''|*[!0-9]*) return 0 ;; esac
+  printf '%s' "$(( $(date +%s) - mtime ))"
+}
+
 # Absorb a stale pane under a declared external-wait pause (paused:) or a
 # dead-agent captain-held transfer, and re-surface it once every
 # PAUSE_RESURFACE_SECS for a recheck so it cannot rot invisibly. Called on any
@@ -334,15 +357,15 @@ busy_turn_over_age() {  # <task>
 # re-surface epoch so, once past the window, it fires once per window rather than
 # every poll. Advances the stale suppressor to <hash> and flags the key paused.
 handle_paused_stale() {  # <window> <task> <hash>
-  local win=$1 task=$2 h=$3 key statusf mtime age rf rf_age reason
+  local win=$1 task=$2 h=$3 key age rf rf_age reason
   key=$(printf '%s' "$win" | tr ':/.' '___')
   printf '%s' "$h" > "$STATE/.stale-$key"
   : > "$STATE/.paused-$key"
   rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
-  statusf="$STATE/$task.status"
-  mtime=$(stat_mtime "$statusf")
-  case "$mtime" in ''|*[!0-9]*) mtime=$(date +%s) ;; esac
-  age=$(( $(date +%s) - mtime ))
+  # An unreadable mtime reads as "just declared" here, so a vanished status file
+  # cannot turn one poll into a spurious recheck.
+  age=$(status_declaration_age "$task")
+  [ -n "$age" ] || age=0
   rf="$STATE/.paused-resurfaced-$key"
   rf_age=$(age_of "$rf")   # 999999 when no prior re-surface
   if [ "$age" -ge "$PAUSE_RESURFACE_SECS" ] && [ "$rf_age" -ge "$PAUSE_RESURFACE_SECS" ]; then
@@ -374,8 +397,22 @@ clear_pause_tracking() {  # <window>
 # Reconcile a declared pause or captain-held status with authoritative crew state.
 # Only a confidently dead ordinary crew may recover paused classification after
 # fm-crew-state has fallen back to stopped or unknown.
+#
+# An authoritative `working` verdict does NOT by itself retire a declaration.
+# crew_absorb_class gives a running pipeline precedence over the status log, so a
+# worker that declares a long external wait and is genuinely working through it
+# reports `working` for the whole wait - the healthiest evidence there is, and
+# previously the one verdict that resumed wedge escalation, so a declared wait was
+# escalated as a possible wedge every STALE_ESCALATE_SECS for its full length.
+# The declaration is therefore weighed on its own age instead: while it is still
+# current (younger than the PAUSE_RESURFACE_SECS window a single declaration is
+# good for) a working crew is absorbed on the pause cadence, and once it has gone
+# that long without being re-declared the working verdict takes over and wedge
+# tracking resumes. That keeps the guarantee this override exists for - one stale
+# `paused:` line can never mute a wedge indefinitely - on a bound the watcher
+# evaluates itself, rather than on the worker's continued good behavior.
 pause_state_class() {  # <window> <task>
-  local win=$1 task=$2 key last recheck_file class agent_alive
+  local win=$1 task=$2 key last recheck_file class agent_alive declared_age
   key=${win//:/_}
   key=${key//\//_}
   key=${key//./_}
@@ -400,6 +437,14 @@ pause_state_class() {  # <window> <task>
   fi
   class=$(crew_absorb_class "$task")
   if [ "$class" = working ]; then
+    # An unreadable declaration age counts as stale, so an unconfirmable pause
+    # yields to wedge tracking rather than suppressing it.
+    declared_age=$(status_declaration_age "$task")
+    if [ -n "$declared_age" ] && [ "$declared_age" -lt "$PAUSE_RESURFACE_SECS" ]; then
+      date +%s > "$recheck_file"
+      printf 'paused'
+      return
+    fi
     rm -f "$recheck_file"
     printf 'working'
     return
