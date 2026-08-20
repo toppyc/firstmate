@@ -132,6 +132,15 @@ record_pi_busy() {  # <state-dir> <id>
 
 reap() { kill "$1" 2>/dev/null || true; wait "$1" 2>/dev/null || true; }
 
+# Seed the persisted state a pane carries once the watcher has ABSORBED it onto
+# the bounded pause cadence. The .paused-<key> flag alone is not that state: the
+# watcher also sets it for a pane it has just SURFACED with a bare stale wake, so
+# only the pair means "honored, and the captain has not been told".
+seed_pause_absorbed() {  # <state> <key>
+  : > "$1/.paused-$2"
+  : > "$1/.paused-absorbed-$2"
+}
+
 # --- pure classifier predicates (fm-classify-lib.sh) ------------------------
 
 test_signal_reason_is_actionable_classifier() {
@@ -946,7 +955,7 @@ test_secondmate_unpause_clears_pause_tracking() {
   key=${window//:/_}
   key=${key//\//_}
   key=${key//./_}
-  : > "$state/.paused-$key"
+  seed_pause_absorbed "$state" "$key"
   : > "$state/.paused-rechecked-$key"
   : > "$state/.paused-resurfaced-$key"
   : > "$state/.stale-$key"
@@ -1035,7 +1044,7 @@ test_nonterminal_paused_rechecks_authoritative_state() {
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '%s' "$pane_hash" > "$state/.stale-$key"
   printf '1\n' > "$state/.count-$key"
-  : > "$state/.paused-$key"
+  seed_pause_absorbed "$state" "$key"
   export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
 
   # The pane leaves an honored declaration here, so it is owed exactly one paused
@@ -1082,7 +1091,7 @@ test_paused_authoritative_working_preserves_wedge_timer() {
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '%s' "$pane_hash" > "$state/.stale-$key"
   printf '1\n' > "$state/.count-$key"
-  : > "$state/.paused-$key"
+  seed_pause_absorbed "$state" "$key"
   export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
 
   # Spend the one paused handover recheck the pane is owed for leaving its
@@ -1248,7 +1257,7 @@ test_lapsed_declared_pause_hands_over_with_one_recheck() {
   printf '%s' "$pane_hash" > "$state/.stale-$key"
   # Arrive mid-absorb: the pane is on the pause cadence, which is why no wedge
   # timer and no escalation count are running. The declaration has just lapsed.
-  : > "$state/.paused-$key"
+  seed_pause_absorbed "$state" "$key"
   export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
 
   # (i) one recheck, in the declared-pause register, never the wedge one.
@@ -1379,7 +1388,7 @@ test_lapsed_declared_pause_hands_over_from_the_redraw_arm() {
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '%s' "$pane_hash" > "$state/.stale-$key"
   printf '2\n' > "$state/.count-$key"
-  : > "$state/.paused-$key"
+  seed_pause_absorbed "$state" "$key"
   export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
 
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
@@ -1423,7 +1432,7 @@ test_busy_pane_under_a_stale_declaration_still_wedge_escalates() {
   pane_hash=$(hash_text "Working...")
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '2\n' > "$state/.count-$key"
-  : > "$state/.paused-$key"
+  seed_pause_absorbed "$state" "$key"
   # No completed turn ever recorded for this task: age the spawn record itself.
   touch -t 200001010000 "$state/busy-paused.meta"
 
@@ -1465,6 +1474,118 @@ test_busy_pane_under_a_stale_declaration_still_wedge_escalates() {
   grep -F "awaiting external" "$out" >/dev/null && fail "a busy pane was escalated as a declared-pause recheck"
   [ ! -e "$state/.paused-$key" ] || fail "a busy pane recovered the pause cadence across the escalation"
   pass "a busy pane under a stale declaration spends one recheck and still climbs the wedge ladder"
+}
+
+# The handover softens a pane the captain was never told about. A pane the watcher
+# SURFACED was told about, in the same breath, so it is owed nothing further - and
+# it reaches an identical-looking state, because the surface path sets the same
+# .paused-<key> flag an absorb does. A captain-held line is the everyday case: it
+# outlives the recheck window within the hour and is never re-declared by design.
+# Driven through real polls rather than seeded, so the surface path is the one
+# that establishes the flag.
+test_surfaced_pane_is_never_owed_a_handover_recheck() {
+  local dir state fakebin out drain_out capture_file statusf window key pid
+  dir=$(make_case surfaced-no-handover); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
+  window="test:fm-surfaced-hold"; statusf="$state/surfaced-hold.status"
+  printf 'idle pane, holding for the decision\n' > "$capture_file"
+  printf 'window=%s\nkind=ship\nharness=claude\nbackend=tmux\n' "$window" > "$state/surfaced-hold.meta"
+  printf 'captain-held [key=route]: tracked by held-decision-route\n' > "$statusf"
+  backdate_status "$statusf" 4000
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-surfaced-hold_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  printf '%s' "$(hash_text "idle pane, holding for the decision")" > "$state/.hash-$key"
+  printf '2\n' > "$state/.count-$key"
+  # A different suppressor hash, so this settles as a first sight - and with a live
+  # agent and no running pipeline there is no absorb reason, so it is surfaced.
+  printf '%s' "$(hash_text "some earlier pane")" > "$state/.stale-$key"
+
+  # Phase A: the bare surface, which is the whole of what this pane is owed.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=claude \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_STALE_ESCALATE_SECS=999 FM_PAUSE_RESURFACE_SECS=3600 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 || { reap "$pid"; fail "an inconclusive held pane was not surfaced: $(cat "$out")"; }
+  grep -F "stale: $window" "$out" >/dev/null || fail "the held pane's surface did not print its stale wake: $(cat "$out")"
+  grep -F "awaiting external" "$out" >/dev/null && fail "a first-sight surface was decorated as a paused recheck: $(cat "$out")"
+  [ -e "$state/.paused-$key" ] || fail "the surfaced pane did not take the pause-shaped stale bookkeeping"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the intentional surface stop"
+
+  # Phase B: the pane redraws, which retires that pause-shaped bookkeeping. It was
+  # never honored, so retiring it owes no confirming recheck - the captain has
+  # already been woken about this pane once.
+  printf 'idle pane, holding for the decision, redrawn\n' > "$capture_file"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=claude \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_STALE_ESCALATE_SECS=999 FM_PAUSE_RESURFACE_SECS=3600 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 || { reap "$pid"; fail "the redrawn held pane never reported again: $(cat "$out")"; }
+  grep -F "awaiting external" "$out" >/dev/null \
+    && fail "a pane that was only ever surfaced bought a handover recheck: $(cat "$out")"
+  grep -F "stale: $window" "$out" >/dev/null || fail "the redrawn held pane lost its plain stale wake: $(cat "$out")"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the redrawn surface failed"
+  grep -F "awaiting external" "$drain_out" >/dev/null \
+    && fail "a handover recheck was queued for a pane that was only ever surfaced"
+  pass "a pane the watcher surfaced is never owed a handover recheck on top of it"
+}
+
+# Away mode is the daemon's: it runs its own long-cadence paused recheck, and the
+# watcher's away arms are cut back to a plain stale handoff. The handover debt is
+# recorded the same way regardless of mode, so the flush is what has to defer -
+# and it defers by leaving the debt on disk, since the crossing is a fact about
+# the pane rather than about the mode. Phase B is that retention: nothing re-seeds
+# the debt, so the recheck arriving there is the one away mode declined to pay.
+test_handover_recheck_defers_to_the_away_daemon() {
+  local dir state fakebin out capture_file statusf window key pid
+  dir=$(make_case afk-handover-deferral); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  window="test:fm-afk-handover"; statusf="$state/afk-handover.status"
+  printf 'idle awaiting external\n' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/afk-handover.meta"
+  printf 'paused: awaiting the upstream release\n' > "$statusf"
+  backdate_status "$statusf" 4000
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-afk-handover_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  printf '%s' "$(hash_text "idle awaiting external")" > "$state/.hash-$key"
+  printf '2\n' > "$state/.count-$key"
+  printf '%s' "$(hash_text "some earlier pane")" > "$state/.stale-$key"
+  # The debt an earlier normal-mode poll recorded when this pane's honored
+  # declaration lapsed, still unpaid when the captain went away.
+  : > "$state/.paused-handover-$key"
+  date '+%s' > "$state/.afk"
+
+  # Phase A: away. The watcher hands off a plain stale identity and authors no
+  # pause wording of its own.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_STALE_ESCALATE_SECS=999 FM_PAUSE_RESURFACE_SECS=3600 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 || { reap "$pid"; fail "the away watcher never handed the stale pane off: $(cat "$out")"; }
+  grep -F "awaiting external" "$out" >/dev/null \
+    && fail "the away watcher emitted its own paused recheck instead of leaving it to the daemon: $(cat "$out")"
+  grep -Fx "stale: $window" "$out" >/dev/null || fail "the away watcher did not hand off a plain stale identity: $(cat "$out")"
+  [ -e "$state/.paused-handover-$key" ] || fail "away mode discarded the unpaid handover debt instead of deferring it"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the intentional away-mode stop"
+
+  # Phase B: back in normal mode the same deferred debt is paid, exactly once.
+  rm -f "$state/.afk"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_STALE_ESCALATE_SECS=999 FM_PAUSE_RESURFACE_SECS=3600 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 || { reap "$pid"; fail "the deferred handover was never paid on return: $(cat "$out")"; }
+  grep -F "confirm the wait still holds" "$out" >/dev/null \
+    || { unset FM_FAKE_CREW_STATE; fail "normal mode did not pay the handover deferred by away mode: $(cat "$out")"; }
+  [ ! -e "$state/.paused-handover-$key" ] || fail "the paid handover left its debt on disk, so it can fire again"
+  pass "the handover recheck defers to the away daemon and is paid once the captain is back"
 }
 
 # --- consecutive wedge escalations on the same pane demand deep inspection ----
@@ -2343,6 +2464,8 @@ test_lapsed_declared_pause_hands_over_with_one_recheck
 test_current_declared_pause_survives_a_moving_pane_under_a_live_worker
 test_lapsed_declared_pause_hands_over_from_the_redraw_arm
 test_busy_pane_under_a_stale_declaration_still_wedge_escalates
+test_surfaced_pane_is_never_owed_a_handover_recheck
+test_handover_recheck_defers_to_the_away_daemon
 test_nonterminal_stale_repairs_missing_or_corrupt_timer
 test_triage_log_size_cap_accepts_spaced_wc_counts
 test_procevent_captured_result_surfaces_proactively

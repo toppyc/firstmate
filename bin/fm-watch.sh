@@ -364,11 +364,22 @@ status_declaration_age() {  # <task>
 # timer would. A .paused-resurfaced-<key> throttle marker records the last
 # re-surface epoch so, once past the window, it fires once per window rather than
 # every poll. Advances the stale suppressor to <hash> and flags the key paused.
+#
+# .paused-<key> carries TWO meanings and is not a record of entitlement. Here it
+# means ABSORBED: the pane is idling on the bounded cadence and the captain has
+# not been told. surface_nonterminal_stale sets the same flag for a pane it has
+# just SURFACED with a bare stale wake, meaning only "this key's stale bookkeeping
+# is pause-shaped" - the captain has already been told about that one. The two
+# entitle different things, and only the absorb is owed a softening handover when
+# its declaration later lapses, so that debt hangs on .paused-absorbed-<key> here
+# rather than on the shared flag. Anything that retires the cadence must retire
+# both.
 handle_paused_stale() {  # <window> <task> <hash>
   local win=$1 task=$2 h=$3 key age rf rf_age reason
   key=$(pause_key "$win")
   printf '%s' "$h" > "$STATE/.stale-$key"
   : > "$STATE/.paused-$key"
+  : > "$STATE/.paused-absorbed-$key"
   rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
   # An unreadable mtime reads as "just declared" here, so a vanished status file
   # cannot turn one poll into a spurious recheck.
@@ -399,24 +410,28 @@ pause_declaration_lapsed() {  # <task>
   [ -z "$age" ] || [ "$age" -ge "$PAUSE_RESURFACE_SECS" ]
 }
 
-# The ONE consumer of the .paused-<key> flag. Every arm of the poll loop that
+# The ONE consumer of the pause cadence's markers. Every arm of the poll loop that
 # retires a pane's pause cadence goes through here, so the question "did this pane
 # just leave a declaration that had lapsed?" is asked in exactly one place rather
 # than at each call site, where a missed site silently cancels the handover for
-# whichever panes take that arm. A lapse records .paused-handover-<key>, which
-# pause_handover_flush below pays out; recording rather than emitting is what
-# keeps the ordering safe, since wake() exits the process and the caller still has
-# its own state to persist after this returns.
+# whichever panes take that arm. The debt hangs on .paused-absorbed-<key>, not the
+# overloaded .paused-<key> flag: only a pane that was actually being HONORED is
+# owed a softening handover, never one that was already surfaced with a bare stale
+# wake. A lapse records .paused-handover-<key>, which pause_handover_flush below
+# pays out; recording rather than emitting is what keeps the ordering safe, since
+# wake() exits the process and the caller still has its own state to persist after
+# this returns.
 clear_pause_state() {  # <window>
   local win=$1 key task
   key=$(pause_key "$win")
-  if [ -e "$STATE/.paused-$key" ]; then
+  if [ -e "$STATE/.paused-absorbed-$key" ]; then
     task=$(window_to_task "$win" "$STATE")
     if [ -n "$task" ] && pause_declaration_lapsed "$task"; then
       : > "$STATE/.paused-handover-$key"
     fi
   fi
-  rm -f "$STATE/.paused-$key" "$STATE/.paused-rechecked-$key" "$STATE/.paused-resurfaced-$key"
+  rm -f "$STATE/.paused-$key" "$STATE/.paused-absorbed-$key" \
+    "$STATE/.paused-rechecked-$key" "$STATE/.paused-resurfaced-$key"
 }
 
 clear_pause_tracking() {  # <window>
@@ -428,7 +443,14 @@ clear_pause_tracking() {  # <window>
 
 # Pay out at most one recheck for a recorded lapse, and pay it before any of this
 # poll's arms can run, so the pane's first word to the captain after the crossing
-# is the confirmation rather than a wedge alarm. The marker is removed first: the
+# is the confirmation rather than a wedge alarm. Normal mode only, gated at the
+# call site: while the captain is away the daemon owns pause triage and raises its
+# own long-cadence recheck, and the watcher's away arms are deliberately reduced
+# to a plain stale handoff. An unpaid debt is left on disk rather than discarded,
+# because it records something about the pane and not about the mode - the
+# crossing happened and was never confirmed - so it is simply delivered on the
+# first normal-mode poll that can deliver it, or retired unpaid below if the
+# worker moved on first. The marker is removed first: the
 # recheck wakes, and wake() exits, so a marker still on disk would re-fire the
 # same crossing on every later cycle. A worker that re-declared or moved on in the
 # meantime retires the marker unpaid - the handover softens a lapse, and there is
@@ -543,12 +565,21 @@ pause_state_class() {  # <window> <task>
   printf '%s' "$class"
 }
 
+# The other setter of .paused-<key>, and the reason that flag cannot be read as an
+# entitlement. Here it means SURFACED: the captain has just been woken about this
+# pane, and the flag only puts its stale bookkeeping on the pause shape so the
+# same wake is not repeated every poll. handle_paused_stale's flag means the
+# opposite - absorbed, captain not told - and only that one is owed a softening
+# handover when its declaration lapses. So this path never records the absorbed
+# marker, and drops any the pane was carrying: a wake already spent the captain's
+# attention, and a second one confirming a wait it has just been told about is
+# exactly the supervision turn this cadence exists to save.
 surface_nonterminal_stale() {  # <window> <hash>
   local win=$1 h=$2 key task last
   key=$(pause_key "$win")
   fm_wake_append stale "$win" "stale: $win" || exit 1
   printf '%s' "$h" > "$STATE/.stale-$key"
-  rm -f "$STATE/.stale-since-$key"
+  rm -f "$STATE/.stale-since-$key" "$STATE/.paused-absorbed-$key"
   task=$(window_to_task "$win" "$STATE")
   last=$(last_status_line "$STATE/$task.status")
   if status_is_paused_or_captain_held "$last"; then
@@ -1135,13 +1166,12 @@ EOF
     if ! status_is_paused_or_captain_held "$last" && [ -e "$STATE/.paused-$key" ]; then
       clear_pause_tracking "$w"
     fi
-    pause_handover_flush "$w" "$task"
+    afk_present || pause_handover_flush "$w" "$task"
     if [ "$kind" = secondmate ] && ! status_is_paused "$last"; then
       continue
     fi
     tail40=$(fm_backend_capture "$(window_backend "$w")" "$w" 40 "$(window_label "$w")" 2>/dev/null) || continue
     h=$(printf '%s' "$tail40" | hash_pane)
-    key=$(pause_key "$w")
     hf="$STATE/.hash-$key"
     cf="$STATE/.count-$key"
     sf="$STATE/.stale-$key"
