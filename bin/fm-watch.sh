@@ -330,6 +330,14 @@ busy_turn_over_age() {  # <task>
   [ "$(age_of "$f")" -ge "$BUSY_TURN_MAX_SECS" ]
 }
 
+# The per-window suffix every $STATE/.<marker>-<key> file this watcher keeps is
+# named by. One owner, because a window identity that keyed two ways would give a
+# pane two independent sets of stale, pause and escalation bookkeeping that never
+# see each other.
+pause_key() {  # <window>
+  printf '%s' "$1" | tr ':/.' '___'
+}
+
 # Age in seconds of <task>'s current status DECLARATION, anchored on the status
 # file's mtime. This is the one anchor for "how long ago did the worker last say
 # this": handle_paused_stale paces its re-surface on it, and pause_state_class
@@ -358,7 +366,7 @@ status_declaration_age() {  # <task>
 # every poll. Advances the stale suppressor to <hash> and flags the key paused.
 handle_paused_stale() {  # <window> <task> <hash>
   local win=$1 task=$2 h=$3 key age rf rf_age reason
-  key=$(printf '%s' "$win" | tr ':/.' '___')
+  key=$(pause_key "$win")
   printf '%s' "$h" > "$STATE/.stale-$key"
   : > "$STATE/.paused-$key"
   rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
@@ -377,36 +385,61 @@ handle_paused_stale() {  # <window> <task> <hash>
   triage_log "absorbed stale (paused, awaiting external, age ${age}s): $win"
 }
 
+# 0 iff <task>'s declaration has LAPSED: its last status line still declares a
+# wait, and that wait has gone un-redeclared past the window a single declaration
+# is good for. Both halves matter. A worker that posted a different status has
+# moved on under its own steam, which is not a lapse and owes nothing; a worker
+# still inside the window is being honored, so there is nothing to hand back yet.
+# An unreadable declaration age counts as lapsed, matching pause_state_class, so
+# an unconfirmable pause yields rather than suppressing.
+pause_declaration_lapsed() {  # <task>
+  local task=$1 age
+  status_is_paused_or_captain_held "$(last_status_line "$STATE/$task.status")" || return 1
+  age=$(status_declaration_age "$task")
+  [ -z "$age" ] || [ "$age" -ge "$PAUSE_RESURFACE_SECS" ]
+}
+
+# The ONE consumer of the .paused-<key> flag. Every arm of the poll loop that
+# retires a pane's pause cadence goes through here, so the question "did this pane
+# just leave a declaration that had lapsed?" is asked in exactly one place rather
+# than at each call site, where a missed site silently cancels the handover for
+# whichever panes take that arm. A lapse records .paused-handover-<key>, which
+# pause_handover_flush below pays out; recording rather than emitting is what
+# keeps the ordering safe, since wake() exits the process and the caller still has
+# its own state to persist after this returns.
 clear_pause_state() {  # <window>
-  local win=$1 key
-  key=${win//:/_}
-  key=${key//\//_}
-  key=${key//./_}
+  local win=$1 key task
+  key=$(pause_key "$win")
+  if [ -e "$STATE/.paused-$key" ]; then
+    task=$(window_to_task "$win" "$STATE")
+    if [ -n "$task" ] && pause_declaration_lapsed "$task"; then
+      : > "$STATE/.paused-handover-$key"
+    fi
+  fi
   rm -f "$STATE/.paused-$key" "$STATE/.paused-rechecked-$key" "$STATE/.paused-resurfaced-$key"
 }
 
 clear_pause_tracking() {  # <window>
   local win=$1 key
-  key=${win//:/_}
-  key=${key//\//_}
-  key=${key//./_}
+  key=$(pause_key "$win")
   clear_pause_state "$win"
   rm -f "$STATE/.stale-$key" "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
 }
 
-# 0 iff <window> is about to LEAVE a declaration it was being absorbed under: the
-# pause flag is still set and <task>'s last status line still declares the wait,
-# so the only thing that changed is that the declaration went un-redeclared past
-# its window. Ask this BEFORE the caller clears the pause state, because that
-# clear is what consumes the flag, and that is what bounds the handover below to
-# exactly one per declaration.
-pause_handover_due() {  # <window> <task>
+# Pay out at most one recheck for a recorded lapse, and pay it before any of this
+# poll's arms can run, so the pane's first word to the captain after the crossing
+# is the confirmation rather than a wedge alarm. The marker is removed first: the
+# recheck wakes, and wake() exits, so a marker still on disk would re-fire the
+# same crossing on every later cycle. A worker that re-declared or moved on in the
+# meantime retires the marker unpaid - the handover softens a lapse, and there is
+# no longer one.
+pause_handover_flush() {  # <window> <task>
   local win=$1 task=$2 key
-  key=${win//:/_}
-  key=${key//\//_}
-  key=${key//./_}
-  [ -e "$STATE/.paused-$key" ] || return 1
-  status_is_paused_or_captain_held "$(last_status_line "$STATE/$task.status")"
+  key=$(pause_key "$win")
+  [ -e "$STATE/.paused-handover-$key" ] || return 0
+  rm -f "$STATE/.paused-handover-$key"
+  pause_declaration_lapsed "$task" || return 0
+  pause_handover_recheck "$win" "$task"
 }
 
 # The single recheck a pane owes on that crossing. The worker cannot be asked to
@@ -417,8 +450,9 @@ pause_handover_due() {  # <window> <task>
 # away-mode daemon uses for the same state. The wait is confirmed, not granted -
 # the escalation ladder resumes from the next poll and reaches
 # demand-deep-inspection exactly as before. Wakes, and wake() exits the process,
-# so every state change the poll owes must already be persisted before this is
-# called; otherwise the flag is never consumed and the crossing re-fires forever.
+# which is why pause_handover_flush is its only caller: the debt is recorded on
+# the poll that retires the declaration and paid at the top of a later one, so no
+# arm can lose its own unpersisted state to this exit.
 pause_handover_recheck() {  # <window> <task>
   local win=$1 task=$2 age reason
   age=$(status_declaration_age "$task")
@@ -445,10 +479,10 @@ pause_handover_recheck() {  # <window> <task>
 # that long without being re-declared the working verdict takes over and wedge
 # tracking resumes. That keeps the guarantee this override exists for - one stale
 # `paused:` line can never mute a wedge indefinitely - on a bound the watcher
-# evaluates itself, rather than on the worker's continued good behavior. The
-# callers that hand a pane back to wedge tracking on that crossing owe it one
-# pause_handover_recheck first, so a still-declared wait is confirmed before it is
-# alarmed on.
+# evaluates itself, rather than on the worker's continued good behavior. Retiring
+# a lapsed declaration owes it one pause_handover_recheck, so a still-declared
+# wait is confirmed before it is alarmed on; clear_pause_state records that debt
+# for every arm at once, rather than each arm remembering to.
 #
 # The .paused-rechecked-<key> marker is owned exclusively by the classifications
 # that came from the crew state or a dead agent, because the shortcut it arms
@@ -460,9 +494,7 @@ pause_handover_recheck() {  # <window> <task>
 # recomputes it every poll.
 pause_state_class() {  # <window> <task>
   local win=$1 task=$2 key last recheck_file class agent_alive declared_age
-  key=${win//:/_}
-  key=${key//\//_}
-  key=${key//./_}
+  key=$(pause_key "$win")
   last=$(last_status_line "$STATE/$task.status")
   recheck_file="$STATE/.paused-rechecked-$key"
   if ! status_is_paused_or_captain_held "$last"; then
@@ -513,7 +545,7 @@ pause_state_class() {  # <window> <task>
 
 surface_nonterminal_stale() {  # <window> <hash>
   local win=$1 h=$2 key task last
-  key=$(printf '%s' "$win" | tr ':/.' '___')
+  key=$(pause_key "$win")
   fm_wake_append stale "$win" "stale: $win" || exit 1
   printf '%s' "$h" > "$STATE/.stale-$key"
   rm -f "$STATE/.stale-since-$key"
@@ -1098,19 +1130,18 @@ EOF
   while IFS= read -r w; do
     kind=$(window_kind "$w")
     task=$(window_to_task "$w" "$STATE")
-    key=${w//:/_}
-    key=${key//\//_}
-    key=${key//./_}
+    key=$(pause_key "$w")
     last=$(last_status_line "$STATE/$task.status")
     if ! status_is_paused_or_captain_held "$last" && [ -e "$STATE/.paused-$key" ]; then
       clear_pause_tracking "$w"
     fi
+    pause_handover_flush "$w" "$task"
     if [ "$kind" = secondmate ] && ! status_is_paused "$last"; then
       continue
     fi
     tail40=$(fm_backend_capture "$(window_backend "$w")" "$w" 40 "$(window_label "$w")" 2>/dev/null) || continue
     h=$(printf '%s' "$tail40" | hash_pane)
-    key=$(printf '%s' "$w" | tr ':/.' '___')
+    key=$(pause_key "$w")
     hf="$STATE/.hash-$key"
     cf="$STATE/.count-$key"
     sf="$STATE/.stale-$key"
@@ -1198,13 +1229,10 @@ EOF
             task=$(window_to_task "$w" "$STATE")
             case "$(pause_state_class "$w" "$task")" in
               working)
-                handover=0
-                pause_handover_due "$w" "$task" && handover=1
                 clear_pause_tracking "$w"
                 printf '%s' "$h" > "$sf"
                 date +%s > "$ssf"
                 triage_log "absorbed non-terminal stale (provably working): $w"
-                [ "$handover" -eq 1 ] && pause_handover_recheck "$w" "$task"
                 ;;
               paused)
                 handle_paused_stale "$w" "$task" "$h"
@@ -1218,11 +1246,8 @@ EOF
             if [ -e "$pf" ] || status_is_paused_or_captain_held "$(last_status_line "$STATE/$task.status")"; then
               case "$(pause_state_class "$w" "$task")" in
                 paused)  handle_paused_stale "$w" "$task" "$h" ;;
-                working) handover=0
-                         pause_handover_due "$w" "$task" && handover=1
-                         clear_pause_state "$w"
+                working) clear_pause_state "$w"
                          printf '%s' "$h" > "$sf"
-                         [ "$handover" -eq 1 ] && pause_handover_recheck "$w" "$task"
                          wedge_timer_check "$w" "$ssf" "non-terminal stale (provably working after a declared pause)" "$ewf"
                          triage_log "absorbed non-terminal stale (provably working): $w" ;;
                 *)       handle_paused_stale "$w" "$task" "$h" ;;

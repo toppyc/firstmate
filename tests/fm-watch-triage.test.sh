@@ -1356,6 +1356,117 @@ test_current_declared_pause_survives_a_moving_pane_under_a_live_worker() {
   pass "a current declared pause holds the bounded cadence across a moving pane under a live worker"
 }
 
+# The handover is owed by the declaration lapsing, not by which arm of the poll
+# loop happens to notice. A pane whose capture moved on the very poll its
+# declaration lapsed leaves the cadence through the redraw arm rather than either
+# stale arm, and that arm retires the pause outright - so if the debt is recorded
+# per-arm, this pane silently loses its recheck and the next thing the captain
+# hears is a bare wedge escalation. Same lapse, different arm, same one recheck.
+test_lapsed_declared_pause_hands_over_from_the_redraw_arm() {
+  local dir state fakebin out drain_out capture_file statusf window key pane_hash sig pid
+  dir=$(make_case lapsed-pause-redraw); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
+  window="test:fm-pause-redraw"; statusf="$state/pause-redraw.status"
+  printf 'idle pane, suite running elsewhere, after the redraw\n' > "$capture_file"
+  printf 'window=%s\nkind=ship\nharness=claude\nbackend=tmux\n' "$window" > "$state/pause-redraw.meta"
+  printf 'working: implementing\npaused: waiting on the backend suite\n' > "$statusf"
+  backdate_status "$statusf" 4000
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-pause-redraw_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle pane, suite running elsewhere, before the redraw")
+  # Established on the pause cadence at the PREVIOUS capture, which is what makes
+  # the first poll take the redraw arm: the pane it now captures is a new hash.
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '%s' "$pane_hash" > "$state/.stale-$key"
+  printf '2\n' > "$state/.count-$key"
+  : > "$state/.paused-$key"
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=zsh \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_STALE_ESCALATE_SECS=2 FM_PAUSE_RESURFACE_SECS=3600 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 || { reap "$pid"; unset FM_FAKE_CREW_STATE; fail "a declaration that lapsed on a redraw poll produced no wake at all"; }
+  grep -F "confirm the wait still holds" "$out" >/dev/null \
+    || { unset FM_FAKE_CREW_STATE; fail "the redraw arm handed the pause back with no confirming recheck: $(cat "$out")"; }
+  grep -F "awaiting external" "$out" >/dev/null \
+    || { unset FM_FAKE_CREW_STATE; fail "the redraw arm's handover lost the declared-pause wording: $(cat "$out")"; }
+  grep -F "possible wedge" "$out" >/dev/null \
+    && { unset FM_FAKE_CREW_STATE; fail "the redraw arm opened with wedge wording instead of the handover recheck"; }
+  [ ! -e "$state/.paused-$key" ] || { unset FM_FAKE_CREW_STATE; fail "the redraw arm left the pane on the pause cadence"; }
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || { unset FM_FAKE_CREW_STATE; fail "drain after the redraw handover failed"; }
+  grep "$(printf '\tstale\t')" "$drain_out" | grep -F "$window" >/dev/null \
+    || { unset FM_FAKE_CREW_STATE; fail "the redraw arm's handover recheck was not queued"; }
+  unset FM_FAKE_CREW_STATE
+  pass "a declaration that lapses on a redraw poll still gets its one confirming recheck"
+}
+
+# The other direction on the busy-pane arm, which now routes through the same
+# handover owner. A busy pane is by definition NOT idling on an external wait, so
+# a stale declaration must buy it nothing beyond the single confirming recheck:
+# it must never be absorbed back onto the pause cadence, and it must still climb
+# the wedge ladder with the wedge wording once its turn-age bound is crossed.
+test_busy_pane_under_a_stale_declaration_still_wedge_escalates() {
+  local dir state fakebin out capture_file statusf window key pane_hash sig pid
+  dir=$(make_case busy-stale-declaration); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  window="test:fm-busy-paused"; statusf="$state/busy-paused.status"
+  printf 'Working...' > "$capture_file"
+  printf 'window=%s\nkind=ship\nharness=pi\n' "$window" > "$state/busy-paused.meta"
+  record_pi_busy "$state" busy-paused
+  printf 'working: setup complete\npaused: waiting on the backend suite\n' > "$statusf"
+  backdate_status "$statusf" 4000
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-busy-paused_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "Working...")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '2\n' > "$state/.count-$key"
+  : > "$state/.paused-$key"
+  # No completed turn ever recorded for this task: age the spawn record itself.
+  touch -t 200001010000 "$state/busy-paused.meta"
+
+  # Phase A: the pane leaves its lapsed declaration, spending the one recheck.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 \
+    FM_PAUSE_RESURFACE_SECS=3600 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 || { reap "$pid"; fail "a busy pane never left its stale declaration: $(cat "$out")"; }
+  [ ! -e "$state/.paused-$key" ] || fail "a busy pane was absorbed onto the pause cadence by a stale declaration"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the intentional busy-pane handover stop"
+
+  # Phase B: with the declaration retired the busy-turn bound owns the pane, so
+  # it goes on the wedge timer and stays there - never back to the pause cadence.
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 \
+    FM_PAUSE_RESURFACE_SECS=3600 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_numeric_file "$state/.stale-since-$key" 60 \
+    || { reap "$pid"; fail "a busy pane past its turn-age bound did not start a wedge timer: $(cat "$out")"; }
+  [ ! -e "$state/.paused-$key" ] || { reap "$pid"; fail "a busy pane recovered the pause cadence from its stale declaration"; }
+  reap "$pid"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the intentional busy-pane timer stop"
+
+  # Phase C: the ladder behind it is untouched - the declaration bought a
+  # confirmation, not immunity.
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 \
+    FM_PAUSE_RESURFACE_SECS=3600 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 || { reap "$pid"; fail "a busy pane under a stale declaration never wedge-escalated"; }
+  grep -F "possible wedge" "$out" >/dev/null || fail "the busy-pane escalation lost its wedge wording: $(cat "$out")"
+  grep -F "awaiting external" "$out" >/dev/null && fail "a busy pane was escalated as a declared-pause recheck"
+  [ ! -e "$state/.paused-$key" ] || fail "a busy pane recovered the pause cadence across the escalation"
+  pass "a busy pane under a stale declaration spends one recheck and still climbs the wedge ladder"
+}
+
 # --- consecutive wedge escalations on the same pane demand deep inspection ----
 # Root cause of the PR #252 incident's ~20 minutes of unnoticed green: each
 # wedge escalation fires, gets classified as "still validating" one poll later
@@ -2230,6 +2341,8 @@ test_current_declared_pause_absorbed_despite_prior_wedge_escalation
 test_stale_declared_pause_still_wedge_escalates
 test_lapsed_declared_pause_hands_over_with_one_recheck
 test_current_declared_pause_survives_a_moving_pane_under_a_live_worker
+test_lapsed_declared_pause_hands_over_from_the_redraw_arm
+test_busy_pane_under_a_stale_declaration_still_wedge_escalates
 test_nonterminal_stale_repairs_missing_or_corrupt_timer
 test_triage_log_size_cap_accepts_spaced_wc_counts
 test_procevent_captured_result_surfaces_proactively
