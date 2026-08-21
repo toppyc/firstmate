@@ -1200,6 +1200,15 @@ test_stale_declared_pause_still_wedge_escalates() {
   pass "a stale declared pause still wedge-escalates, so a worker cannot mute the alarm by never re-declaring"
 }
 
+# Once absorbed, a pane must STAY on the bounded pause cadence for as long as its
+# declaration is current - including while the captured pane keeps moving, which
+# over a multi-hour wait it will (a ticking clock, a token counter, a redraw).
+# The incident's worker is LIVE, so this also pins that the absorb decision is
+# re-derived from the declaration on every poll rather than cached behind the
+# recheck marker, whose shortcut can only answer paused for a confidently DEAD
+# agent: cached, a live worker's honored pause alternates between absorbed and
+# unclassified, and an unclassified poll drops the pane off the cadence entirely.
+# The pane is established through real polls rather than by seeding its markers,
 # so the classifier is entered in the state it actually produces.
 test_current_declared_pause_survives_a_moving_pane_under_a_live_worker() {
   local dir state fakebin out capture_file statusf window key sig pid i dropped
@@ -1303,6 +1312,17 @@ test_busy_pane_under_a_stale_declaration_still_wedge_escalates() {
   [ ! -e "$state/.paused-$key" ] || fail "a busy pane recovered the pause cadence across the escalation"
   pass "a busy pane carrying a declaration is never absorbed as paused and still climbs the wedge ladder"
 }
+
+# --- consecutive wedge escalations on the same pane demand deep inspection ----
+# Root cause of the PR #252 incident's ~20 minutes of unnoticed green: each
+# wedge escalation fires, gets classified as "still validating" one poll later
+# (the timer restarts, see wedge_timer_check), and repeats forever on a pane
+# that never changes. A single escalation reason looks identical every round,
+# so nothing in the payload itself signals "this has now happened N times in a
+# row" - that judgment call was left entirely to the supervisor noticing the
+# repetition on its own. This is the safety-net fix: past
+# FM_WEDGE_DEMAND_INSPECT_COUNT consecutive escalations on the SAME pane, the
+# wake reason itself carries a "demand-deep-inspection" marker.
 
 test_wedge_escalation_marks_demand_deep_inspection_after_threshold() {
   local dir state fakebin out capture_file window key pane_hash sig pid n
