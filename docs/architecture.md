@@ -19,7 +19,8 @@ A concurrent replacement remains armed, every non-merged or invalid observation 
 `bin/fm-pr-lib.sh` owns the receipt format and strict identity mechanics, while `bin/fm-watch.sh` owns queue-before-retirement ordering.
 No-verb wakes, such as `working:` notes and bare turn-ended signals, are benign only when `bin/fm-crew-state.sh` reports positive evidence that the crew is still working: an actively running no-mistakes step attributed to that crew's current code, or an exact busy verdict from the semantic busy-state contract.
 A `kind=secondmate` task's status signal is the parent-directed reply stream and is never absorbed as provably working; only its bare turn-ended signal retains the ordinary absorb rule.
-A crew that declares `paused:` for a known external wait is separately absorbed while idle and re-surfaced only on the longer pause cadence, rather than being treated as a possible wedge.
+A crew that declares `paused:` for a known external wait is separately absorbed while that declaration stays current and re-surfaced only on the longer pause cadence, rather than being treated as a possible wedge, even when a running pipeline makes its authoritative current state read working.
+The declaration goes stale once it has gone `FM_PAUSE_RESURFACE_SECS` without being re-declared, and a working crew then returns to ordinary wedge escalation, so one forgotten `paused:` line cannot mute a wedge indefinitely.
 For an ordinary crew that has stopped, the normal-mode watcher first surfaces one stale wake, then applies that same cadence to an unchanged `paused:` or durable `captain-held` endpoint only when the backend confidently reports its agent dead.
 Live or inconclusive liveness remains fail-open at that initial surface, and the secondmate idle-endpoint exemption is unchanged.
 Its initial normal-mode status signal still surfaces through the no-verb path, while away mode self-handles that routine signal and owns the later recheck.
