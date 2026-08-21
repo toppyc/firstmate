@@ -20,7 +20,14 @@
 #                          line, since the crew's own log gets no new entry once
 #                          firstmate hands it to a no-mistakes validation. A declared
 #                          external-wait pause is absorbed instead with its own long
-#                          re-surface cadence, never as a wedge. Only when neither
+#                          re-surface cadence, never as a wedge, for as long as
+#                          the declaration stays current: a running pipeline does
+#                          not retire it (crew_absorb_class gives the run
+#                          precedence over the log, so a worker working through
+#                          its own declared wait reports working throughout), but
+#                          leaving it un-redeclared past FM_PAUSE_RESURFACE_SECS
+#                          does, so one stale paused: line cannot mute a wedge
+#                          forever. Only when neither
 #                          absorb class applies does the log's last line decide:
 #                          terminal (captain-relevant) or non-terminal (no verb),
 #                          both surfaced at once. A provably-working stale past the
@@ -166,6 +173,9 @@ BUSY_TURN_MAX_SECS=${FM_BUSY_TURN_MAX_SECS:-3600}
 # bounded cadence, while a live or ambiguously read agent still surfaces once.
 # These cases re-surface once for a recheck every PAUSE_RESURFACE_SECS - far
 # longer than the wedge threshold, but finite so a forgotten hold cannot rot invisibly.
+# The same window doubles as how long one declaration stays current; pause_state_class
+# owns that rule, so changing this knob also moves when a working crew's declared
+# pause is retired.
 PAUSE_RESURFACE_SECS=${FM_PAUSE_RESURFACE_SECS:-$FM_PAUSE_RESURFACE_SECS_DEFAULT}
 # Consecutive event-path failures (fm_backend_wait_transition returning 2 -
 # connect/subscribe failure) before the push fast-path is disabled for the rest
@@ -323,6 +333,32 @@ busy_turn_over_age() {  # <task>
   [ "$(age_of "$f")" -ge "$BUSY_TURN_MAX_SECS" ]
 }
 
+# The per-window suffix every $STATE/.<marker>-<key> file this watcher keeps is
+# named by. One owner, because a window identity that keyed two ways would give a
+# pane two independent sets of stale, pause and escalation bookkeeping that never
+# see each other.
+pause_key() {  # <window>
+  local k=${1//:/_}
+  k=${k//\//_}
+  printf '%s' "${k//./_}"
+}
+
+# Age in seconds of <task>'s current status DECLARATION, anchored on the status
+# file's mtime. This is the one anchor for "how long ago did the worker last say
+# this": handle_paused_stale paces its re-surface on it, and pause_state_class
+# decides on it whether a declared pause is still current. Anchoring on the file
+# rather than a per-hash marker is what stops a churny idle pane from resetting
+# the cadence; and because any later status line ends the pause outright (the
+# last-line check in pause_state_class), only re-declaring the pause refreshes it.
+# Prints nothing when the mtime is unreadable, leaving each caller to state its
+# own fallback rather than sharing one that suits only one of them.
+status_declaration_age() {  # <task>
+  local task=$1 mtime
+  mtime=$(stat_mtime "$STATE/$task.status")
+  case "$mtime" in ''|*[!0-9]*) return 0 ;; esac
+  printf '%s' "$(( $(date +%s) - mtime ))"
+}
+
 # Absorb a stale pane under a declared external-wait pause (paused:) or a
 # dead-agent captain-held transfer, and re-surface it once every
 # PAUSE_RESURFACE_SECS for a recheck so it cannot rot invisibly. Called on any
@@ -333,16 +369,26 @@ busy_turn_over_age() {  # <task>
 # timer would. A .paused-resurfaced-<key> throttle marker records the last
 # re-surface epoch so, once past the window, it fires once per window rather than
 # every poll. Advances the stale suppressor to <hash> and flags the key paused.
+#
+# .paused-<key> records only that this key's stale bookkeeping is pause-shaped,
+# and it carries TWO meanings that nothing downstream can currently tell apart.
+# Set here it means ABSORBED: the pane is idling on the bounded cadence and the
+# captain has not been told. surface_nonterminal_stale sets the same flag for a
+# pane it has just SURFACED with a bare stale wake, where the captain HAS been
+# told. Those two states deserve different treatment when the cadence is later
+# retired - an absorbed pane leaves an unreported wait behind, a surfaced one does
+# not - so any future reader that wants to act on the difference must distinguish
+# them first rather than reading this flag as if it meant absorbed.
 handle_paused_stale() {  # <window> <task> <hash>
-  local win=$1 task=$2 h=$3 key statusf mtime age rf rf_age reason
-  key=$(printf '%s' "$win" | tr ':/.' '___')
+  local win=$1 task=$2 h=$3 key age rf rf_age reason
+  key=$(pause_key "$win")
   printf '%s' "$h" > "$STATE/.stale-$key"
   : > "$STATE/.paused-$key"
   rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
-  statusf="$STATE/$task.status"
-  mtime=$(stat_mtime "$statusf")
-  case "$mtime" in ''|*[!0-9]*) mtime=$(date +%s) ;; esac
-  age=$(( $(date +%s) - mtime ))
+  # An unreadable mtime reads as "just declared" here, so a vanished status file
+  # cannot turn one poll into a spurious recheck.
+  age=$(status_declaration_age "$task")
+  [ -n "$age" ] || age=0
   rf="$STATE/.paused-resurfaced-$key"
   rf_age=$(age_of "$rf")   # 999999 when no prior re-surface
   if [ "$age" -ge "$PAUSE_RESURFACE_SECS" ] && [ "$rf_age" -ge "$PAUSE_RESURFACE_SECS" ]; then
@@ -356,17 +402,13 @@ handle_paused_stale() {  # <window> <task> <hash>
 
 clear_pause_state() {  # <window>
   local win=$1 key
-  key=${win//:/_}
-  key=${key//\//_}
-  key=${key//./_}
+  key=$(pause_key "$win")
   rm -f "$STATE/.paused-$key" "$STATE/.paused-rechecked-$key" "$STATE/.paused-resurfaced-$key"
 }
 
 clear_pause_tracking() {  # <window>
   local win=$1 key
-  key=${win//:/_}
-  key=${key//\//_}
-  key=${key//./_}
+  key=$(pause_key "$win")
   clear_pause_state "$win"
   rm -f "$STATE/.stale-$key" "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
 }
@@ -374,11 +416,32 @@ clear_pause_tracking() {  # <window>
 # Reconcile a declared pause or captain-held status with authoritative crew state.
 # Only a confidently dead ordinary crew may recover paused classification after
 # fm-crew-state has fallen back to stopped or unknown.
+#
+# An authoritative `working` verdict does NOT by itself retire a declaration.
+# crew_absorb_class gives a running pipeline precedence over the status log, so a
+# worker that declares a long external wait and is genuinely working through it
+# reports `working` for the whole wait - the healthiest evidence there is, and
+# previously the one verdict that resumed wedge escalation, so a declared wait was
+# escalated as a possible wedge every STALE_ESCALATE_SECS for its full length.
+# The declaration is therefore weighed on its own age instead: while it is still
+# current (younger than the PAUSE_RESURFACE_SECS window a single declaration is
+# good for) a working crew is absorbed on the pause cadence, and once it has gone
+# that long without being re-declared the working verdict takes over and wedge
+# tracking resumes. That keeps the guarantee this override exists for - one stale
+# `paused:` line can never mute a wedge indefinitely - on a bound the watcher
+# evaluates itself, rather than on the worker's continued good behavior.
+#
+# The .paused-rechecked-<key> marker is owned exclusively by the classifications
+# that came from the crew state or a dead agent, because the shortcut it arms
+# (below) can only ever answer `paused` for an agent that is confidently DEAD. A
+# classification justified by the declaration's age must therefore leave the
+# marker alone: recording one would arm that shortcut for a LIVE agent, whose only
+# outcome there is `none`, and an honored pause would flip between absorbed and
+# unclassified on alternate polls. Age is cheap to re-derive, so this path simply
+# recomputes it every poll.
 pause_state_class() {  # <window> <task>
-  local win=$1 task=$2 key last recheck_file class agent_alive
-  key=${win//:/_}
-  key=${key//\//_}
-  key=${key//./_}
+  local win=$1 task=$2 key last recheck_file class agent_alive declared_age
+  key=$(pause_key "$win")
   last=$(last_status_line "$STATE/$task.status")
   recheck_file="$STATE/.paused-rechecked-$key"
   if ! status_is_paused_or_captain_held "$last"; then
@@ -400,6 +463,13 @@ pause_state_class() {  # <window> <task>
   fi
   class=$(crew_absorb_class "$task")
   if [ "$class" = working ]; then
+    # An unreadable declaration age counts as stale, so an unconfirmable pause
+    # yields to wedge tracking rather than suppressing it.
+    declared_age=$(status_declaration_age "$task")
+    if [ -n "$declared_age" ] && [ "$declared_age" -lt "$PAUSE_RESURFACE_SECS" ]; then
+      printf 'paused'
+      return
+    fi
     rm -f "$recheck_file"
     printf 'working'
     return
@@ -420,9 +490,16 @@ pause_state_class() {  # <window> <task>
   printf '%s' "$class"
 }
 
+# The other setter of .paused-<key>, and the reason that flag cannot be read as a
+# record of what the captain has been told. Here it means SURFACED: the captain
+# has just been woken about this pane, and the flag only puts its stale
+# bookkeeping on the pause shape so the same wake is not repeated every poll.
+# handle_paused_stale's flag means the opposite - absorbed, captain not told. See
+# the note there for why anything acting on that difference has to establish it
+# some other way.
 surface_nonterminal_stale() {  # <window> <hash>
   local win=$1 h=$2 key task last
-  key=$(printf '%s' "$win" | tr ':/.' '___')
+  key=$(pause_key "$win")
   fm_wake_append stale "$win" "stale: $win" || exit 1
   printf '%s' "$h" > "$STATE/.stale-$key"
   rm -f "$STATE/.stale-since-$key"
@@ -1007,9 +1084,7 @@ EOF
   while IFS= read -r w; do
     kind=$(window_kind "$w")
     task=$(window_to_task "$w" "$STATE")
-    key=${w//:/_}
-    key=${key//\//_}
-    key=${key//./_}
+    key=$(pause_key "$w")
     last=$(last_status_line "$STATE/$task.status")
     if ! status_is_paused_or_captain_held "$last" && [ -e "$STATE/.paused-$key" ]; then
       clear_pause_tracking "$w"
@@ -1019,7 +1094,6 @@ EOF
     fi
     tail40=$(fm_backend_capture "$(window_backend "$w")" "$w" 40 "$(window_label "$w")" 2>/dev/null) || continue
     h=$(printf '%s' "$tail40" | hash_pane)
-    key=$(printf '%s' "$w" | tr ':/.' '___')
     hf="$STATE/.hash-$key"
     cf="$STATE/.count-$key"
     sf="$STATE/.stale-$key"
