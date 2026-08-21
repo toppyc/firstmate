@@ -16,7 +16,7 @@
 # fixed mapping logic, no heuristics and no LLM. Output is one stable, parseable,
 # token-tight line firstmate can read every heartbeat:
 #
-#   state: <working|parked|done|blocked|paused|failed|unknown> · source: <run-step|pane|status-log|none> · <detail>
+#   state: <working|parked|done|blocked|paused|failed|unknown> · source: <run-step|pane|status-log|run-unbound|none> · <detail>
 #
 # Logic, in order:
 #   1. Resolve worktree + backend target + kind from state/<id>.meta.
@@ -24,10 +24,13 @@
 #      active or terminal (from `axi status`, or the coarse `no-mistakes runs`
 #      fallback)? Branch name alone is not enough: a historical run on a reused
 #      branch whose head was rewritten or diverged must not be attributed.
-#      A run matches when its head equals the worktree HEAD, or the worktree HEAD
-#      is an ancestor of the run head (pipeline fix commits advanced the run on
-#      the same line of history). Local work that advanced past the run head, or
-#      diverged from it, invalidates attribution.
+#      bin/fm-nm-run-lib.sh's fm_nm_run_binding owns which of the run's reported
+#      heads bind and what a non-binding head means; the coarse fallback binds
+#      the branch's NEWEST row only, because the list is newest-first and an
+#      older row is superseded by construction - scanning past a newest row
+#      whose head does not bind is what let a dead terminal run outrank the live
+#      one. A run found on this crew's branch that does not bind is REPORTED
+#      (see step 5) rather than dropped.
 #      The run-step is AUTHORITATIVE: running/fixing -> working, ci -> working,
 #      awaiting_approval/fix_review -> parked (with gate findings), terminal
 #      passed/checks-passed -> done, failed/cancelled -> failed. EXCEPT: while
@@ -45,7 +48,12 @@
 #      `resolved` never become current state or detail.
 #   5. Missing meta or torn-down worktree: report unknown · none. If no run is
 #      attributed to this crew, a dead endpoint also reports unknown · none rather
-#      than trusting a stale status log.
+#      than trusting a stale status log. When a run WAS found on this crew's
+#      branch and refused, every verdict that still reports `unknown` carries
+#      why, and one with no source at all reports source run-unbound instead:
+#      `unknown · none` used to read identically for a crew whose worker has
+#      vanished and for one whose live run this reader silently discarded, which
+#      sends a supervisor acting on a deep-inspection demand to a dead end.
 #
 # Read-only and side-effect free. Always exits 0 on a successful read regardless
 # of state; exit 2 only on a usage error (no id).
@@ -75,7 +83,7 @@ LOG="$STATE/$ID.status"
 NM_TIMEOUT=${FM_CREW_STATE_NM_TIMEOUT:-10}
 case "$NM_TIMEOUT" in ''|*[!0-9]*) NM_TIMEOUT=10 ;; esac
 # How many of the most recent `no-mistakes runs` rows the cross-branch fallback
-# (nm_runs_status_for_branch, below) scans. Generous enough to still find a
+# (nm_runs_row_for_branch, below) scans. Generous enough to still find a
 # branch's own run on a busy multi-crew fleet without listing the entire
 # history every call.
 FM_CREW_STATE_RUNS_LIMIT=${FM_CREW_STATE_RUNS_LIMIT:-200}
@@ -331,11 +339,13 @@ nm_ci_checks_state() {
 # "<status> <branch> <short-sha> <date> [<pr-url>]" separated by runs of
 # spaces (verified: no quoting, so splitting on the first two whitespace runs
 # is exact) - but branch + coarse status is exactly what this predicate needs:
-# is a run for THIS branch active right now. Echoes the first (most recent)
-# matching row's status word (running/completed/cancelled/failed), or empty
-# when the branch has no run within FM_CREW_STATE_RUNS_LIMIT rows.
-nm_runs_status_for_branch() {  # <branch>
-  local branch=$1 out row st rest br sha
+# is a run for THIS branch active right now. Echoes the branch's most recent row
+# as "<identity-verdict>|<status>|<short-sha>" - the status word
+# (running/completed/cancelled/failed) is this crew's current state only when
+# the verdict is `match` - or nothing when the branch has no run within
+# FM_CREW_STATE_RUNS_LIMIT rows.
+nm_runs_row_for_branch() {  # <branch>
+  local branch=$1 out row st rest br sha verdict
   out=$(nm_run runs --limit "$FM_CREW_STATE_RUNS_LIMIT")
   [ -n "$out" ] || return 0
   while IFS= read -r row; do
@@ -348,15 +358,15 @@ nm_runs_status_for_branch() {  # <branch>
     rest=${rest#* }
     rest=$(trim "$rest")
     sha=${rest%% *}
-    if [ "$br" = "$branch" ]; then
-      # Same code-identity rule as axi status: skip a same-branch row whose
-      # short-sha does not match this worktree (rewritten or advanced tip).
-      if ! nm_coarse_head_matches_worktree "$sha"; then
-        continue
-      fi
-      printf '%s' "$st"
-      return 0
-    fi
+    [ "$br" = "$branch" ] || continue
+    # Newest-first, so the branch's TOPMOST row is its current run and every
+    # older row is superseded by construction. Bind or reject on this row
+    # alone: scanning past it once its head does not bind is what let a dead
+    # terminal run at an older, still-resolvable head be reported as this
+    # crew's current state while its live run advanced beyond this worktree.
+    verdict=$(fm_nm_head_verdict "$WT" "$sha")
+    printf '%s|%s|%s' "$verdict" "$st" "$sha"
+    return 0
   done <<< "$out"
   return 0
 }
@@ -365,20 +375,19 @@ nm_runs_status_for_branch() {  # <branch>
 # scratch worktree); with no branch there is no run to attribute to this crew.
 CREW_BRANCH=$(git -C "$WT" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
 
-# 0 if the active axi-status run's head field matches this worktree's code
-# identity. Branch match is a precondition (caller). Rule owned by
-# fm_nm_head_matches_worktree in bin/fm-nm-run-lib.sh.
-nm_run_head_matches_worktree() {
-  local run_head
-  run_head=$(strip_quotes "$(nm_field head)")
-  fm_nm_head_matches_worktree "$WT" "$run_head"
-}
-
-# Coarse runs-list rows are "<status> <branch> <short-sha> ...". 0 if the short
-# sha for this branch row matches the worktree head under the same rules as
-# nm_run_head_matches_worktree (equal, or local is ancestor of run tip).
-nm_coarse_head_matches_worktree() {  # <short-sha>
-  fm_nm_head_matches_worktree "$WT" "$1"
+# Why a run found on THIS crew's branch was not attributed, kept so an
+# otherwise sourceless verdict can name it instead of reading as no source at
+# all. Set once, by the first lookup that finds and refuses such a run.
+RUN_REJECT=""
+note_unattributed_run() {  # <what> <verdict> <head>
+  local reason
+  [ -z "$RUN_REJECT" ] || return 0
+  case "$2" in
+    unresolved) reason="head $3 is not an object in this worktree (unpushed pipeline commits?)" ;;
+    mismatch)   reason="head $3 is not this worktree's code identity" ;;
+    *)          reason="no usable head reported" ;;
+  esac
+  RUN_REJECT="$1 not attributed: $reason"
 }
 
 HAVE_RUN=0
@@ -394,20 +403,42 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
   RUN_OUT=$(nm_run axi status)
   if [ -n "$RUN_OUT" ]; then
     run_branch=$(strip_quotes "$(nm_field branch)")
-    if [ -n "$run_branch" ] && [ "$run_branch" = "$CREW_BRANCH" ] && nm_run_head_matches_worktree; then
-      HAVE_RUN=1
-    else
-      # The active-or-most-recent run is for another branch, or same branch with
-      # a rewritten/diverged head (the CLI is alive and answered; only the
-      # attribution missed) - try the coarse fallback.
+    if [ -n "$run_branch" ] && [ "$run_branch" = "$CREW_BRANCH" ]; then
+      binding=$(fm_nm_run_binding "$WT" "$RUN_OUT")
+      binding_verdict=${binding%% *}
+      binding_head=${binding#* }
+      [ "$binding_head" != "$binding" ] || binding_head=""
+      if [ "$binding_verdict" = match ]; then
+        HAVE_RUN=1
+      else
+        run_id=$(strip_quotes "$(nm_field id)")
+        if [ -n "$run_id" ]; then run_id="run $run_id"; else run_id="run on this branch"; fi
+        note_unattributed_run "$run_id" "$binding_verdict" "$binding_head"
+      fi
+    fi
+    if [ "$HAVE_RUN" = 0 ]; then
+      # The active-or-most-recent run is for another branch, or is this branch's
+      # own run with no head that binds (the CLI is alive and answered; only the
+      # attribution missed) - try the coarse fallback, which sees every branch's
+      # rows rather than only the repo-wide active-or-most-recent one.
       # Deliberately nested inside `[ -n "$RUN_OUT" ]`: an empty/timed-out
       # primary call means the CLI itself did not respond, so retrying it
       # immediately with a second bounded call would just double the wait
       # for no better answer.
-      COARSE_STATUS=$(nm_runs_status_for_branch "$CREW_BRANCH")
-      if [ -n "$COARSE_STATUS" ]; then
-        HAVE_RUN=1
-        RUN_SOURCE=coarse
+      coarse_row=$(nm_runs_row_for_branch "$CREW_BRANCH")
+      if [ -n "$coarse_row" ]; then
+        coarse_verdict=${coarse_row%%|*}
+        coarse_rest=${coarse_row#*|}
+        COARSE_STATUS=${coarse_rest%%|*}
+        coarse_sha=${coarse_rest#*|}
+        if [ "$coarse_verdict" = match ]; then
+          HAVE_RUN=1
+          RUN_SOURCE=coarse
+        else
+          COARSE_STATUS=""
+          note_unattributed_run "newest run listed for this branch" \
+            "$coarse_verdict" "$coarse_sha"
+        fi
       fi
     fi
   fi
@@ -536,8 +567,31 @@ fi
 # liveness, so a finished-but-pane-closed crew never reaches here. Down here there
 # is no run to consult, so a dead/unreadable target means the crew is gone: report
 # unknown rather than trusting a possibly-stale status log as the current state.
-[ -n "$BACKEND_TARGET" ] || emit unknown none "no backend target recorded"
-pane_readable "$BACKEND_TARGET" || emit unknown none "backend target gone: $BACKEND_TARGET"
+#
+# A verdict from here down that still cannot name a current state carries why a
+# run on this crew's branch was refused when there was one, and names the source
+# run-unbound instead of none. That is the whole difference between "this crew
+# has vanished" and "its run is right there and this reader would not bind it",
+# which a supervisor sent here by a deep-inspection demand has to be able to tell
+# apart without going and reading `axi status` by hand.
+#
+# ONLY on `unknown`, deliberately. A verdict that names a real state - working
+# from a busy pane, working from the status log - is not a dead end: it already
+# answered the question, and a refused run there is usually just the branch's
+# superseded previous run, exactly what the guard is for. Detail on a healthy
+# line trains a supervisor to skip the line, and then the one occurrence that
+# mattered gets skipped with it. Put the reason where somebody is stuck.
+emit_fallback() {  # <state> <source> [detail]
+  local state=$1 source=$2 detail=${3:-}
+  if [ -n "$RUN_REJECT" ] && [ "$state" = unknown ]; then
+    if [ -n "$detail" ]; then detail="$detail${SEP}$RUN_REJECT"; else detail="$RUN_REJECT"; fi
+    [ "$source" = none ] && source=run-unbound
+  fi
+  emit "$state" "$source" "$detail"
+}
+
+[ -n "$BACKEND_TARGET" ] || emit_fallback unknown none "no backend target recorded"
+pane_readable "$BACKEND_TARGET" || emit_fallback unknown none "backend target gone: $BACKEND_TARGET"
 
 # Secondmates idle on their own watcher (idle pane = healthy), so the busy
 # state is not meaningful for them; read their state from the status log only.
@@ -547,9 +601,9 @@ pane_readable "$BACKEND_TARGET" || emit unknown none "backend target gone: $BACK
 if [ "$KIND" != secondmate ]; then
   BUSY_VERDICT=$(crew_busy_verdict "$BACKEND_TARGET")
   case "${BUSY_VERDICT%% *}" in
-    busy) emit working pane "harness busy (${BUSY_VERDICT#* })" ;;
+    busy) emit_fallback working pane "harness busy (${BUSY_VERDICT#* })" ;;
     idle) ;;
-    *) emit unknown pane "harness state unavailable ($BUSY_VERDICT)" ;;
+    *) emit_fallback unknown pane "harness state unavailable ($BUSY_VERDICT)" ;;
   esac
 fi
 
@@ -566,8 +620,8 @@ fi
 if [ -n "$LOG_VERB" ]; then
   LOG_STATE=$(map_log_state "$LOG_LINE")
   if [ "$LOG_STATE" != unknown ]; then
-    emit "$LOG_STATE" status-log "$(status_line_note "$LOG_LINE")"
+    emit_fallback "$LOG_STATE" status-log "$(status_line_note "$LOG_LINE")"
   fi
 fi
 
-emit unknown none "no current-state source available"
+emit_fallback unknown none "no current-state source available"

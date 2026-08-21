@@ -27,6 +27,7 @@ Treat the digest's endpoint result as a presence signal, not proof that the task
 Read the targeted current state with `bin/fm-crew-state.sh <id>` before deciding to relaunch.
 A no-mistakes run matched to the crew's branch and current code remains authoritative when the endpoint is dead: handle a terminal or parked run through the normal lifecycle, and keep supervising an active run instead of creating a duplicate worker.
 
+An `unknown` state whose source is `run-unbound` is not a missing run: the reader found one on the crew's branch and refused to bind it, and the printed reason says why, so read that run with `no-mistakes axi status` in the recorded worktree before treating the task as unaccounted for.
 When no authoritative run accounts for the task, inspect only its recorded backend and worktree inventory.
 Use `treehouse status` for treehouse-backed tmux, herdr, zellij, or cmux tasks, and use the recorded `orca_worktree_id=` and `terminal=` for Orca tasks.
 Do not sweep another home's endpoints or infer ownership from a matching window label.
