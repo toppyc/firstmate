@@ -7,16 +7,44 @@
 # Merge method defaults to --squash when the caller passes none of --squash,
 # --merge, --rebase, or --method after the optional -- separator. Extra args
 # must not include --repo or -R because the repository comes only from the URL.
-# Usage: fm-pr-merge.sh <task-id> <pr-url> [-- <extra gh-axi pr merge args>]
+#
+# --no-worker merges a PR firstmate opened itself for a backlog item that never
+# had a worker: no crewmate, no worktree, no runtime metadata, and so nothing to
+# tear down. The recorded pr= and pr_head= exist only so bin/fm-teardown.sh can
+# verify landed work, so with no worker there is no consumer for them and the
+# flag skips the bin/fm-pr-check.sh recording step entirely; firstmate updates
+# the backlog item on completion as it does for any other finished work.
+# The flag is an assertion this script verifies rather than trusts: it refuses
+# when the task has runtime metadata, a brief or report directory at
+# data/<task-id>/, or a status log at state/<task-id>.status, because each of
+# those means a worker did exist and its metadata has gone missing. Absent
+# metadata alone never relaxes anything - without --no-worker the refusal is
+# exactly as it was, so a mistyped task id still stops the merge.
+# Usage: fm-pr-merge.sh [--no-worker] <task-id> <pr-url> [-- <extra gh-axi pr merge args>]
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 
 # shellcheck source=bin/fm-pr-lib.sh
 . "$SCRIPT_DIR/fm-pr-lib.sh"
+
+usage() {
+  # The whole leading comment block, ending at the first non-comment line.
+  sed -n '2,${/^#/!q;p;}' "$0" | sed 's/^# \{0,1\}//'
+}
+
+NO_WORKER=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --no-worker) NO_WORKER=1; shift ;;
+    *) break ;;
+  esac
+done
 
 if [ "$#" -lt 2 ]; then
   echo "error: invalid PR merge request" >&2
@@ -65,16 +93,38 @@ reject_repo_overrides "$@" || exit 1
 
 # Task-derived paths are constructed only after the canonical ID validation.
 META="$STATE/$ID.meta"
-if [ ! -f "$META" ] || [ -L "$META" ]; then
-  echo "error: task metadata is unavailable" >&2
-  exit 1
-fi
 
-"$SCRIPT_DIR/fm-pr-check.sh" "$ID" "$URL"
-grep -qxF "pr=$URL" "$META" || {
-  echo "error: PR metadata recording failed" >&2
-  exit 1
-}
+if [ "$NO_WORKER" = 1 ]; then
+  # Every durable per-task artifact a worker leaves behind. data/<id>/ holds the
+  # brief bin/fm-spawn.sh refuses to launch without, and state/<id>.status holds
+  # the worker's own appends; bin/fm-teardown.sh removes neither, so either one
+  # present means this task had a worker and --no-worker is being pointed at the
+  # wrong task.
+  worker_record=
+  if [ -e "$META" ] || [ -L "$META" ]; then
+    worker_record="state/$ID.meta"
+  elif [ -e "$DATA/$ID" ] || [ -L "$DATA/$ID" ]; then
+    worker_record="data/$ID"
+  elif [ -e "$STATE/$ID.status" ] || [ -L "$STATE/$ID.status" ]; then
+    worker_record="state/$ID.status"
+  fi
+  if [ -n "$worker_record" ]; then
+    echo "error: --no-worker refused: $ID has a worker record at $worker_record" >&2
+    exit 1
+  fi
+  printf 'no task record: %s has no worker; nothing to record for teardown\n' "$ID"
+else
+  if [ ! -f "$META" ] || [ -L "$META" ]; then
+    echo "error: task metadata is unavailable" >&2
+    exit 1
+  fi
+
+  "$SCRIPT_DIR/fm-pr-check.sh" "$ID" "$URL"
+  grep -qxF "pr=$URL" "$META" || {
+    echo "error: PR metadata recording failed" >&2
+    exit 1
+  }
+fi
 
 merge_args=()
 if ! caller_has_merge_method "$@"; then
