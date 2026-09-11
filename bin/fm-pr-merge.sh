@@ -15,11 +15,23 @@
 # flag skips the bin/fm-pr-check.sh recording step entirely; firstmate updates
 # the backlog item on completion as it does for any other finished work.
 # The flag is an assertion this script verifies rather than trusts: it refuses
-# when the task has runtime metadata, a brief or report directory at
-# data/<task-id>/, or a status log at state/<task-id>.status, because each of
-# those means a worker did exist and its metadata has gone missing. Absent
-# metadata alone never relaxes anything - without --no-worker the refusal is
-# exactly as it was, so a mistyped task id still stops the merge.
+# when the task has runtime metadata at state/<task-id>.meta, a brief or report
+# directory at data/<task-id>/, or a status log at state/<task-id>.status.
+# data/<task-id>/ is the durable signal: it holds the brief bin/fm-spawn.sh
+# refuses to launch without, and bin/fm-teardown.sh does not remove it, so it
+# still identifies a crew-shipped task after teardown. The metadata and the
+# status log say a worker exists right now, and teardown removes both, so
+# neither is relied on to identify a task whose worker has already been torn
+# down. Absent metadata alone never relaxes anything - without --no-worker the
+# refusal is exactly as it was, so a mistyped task id still stops the merge.
+#
+# Known limitation: under --no-worker the task id is used only for that guard,
+# so a mistyped id paired with a real PR URL merges that PR without recording
+# pr= against the task that actually owns it. The recording is a fast path for
+# teardown rather than its only evidence: bin/fm-teardown.sh also resolves the
+# PR from the branch name and then falls back to a content check against the
+# default branch, and refuses to return a worktree when all of those are
+# inconclusive, so the owner task's cleanup stops rather than discarding work.
 # Usage: fm-pr-merge.sh [--no-worker] <task-id> <pr-url> [-- <extra gh-axi pr merge args>]
 set -eu
 
@@ -95,11 +107,13 @@ reject_repo_overrides "$@" || exit 1
 META="$STATE/$ID.meta"
 
 if [ "$NO_WORKER" = 1 ]; then
-  # Every durable per-task artifact a worker leaves behind. data/<id>/ holds the
-  # brief bin/fm-spawn.sh refuses to launch without, and state/<id>.status holds
-  # the worker's own appends; bin/fm-teardown.sh removes neither, so either one
-  # present means this task had a worker and --no-worker is being pointed at the
-  # wrong task.
+  # Every per-task artifact a worker leaves behind, any one of which means
+  # --no-worker is being pointed at the wrong task. data/<id>/ is the durable
+  # one: it holds the brief bin/fm-spawn.sh refuses to launch without, and
+  # bin/fm-teardown.sh does not remove it, so it still identifies a crew-shipped
+  # task after teardown. The metadata and state/<id>.status say a worker exists
+  # right now, and teardown removes both, so neither is relied on once the
+  # worker is gone.
   worker_record=
   if [ -e "$META" ] || [ -L "$META" ]; then
     worker_record="state/$ID.meta"
