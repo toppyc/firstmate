@@ -10,10 +10,12 @@
 #
 # --no-worker merges a PR firstmate opened itself for a backlog item that never
 # had a worker: no crewmate, no worktree, no runtime metadata, and so nothing to
-# tear down. The recorded pr= and pr_head= exist only so bin/fm-teardown.sh can
-# verify landed work, so with no worker there is no consumer for them and the
-# flag skips the bin/fm-pr-check.sh recording step entirely; firstmate updates
-# the backlog item on completion as it does for any other finished work.
+# tear down. The recorded pr= and pr_head= are read only through the task's
+# metadata, by bin/fm-teardown.sh's landed-work verification and by
+# bin/fm-review-diff.sh's base resolution, so a task with no metadata has no
+# consumer of any kind and the flag skips the bin/fm-pr-check.sh recording step
+# entirely; firstmate updates the backlog item on completion as it does for any
+# other finished work.
 # The flag is an assertion this script verifies rather than trusts: it refuses
 # when the task has runtime metadata at state/<task-id>.meta, a brief or report
 # directory at data/<task-id>/, or a status log at state/<task-id>.status.
