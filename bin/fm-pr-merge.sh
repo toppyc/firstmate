@@ -108,12 +108,7 @@ META="$STATE/$ID.meta"
 
 if [ "$NO_WORKER" = 1 ]; then
   # Every per-task artifact a worker leaves behind, any one of which means
-  # --no-worker is being pointed at the wrong task. data/<id>/ is the durable
-  # one: it holds the brief bin/fm-spawn.sh refuses to launch without, and
-  # bin/fm-teardown.sh does not remove it, so it still identifies a crew-shipped
-  # task after teardown. The metadata and state/<id>.status say a worker exists
-  # right now, and teardown removes both, so neither is relied on once the
-  # worker is gone.
+  # --no-worker is being pointed at the wrong task (see the header).
   worker_record=
   if [ -e "$META" ] || [ -L "$META" ]; then
     worker_record="state/$ID.meta"
