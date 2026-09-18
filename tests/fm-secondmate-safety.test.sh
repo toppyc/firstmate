@@ -2953,6 +2953,66 @@ EOF
   pass "fm-backlog-handoff refuses Done items under whitespace section headings and unsafe homes"
 }
 
+test_secondmate_force_teardown_releases_child_task_resources() {
+  local home subhome fakebin log dockerdir
+  home="$TMP_ROOT/child-resources-home"
+  subhome="$TMP_ROOT/child-resources-subhome"
+  dockerdir="$TMP_ROOT/child-resources-docker"
+  mkdir -p "$home/state" "$home/data" "$subhome/state" "$dockerdir"
+  mark_firstmate_home "$subhome"
+  printf 'domain\n' > "$subhome/.fm-secondmate-home"
+  fm_write_secondmate_meta "$home/state/domain.meta" "$subhome"
+  printf -- '- domain - design domain (home: %s; scope: design domain; projects: alpha; added 2026-09-18)\n' \
+    "$subhome" > "$home/data/secondmates.md"
+  # One ordinary task inside the retiring home, holding a container it recorded.
+  fm_write_meta "$subhome/state/child-x1.meta" \
+    "window=firstmate:fm-child-x1" \
+    "endpoint_task_id=child-x1" \
+    "worktree=$TMP_ROOT/child-resources-absent-wt" \
+    "project=$TMP_ROOT/child-resources-absent-project" \
+    "kind=ship" \
+    "mode=local-only"
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$subhome/state" \
+    "$ROOT/bin/fm-resource.sh" record child-x1 container sf-childx1-pg >/dev/null \
+    || fail "recording the child task's container failed"
+
+  fakebin=$(make_fake_tmux "$TMP_ROOT/child-resources-fake")
+  log="$TMP_ROOT/child-resources-fake/tmux.log"
+  : > "$dockerdir/running"
+  : > "$dockerdir/stopped.log"
+  printf 'sf-childx1-pg\n' >> "$dockerdir/running"
+  printf 'stoneflow-dev-postgres\n' >> "$dockerdir/running"
+  cat > "$fakebin/docker" <<'SH'
+#!/usr/bin/env bash
+dir=$FM_FAKE_DOCKER_DIR
+case "${1:-} ${2:-}" in
+  "container inspect") grep -Fxq "${3:-}" "$dir/running" && exit 0; exit 1 ;;
+esac
+if [ "${1:-}" = stop ]; then
+  grep -Fxq "${2:-}" "$dir/running" || exit 1
+  grep -Fxv "${2:-}" "$dir/running" > "$dir/running.next" 2>/dev/null || :
+  mv "$dir/running.next" "$dir/running"
+  printf '%s\n' "${2:-}" >> "$dir/stopped.log"
+  exit 0
+fi
+exit 125
+SH
+  chmod +x "$fakebin/docker"
+
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/child-resources-fake/pane.txt" \
+    FM_FAKE_DOCKER_DIR="$dockerdir" \
+    "$ROOT/bin/fm-teardown.sh" domain --force >/dev/null 2>/dev/null \
+    || fail "forced secondmate retirement failed"
+
+  grep -Fxq sf-childx1-pg "$dockerdir/stopped.log" \
+    || fail "forced retirement erased the child task's records without stopping the container it recorded"
+  grep -Fxq stoneflow-dev-postgres "$dockerdir/running" \
+    || fail "forced retirement stopped a container no record named"
+  [ ! -d "$subhome" ] || fail "forced retirement retained the home"
+  pass "forced secondmate retirement releases each child task's recorded resources"
+}
+
 test_fm_home_parameterization
 test_lock_status_is_per_home
 test_seed_allows_overlapping_clones_and_drops_owner
@@ -3030,3 +3090,4 @@ test_secondmate_idle_pane_is_not_stale
 test_secondmate_charter_brief_is_idle_by_default
 test_backlog_handoff_aborts_safely
 test_backlog_handoff_refuses_done_items_and_non_secondmate_homes
+test_secondmate_force_teardown_releases_child_task_resources

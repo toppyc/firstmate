@@ -139,6 +139,25 @@
 #     root still exists, so the account's healthy LaunchAgent worker and every
 #     live remote secondmate worker are out of scope. Best effort: a sweep
 #     failure never blocks this teardown.
+#   Fix 4 - release the external resources this task recorded for itself. A
+#     worker that stands up its own service container (one isolated Postgres per
+#     task lane, say) leaves it running past teardown, because nothing here ever
+#     shut one down (observed 2026-09-18: four task containers from long-merged
+#     tasks still up, one for four days, ~380 MB of resident memory between them
+#     on a machine that was swapping). The container's name is INVENTED by the
+#     worker - sf-opstatus-pg for stoneflow-operational-status-phase-gate - so it
+#     is not derivable from the task id and cleanup never guesses: the creator
+#     records it with bin/fm-resource.sh and release_task_resources stops exactly
+#     what state/<id>.resources names. A name-pattern sweep is forbidden for the
+#     same reason broad process kills are: sibling lanes and the captain's own
+#     development containers share the daemon. No record is a silent no-op; an
+#     unusable record releases nothing; a recorded container that no longer exists
+#     is reported, not an error. Never fatal - anything that cannot be released is
+#     reported and its record RETAINED as the operator's durable pointer to it,
+#     while the rest of cleanup still runs. Forced secondmate retirement applies
+#     the same rule to each child task before erasing its records, since that path
+#     would otherwise delete the only pointer to a still-running container.
+#     bin/fm-resource-lib.sh owns the record format and the release contract.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -174,6 +193,8 @@ SUB_HOME_PARENT_MARKER=".fm-secondmate-parent"
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 # shellcheck source=bin/fm-nm-run-lib.sh
 . "$SCRIPT_DIR/fm-nm-run-lib.sh"
+# shellcheck source=bin/fm-resource-lib.sh
+. "$SCRIPT_DIR/fm-resource-lib.sh"
 if [ "$#" -lt 1 ] || ! fm_task_id_path_safe "$1"; then
   echo "error: invalid teardown request" >&2
   exit 2
@@ -1291,6 +1312,31 @@ conclude_task_no_mistakes_run() {  # <worktree>
   return 1
 }
 
+# Release the external resources this task recorded for itself (Fix 4 in the
+# script header). Proof of ownership is the record and nothing else, so a task
+# that recorded nothing is cleaned up exactly as before. Never fatal: a resource
+# that cannot be released is reported and its record retained, and cleanup
+# continues.
+TASK_RESOURCES_RETAINED=0
+release_task_resources() {  # <state-dir> <task-id>
+  local state=$1 id=$2 entry rc=0
+  fm_resource_release_all "$state" "$id" || rc=1
+  if [ "$FM_RESOURCE_RECORD_UNUSABLE" = 1 ]; then
+    echo "warning: task $id has an unusable resource record at $(fm_resource_record_path "$state" "$id"); released nothing from it" >&2
+    return "$rc"
+  fi
+  for entry in "${FM_RESOURCE_RELEASED[@]+"${FM_RESOURCE_RELEASED[@]}"}"; do
+    echo "resource: stopped $entry recorded by $id"
+  done
+  for entry in "${FM_RESOURCE_ABSENT[@]+"${FM_RESOURCE_ABSENT[@]}"}"; do
+    echo "resource: $entry recorded by $id no longer exists; nothing to stop"
+  done
+  for entry in "${FM_RESOURCE_RETAINED[@]+"${FM_RESOURCE_RETAINED[@]}"}"; do
+    echo "warning: could not release $entry recorded by $id; it is still holding resources" >&2
+  done
+  return "$rc"
+}
+
 # Fix 2 (see script header): pids of every process whose CURRENT WORKING
 # DIRECTORY is exactly $1 or under it, from one bounded system-wide `lsof -a
 # -d cwd` scan (never the recursive +D file-tree walk, which lsof itself
@@ -2255,6 +2301,14 @@ cleanup_firstmate_home_children() {
         safe_rm_rf_child_worktree "$child_wt" "$child_proj"
       fi
     fi
+    # Same rule as the task path above: stop exactly what this child recorded,
+    # and keep the record when something could not be released rather than
+    # erasing the only pointer to a container that is still running.
+    if release_task_resources "$sub_state" "$child_id"; then
+      rm -f "$sub_state/$child_id.resources"
+    else
+      echo "warning: retaining $(fm_resource_record_path "$sub_state" "$child_id") for child $child_id; release its entries by hand, then delete it" >&2
+    fi
     remove_grok_turnend_auth "$sub_state" "$child_id" || return 1
     remove_kimi_turnend_auth "$sub_state" "$child_id" || return 1
     remove_pr_poll_artifacts "$sub_state" "$child_id" || return 1
@@ -2392,6 +2446,18 @@ if [ "$KIND" != secondmate ]; then
   conclude_task_no_mistakes_run "$WT"
   reap_task_worktree_processes worktree "$WT" "$TASK_TMP"
 fi
+
+# Fix 4 (see script header): stop the external resources this task recorded.
+# Placed here, with the other pre-teardown cleanup, for two reasons. It runs
+# AFTER every landed/discard-work refusal, because a refusal means this task is
+# still alive and still owes the captain its work - taking its database out from
+# under a worker that is about to resume would be a fresh way to destroy work,
+# and no refusal is weakened to make a container stop happen. It runs after the
+# process reap, so nothing is left running that could restart what was just
+# stopped. Every kind is covered: the record, not the task shape, is what says
+# whether there is anything to release.
+TASK_RESOURCES_RETAINED=0
+release_task_resources "$STATE" "$ID" || TASK_RESOURCES_RETAINED=1
 
 # Fix 3 (see script header): sweep remote job workers abandoned by an already
 # pruned code root. Best effort - a sweep failure never blocks this teardown.
@@ -2544,6 +2610,16 @@ fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 remove_pr_poll_artifacts "$STATE" "$ID" || exit 1
 retire_busy_state "$STATE" "$ID" "$BUSY_GEN" || exit 1
 status_retire_presentation_task "$STATE" "$ID" || exit 1
+# The resource record is retired with the rest of the volatile state ONLY when
+# it has nothing left to point at. When a recorded resource could not be
+# released, the record is the operator's one durable pointer to what is still
+# running - deleting it here would orphan exactly the container this change
+# exists to stop.
+if [ "$TASK_RESOURCES_RETAINED" = 1 ]; then
+  echo "warning: retaining $(fm_resource_record_path "$STATE" "$ID") for task $ID; release its entries by hand, then delete it" >&2
+else
+  rm -f "$STATE/$ID.resources"
+fi
 rm -f "$STATE/$ID.turn-ended" "$STATE/$ID.meta" \
   "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" \
   "$STATE/$ID.kimi-turnend-token" "$STATE/$ID.muse-session" \

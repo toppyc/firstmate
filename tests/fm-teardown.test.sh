@@ -2591,6 +2591,269 @@ EOF
   pass "the run abort and the leaked-process reap both complete before the destructive worktree return"
 }
 
+# --- recorded external resources (bin/fm-resource-lib.sh) -------------------
+#
+# A worker that stands up its own service container records it, and cleanup
+# stops exactly what is recorded. The helpers below install a fake `docker`
+# whose running set, call log, and per-container stop failures are all driven
+# from files, so the whole contract - including "a container nobody recorded is
+# never touched" - is exercised without a real daemon.
+
+# add_fake_docker <case-dir> <running-container>...
+# Installs the fake and seeds its running set. Exports FM_FAKE_DOCKER_DIR for
+# the teardown run.
+add_fake_docker() {
+  local case_dir=$1; shift
+  local dir="$case_dir/docker"
+  mkdir -p "$dir"
+  : > "$dir/running"
+  : > "$dir/calls.log"
+  : > "$dir/stopped.log"
+  : > "$dir/stop-fails"
+  local name
+  for name in "$@"; do printf '%s\n' "$name" >> "$dir/running"; done
+  cat > "$case_dir/fakebin/docker" <<'SH'
+#!/usr/bin/env bash
+# Fake docker driven by files under $FM_FAKE_DOCKER_DIR:
+#   running      one running container name per line
+#   calls.log    every invocation, as received
+#   stopped.log  every container this fake actually stopped
+#   stop-fails   containers whose `docker stop` reports a daemon error
+dir=${FM_FAKE_DOCKER_DIR:-}
+[ -n "$dir" ] || { echo "fake docker: FM_FAKE_DOCKER_DIR unset" >&2; exit 125; }
+printf '%s\n' "$*" >> "$dir/calls.log"
+case "${1:-} ${2:-}" in
+  "container inspect")
+    if grep -Fxq "${3:-}" "$dir/running" 2>/dev/null; then exit 0; fi
+    printf 'Error: No such container: %s\n' "${3:-}" >&2
+    exit 1 ;;
+esac
+if [ "${1:-}" = stop ]; then
+  name=${2:-}
+  if grep -Fxq "$name" "$dir/stop-fails" 2>/dev/null; then
+    printf 'Error response from daemon: cannot stop container %s\n' "$name" >&2
+    exit 1
+  fi
+  if ! grep -Fxq "$name" "$dir/running" 2>/dev/null; then
+    printf 'Error: No such container: %s\n' "$name" >&2
+    exit 1
+  fi
+  grep -Fxv "$name" "$dir/running" > "$dir/running.next" 2>/dev/null || :
+  mv "$dir/running.next" "$dir/running"
+  printf '%s\n' "$name" >> "$dir/stopped.log"
+  exit 0
+fi
+printf 'fake docker: unsupported invocation: %s\n' "$*" >&2
+exit 125
+SH
+  chmod +x "$case_dir/fakebin/docker"
+  export FM_FAKE_DOCKER_DIR="$dir"
+}
+
+# record_container <case-dir> <container-name>: record it against task-x1 the
+# way a worker would, through the real bin/fm-resource.sh.
+record_container() {
+  local case_dir=$1 name=$2
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$case_dir/state" \
+    "$ROOT/bin/fm-resource.sh" record task-x1 container "$name" >/dev/null \
+    || fail "recording container $name failed"
+}
+
+docker_is_running() {  # <case-dir> <name>
+  grep -Fxq "$2" "$1/docker/running" 2>/dev/null
+}
+
+# A landed local-only ship task: the baseline every ALLOW case below builds on.
+make_landed_case() {  # <name>
+  local case_dir
+  case_dir=$(make_case "$1")
+  write_meta "$case_dir" local-only ship
+  wt_commit "$case_dir" "fix the thing"
+  add_fork_with_pushed_branch "$case_dir"
+  printf '%s\n' "$case_dir"
+}
+
+test_recorded_container_is_stopped_by_teardown() {
+  local case_dir rc
+  case_dir=$(make_landed_case resource-stop)
+  add_fake_docker "$case_dir" sf-x1-pg
+  record_container "$case_dir" sf-x1-pg
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "resource-stop: teardown should succeed"
+  assert_grep "sf-x1-pg" "$case_dir/docker/stopped.log" \
+    "resource-stop: the recorded container was not stopped"
+  ! docker_is_running "$case_dir" sf-x1-pg \
+    || fail "resource-stop: the recorded container is still running after cleanup"
+  assert_grep "sf-x1-pg" "$case_dir/stdout" "resource-stop: teardown did not report what it stopped"
+  assert_absent "$case_dir/state/task-x1.resources" \
+    "resource-stop: the resource record outlived a fully released task"
+  pass "teardown stops the container its task recorded"
+}
+
+test_unrecorded_containers_survive_teardown() {
+  local case_dir rc
+  case_dir=$(make_landed_case resource-unrecorded)
+  # The task's own container, a sibling lane's container, and the captain's own
+  # development stack - all running on the same daemon. Only the first is recorded.
+  add_fake_docker "$case_dir" sf-x1-pg sf-siblinglane-pg stoneflow-dev-postgres stoneflow-dev-pgadmin
+  record_container "$case_dir" sf-x1-pg
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "resource-unrecorded: teardown should succeed"
+  ! docker_is_running "$case_dir" sf-x1-pg \
+    || fail "resource-unrecorded: the recorded container was not stopped"
+  local name
+  for name in sf-siblinglane-pg stoneflow-dev-postgres stoneflow-dev-pgadmin; do
+    docker_is_running "$case_dir" "$name" \
+      || fail "resource-unrecorded: cleanup stopped $name, which no record named"
+    assert_no_grep "$name" "$case_dir/docker/stopped.log" \
+      "resource-unrecorded: cleanup issued a stop for unrecorded container $name"
+  done
+  pass "teardown never stops a container no record proves belongs to the task"
+}
+
+test_recorded_container_already_gone_is_reported_not_an_error() {
+  local case_dir rc
+  case_dir=$(make_landed_case resource-gone)
+  add_fake_docker "$case_dir" sf-other-pg
+  record_container "$case_dir" sf-x1-pg
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "resource-gone: teardown should complete when a recorded container is already gone"
+  assert_grep "sf-x1-pg" "$case_dir/stdout" "resource-gone: the vanished container was not reported"
+  assert_grep "teardown task-x1 complete" "$case_dir/stdout" "resource-gone: cleanup did not complete"
+  assert_absent "$case_dir/state/task-x1.resources" \
+    "resource-gone: the record was retained although nothing was left to release"
+  docker_is_running "$case_dir" sf-other-pg \
+    || fail "resource-gone: an unrelated container was stopped"
+  pass "a recorded container that no longer exists is reported, and cleanup completes"
+}
+
+test_task_without_a_resource_record_is_torn_down_unchanged() {
+  local case_dir rc
+  case_dir=$(make_landed_case resource-none)
+  add_fake_docker "$case_dir" sf-x1-pg stoneflow-dev-postgres
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "resource-none: teardown should succeed"
+  assert_grep "teardown task-x1 complete" "$case_dir/stdout" "resource-none: cleanup did not complete"
+  [ ! -s "$case_dir/docker/calls.log" ] \
+    || fail "resource-none: cleanup called docker for a task that recorded nothing"$'\n'"$(cat "$case_dir/docker/calls.log")"
+  docker_is_running "$case_dir" sf-x1-pg \
+    || fail "resource-none: an unrecorded container was stopped"
+  assert_not_contains "$(cat "$case_dir/stdout")" "resource:" \
+    "resource-none: cleanup reported resource work for a task that recorded none"
+  pass "a task that recorded nothing is torn down exactly as before"
+}
+
+test_unlanded_work_still_refuses_and_leaves_the_container_running() {
+  local case_dir rc
+  case_dir=$(make_case resource-refusal)
+  write_meta "$case_dir" local-only ship
+  wt_commit "$case_dir" "unpushed work"
+  add_fake_docker "$case_dir" sf-x1-pg
+  record_container "$case_dir" sf-x1-pg
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  [ "$rc" -ne 0 ] || fail "resource-refusal: teardown should refuse unlanded work"
+  assert_grep "REFUSED" "$case_dir/stderr" "resource-refusal: no refusal was printed"
+  # The refusal means this task is still alive and still owes its work. Taking
+  # its database away is not cleanup, it is a fresh way to destroy work.
+  docker_is_running "$case_dir" sf-x1-pg \
+    || fail "resource-refusal: a refused teardown stopped the live task's container"
+  [ ! -s "$case_dir/docker/calls.log" ] \
+    || fail "resource-refusal: a refused teardown still reached for docker"
+  assert_grep "container sf-x1-pg" "$case_dir/state/task-x1.resources" \
+    "resource-refusal: the refusal dropped the task's resource record"
+  pass "an existing refusal still refuses, and the refused task keeps its container"
+}
+
+test_dirty_worktree_refusal_survives_a_recorded_container() {
+  local case_dir rc
+  case_dir=$(make_landed_case resource-dirty)
+  add_fake_docker "$case_dir" sf-x1-pg
+  record_container "$case_dir" sf-x1-pg
+  printf 'uncommitted\n' > "$case_dir/wt/scratch.txt"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  [ "$rc" -ne 0 ] || fail "resource-dirty: teardown should refuse a dirty worktree"
+  assert_grep "REFUSED" "$case_dir/stderr" "resource-dirty: no refusal was printed"
+  docker_is_running "$case_dir" sf-x1-pg \
+    || fail "resource-dirty: a refused teardown stopped the live task's container"
+  pass "the dirty-worktree refusal is unchanged by a recorded container"
+}
+
+test_container_that_cannot_be_stopped_is_reported_and_its_record_retained() {
+  local case_dir rc
+  case_dir=$(make_landed_case resource-stop-fails)
+  add_fake_docker "$case_dir" sf-x1-pg sf-x1-redis
+  printf 'sf-x1-pg\n' > "$case_dir/docker/stop-fails"
+  record_container "$case_dir" sf-x1-pg
+  record_container "$case_dir" sf-x1-redis
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "resource-stop-fails: an unreleasable container must not abort cleanup"
+  assert_grep "teardown task-x1 complete" "$case_dir/stdout" "resource-stop-fails: cleanup did not complete"
+  assert_grep "sf-x1-pg" "$case_dir/stderr" "resource-stop-fails: the failure was not reported"
+  assert_grep "sf-x1-redis" "$case_dir/docker/stopped.log" \
+    "resource-stop-fails: one failure stopped the other recorded container from being released"
+  assert_grep "container sf-x1-pg" "$case_dir/state/task-x1.resources" \
+    "resource-stop-fails: the record was deleted although the container is still running"
+  docker_is_running "$case_dir" sf-x1-pg \
+    || fail "resource-stop-fails: the fake reported a failure but stopped the container anyway"
+  pass "a container that cannot be stopped is reported and keeps its record"
+}
+
+test_unusable_resource_record_releases_nothing_and_completes() {
+  local case_dir rc
+  case_dir=$(make_landed_case resource-unusable)
+  add_fake_docker "$case_dir" sf-x1-pg
+  printf 'container sf-x1-pg\n' > "$case_dir/state/task-x1.resources"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "resource-unusable: cleanup should complete despite an unusable record"
+  assert_grep "teardown task-x1 complete" "$case_dir/stdout" "resource-unusable: cleanup did not complete"
+  docker_is_running "$case_dir" sf-x1-pg \
+    || fail "resource-unusable: a record that could not be trusted still stopped a container"
+  assert_no_grep "stop" "$case_dir/docker/calls.log" \
+    "resource-unusable: cleanup issued a stop from a record it could not read"
+  assert_grep "unusable" "$case_dir/stderr" "resource-unusable: the unusable record was not reported"
+  pass "an unusable resource record releases nothing and cleanup still completes"
+}
+
 test_local_only_fork_remote_allows
 test_teardown_prompts_tasks_axi_done_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
@@ -2649,3 +2912,11 @@ test_process_spawned_during_grace_is_reaped_on_later_pass
 test_persistent_scan_refuses_after_bounded_retries
 test_process_exit_during_identity_lookup_does_not_refuse
 test_run_abort_precedes_process_reap_precedes_worktree_removal
+test_recorded_container_is_stopped_by_teardown
+test_unrecorded_containers_survive_teardown
+test_recorded_container_already_gone_is_reported_not_an_error
+test_task_without_a_resource_record_is_torn_down_unchanged
+test_unlanded_work_still_refuses_and_leaves_the_container_running
+test_dirty_worktree_refusal_survives_a_recorded_container
+test_container_that_cannot_be_stopped_is_reported_and_its_record_retained
+test_unusable_resource_record_releases_nothing_and_completes
