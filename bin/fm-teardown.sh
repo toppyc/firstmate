@@ -152,11 +152,15 @@
 #     same reason broad process kills are: sibling lanes and the captain's own
 #     development containers share the daemon. No record is a silent no-op; an
 #     unusable record releases nothing; a recorded container that no longer exists
-#     is reported, not an error. Never fatal - anything that cannot be released is
-#     reported and its record RETAINED as the operator's durable pointer to it,
-#     while the rest of cleanup still runs. Forced secondmate retirement applies
-#     the same rule to each child task before erasing its records, since that path
-#     would otherwise delete the only pointer to a still-running container.
+#     is reported, not an error. Never fatal - on the ordinary task path anything
+#     that cannot be released is reported and its record RETAINED as the
+#     operator's durable pointer to it, while the rest of cleanup still runs.
+#     Forced secondmate retirement CANNOT retain anything: it erases the whole
+#     home, records and all. So it sweeps every <home>/state/*.resources record
+#     instead - keyed on the records themselves, so one whose task meta is
+#     already gone is released too - and NAMES each entry it could not release in
+#     its output before the home and its records are destroyed. The name escaping
+#     into the run's output is all that survives there.
 #     bin/fm-resource-lib.sh owns the record format and the release contract.
 set -eu
 
@@ -1318,11 +1322,11 @@ conclude_task_no_mistakes_run() {  # <worktree>
 # that cannot be released is reported and its record retained, and cleanup
 # continues.
 TASK_RESOURCES_RETAINED=0
-release_task_resources() {  # <state-dir> <task-id>
-  local state=$1 id=$2 entry rc=0
+release_task_resources() {  # <state-dir> <task-id> [what-becomes-of-the-record]
+  local state=$1 id=$2 note=${3-} entry rc=0
   fm_resource_release_all "$state" "$id" || rc=1
   if [ "$FM_RESOURCE_RECORD_UNUSABLE" = 1 ]; then
-    echo "warning: task $id has an unusable resource record at $(fm_resource_record_path "$state" "$id"); released nothing from it" >&2
+    echo "warning: task $id has an unusable resource record at $(fm_resource_record_path "$state" "$id"); released nothing from it${note:+; $note}" >&2
     return "$rc"
   fi
   for entry in "${FM_RESOURCE_RELEASED[@]+"${FM_RESOURCE_RELEASED[@]}"}"; do
@@ -1332,9 +1336,33 @@ release_task_resources() {  # <state-dir> <task-id>
     echo "resource: $entry recorded by $id no longer exists; nothing to stop"
   done
   for entry in "${FM_RESOURCE_RETAINED[@]+"${FM_RESOURCE_RETAINED[@]}"}"; do
-    echo "warning: could not release $entry recorded by $id; it is still holding resources" >&2
+    echo "warning: could not release $entry recorded by $id; it is still holding resources${note:+; $note}" >&2
   done
   return "$rc"
+}
+
+# Sweep the resource records of a firstmate home that is about to be removed
+# outright (Fix 4 in the script header). Keyed on the records themselves rather
+# than on the task metas beside them, because a record left by a child's OWN
+# earlier failed teardown has no meta any more and is exactly the one most
+# likely to be orphaned. Nothing here can be retained - the home and every
+# record in it are erased moments later - so an entry that could not be released
+# is NAMED, not pointed at through a file that will not exist.
+release_retiring_home_resources() {  # <state-dir>
+  local state=$1 record child_id
+  local note="the record naming it is being destroyed with the retiring home"
+  [ -d "$state" ] || return 0
+  for record in "$state"/*.resources; do
+    [ -e "$record" ] || continue
+    child_id=$(basename "$record" .resources)
+    if ! fm_task_id_path_safe "$child_id"; then
+      echo "warning: ignoring resource record $record in the retiring home; $child_id is not a usable task id" >&2
+      continue
+    fi
+    if release_task_resources "$state" "$child_id" "$note"; then
+      rm -f "$record"
+    fi
+  done
 }
 
 # Fix 2 (see script header): pids of every process whose CURRENT WORKING
@@ -2301,14 +2329,6 @@ cleanup_firstmate_home_children() {
         safe_rm_rf_child_worktree "$child_wt" "$child_proj"
       fi
     fi
-    # Same rule as the task path above: stop exactly what this child recorded,
-    # and keep the record when something could not be released rather than
-    # erasing the only pointer to a container that is still running.
-    if release_task_resources "$sub_state" "$child_id"; then
-      rm -f "$sub_state/$child_id.resources"
-    else
-      echo "warning: retaining $(fm_resource_record_path "$sub_state" "$child_id") for child $child_id; release its entries by hand, then delete it" >&2
-    fi
     remove_grok_turnend_auth "$sub_state" "$child_id" || return 1
     remove_kimi_turnend_auth "$sub_state" "$child_id" || return 1
     remove_pr_poll_artifacts "$sub_state" "$child_id" || return 1
@@ -2324,6 +2344,12 @@ cleanup_firstmate_home_children() {
       "$sub_state/$child_id.muse-session" "$sub_state/$child_id.muse-session-current" \
       "$sub_state/$child_id.cursor-session"
   done
+  # Only once every child above was retired without a refusal: a refusal leaves
+  # this home standing with its durable records intact, and a container stopped
+  # under a child that is about to be resumed would destroy live work. Runs on
+  # the way out of each recursion level, so a nested home is swept before the
+  # `remove_firstmate_home` call above erases it.
+  release_retiring_home_resources "$sub_state"
 }
 
 remove_secondmate_registry_entry() {
@@ -2447,22 +2473,6 @@ if [ "$KIND" != secondmate ]; then
   reap_task_worktree_processes worktree "$WT" "$TASK_TMP"
 fi
 
-# Fix 4 (see script header): stop the external resources this task recorded.
-# Placed here, with the other pre-teardown cleanup, for two reasons. It runs
-# AFTER every landed/discard-work refusal, because a refusal means this task is
-# still alive and still owes the captain its work - taking its database out from
-# under a worker that is about to resume would be a fresh way to destroy work,
-# and no refusal is weakened to make a container stop happen. It runs after the
-# process reap, so nothing is left running that could restart what was just
-# stopped. Every kind is covered: the record, not the task shape, is what says
-# whether there is anything to release.
-TASK_RESOURCES_RETAINED=0
-release_task_resources "$STATE" "$ID" || TASK_RESOURCES_RETAINED=1
-
-# Fix 3 (see script header): sweep remote job workers abandoned by an already
-# pruned code root. Best effort - a sweep failure never blocks this teardown.
-"$SCRIPT_DIR/fm-remote-job-reap-orphans.sh" >&2 || true
-
 # A Herdr close may reposition shared workspace order, so the whole
 # destructive sequence below (worktree return, pane close, record removal)
 # runs under the named-session presentation lock, acquired BEFORE anything is
@@ -2478,6 +2488,24 @@ if [ "$BACKEND" = herdr ]; then
   TEARDOWN_HERDR_SESSION=$FM_BACKEND_HERDR_SESSION
   TEARDOWN_HERDR_PANE=$FM_BACKEND_HERDR_PANE
 fi
+
+# Fix 4 (see script header): stop the external resources this task recorded.
+# Placed here, with the other pre-teardown cleanup, deliberately. It runs
+# AFTER every landed/discard-work refusal AND after the herdr presentation-lock
+# preflight, because each of those means this task is still alive and still owes
+# the captain its work - and the preflight's refusal promises that nothing was
+# changed, so a contended lock must be found before any container is stopped.
+# Taking a database out from under a worker that is about to resume would be a
+# fresh way to destroy work, and no refusal is weakened to make a container stop
+# happen. It runs after the process reap, so nothing is left running that could
+# restart what was just stopped. Every kind is covered: the record, not the task
+# shape, is what says whether there is anything to release.
+TASK_RESOURCES_RETAINED=0
+release_task_resources "$STATE" "$ID" || TASK_RESOURCES_RETAINED=1
+
+# Fix 3 (see script header): sweep remote job workers abandoned by an already
+# pruned code root. Best effort - a sweep failure never blocks this teardown.
+"$SCRIPT_DIR/fm-remote-job-reap-orphans.sh" >&2 || true
 
 # Best-effort: drop the local task branch so the shared repo does not accumulate refs.
 if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then

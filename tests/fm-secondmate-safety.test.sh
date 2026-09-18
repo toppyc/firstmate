@@ -2953,6 +2953,34 @@ EOF
   pass "fm-backlog-handoff refuses Done items under whitespace section headings and unsafe homes"
 }
 
+# A file-driven docker stand-in: $dir/running is the daemon's container list,
+# $dir/stopped.log records every successful stop, and a name in
+# $dir/unstoppable exists but refuses to stop, standing in for a daemon error.
+install_fake_docker() {  # <fake-bin-dir> <docker-state-dir>
+  local fakebin=$1 dir=$2
+  mkdir -p "$dir"
+  : > "$dir/running"
+  : > "$dir/stopped.log"
+  : > "$dir/unstoppable"
+  cat > "$fakebin/docker" <<'SH'
+#!/usr/bin/env bash
+dir=$FM_FAKE_DOCKER_DIR
+case "${1:-} ${2:-}" in
+  "container inspect") grep -Fxq "${3:-}" "$dir/running" && exit 0; exit 1 ;;
+esac
+if [ "${1:-}" = stop ]; then
+  grep -Fxq "${2:-}" "$dir/running" || exit 1
+  ! grep -Fxq "${2:-}" "$dir/unstoppable" || exit 1
+  grep -Fxv "${2:-}" "$dir/running" > "$dir/running.next" 2>/dev/null || :
+  mv "$dir/running.next" "$dir/running"
+  printf '%s\n' "${2:-}" >> "$dir/stopped.log"
+  exit 0
+fi
+exit 125
+SH
+  chmod +x "$fakebin/docker"
+}
+
 test_secondmate_force_teardown_releases_child_task_resources() {
   local home subhome fakebin log dockerdir
   home="$TMP_ROOT/child-resources-home"
@@ -2978,26 +3006,9 @@ test_secondmate_force_teardown_releases_child_task_resources() {
 
   fakebin=$(make_fake_tmux "$TMP_ROOT/child-resources-fake")
   log="$TMP_ROOT/child-resources-fake/tmux.log"
-  : > "$dockerdir/running"
-  : > "$dockerdir/stopped.log"
+  install_fake_docker "$fakebin" "$dockerdir"
   printf 'sf-childx1-pg\n' >> "$dockerdir/running"
   printf 'stoneflow-dev-postgres\n' >> "$dockerdir/running"
-  cat > "$fakebin/docker" <<'SH'
-#!/usr/bin/env bash
-dir=$FM_FAKE_DOCKER_DIR
-case "${1:-} ${2:-}" in
-  "container inspect") grep -Fxq "${3:-}" "$dir/running" && exit 0; exit 1 ;;
-esac
-if [ "${1:-}" = stop ]; then
-  grep -Fxq "${2:-}" "$dir/running" || exit 1
-  grep -Fxv "${2:-}" "$dir/running" > "$dir/running.next" 2>/dev/null || :
-  mv "$dir/running.next" "$dir/running"
-  printf '%s\n' "${2:-}" >> "$dir/stopped.log"
-  exit 0
-fi
-exit 125
-SH
-  chmod +x "$fakebin/docker"
 
   PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" \
     FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/child-resources-fake/pane.txt" \
@@ -3011,6 +3022,92 @@ SH
     || fail "forced retirement stopped a container no record named"
   [ ! -d "$subhome" ] || fail "forced retirement retained the home"
   pass "forced secondmate retirement releases each child task's recorded resources"
+}
+
+# A child whose own teardown already retired its meta but kept its resource
+# record is the case most likely to be orphaned: nothing else points at that
+# container any more, and the home is about to be erased with the record in it.
+test_secondmate_force_teardown_releases_child_record_without_meta() {
+  local home subhome fakebin dockerdir
+  home="$TMP_ROOT/orphan-record-home"
+  subhome="$TMP_ROOT/orphan-record-subhome"
+  dockerdir="$TMP_ROOT/orphan-record-docker"
+  mkdir -p "$home/state" "$home/data" "$subhome/state"
+  mark_firstmate_home "$subhome"
+  printf 'metaless\n' > "$subhome/.fm-secondmate-home"
+  fm_write_secondmate_meta "$home/state/metaless.meta" "$subhome"
+  printf -- '- metaless - design domain (home: %s; scope: design domain; projects: alpha; added 2026-09-18)\n' \
+    "$subhome" > "$home/data/secondmates.md"
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$subhome/state" \
+    "$ROOT/bin/fm-resource.sh" record child-x2 container sf-childx2-pg >/dev/null \
+    || fail "recording the orphaned child container failed"
+  [ ! -e "$subhome/state/child-x2.meta" ] || fail "fixture left a meta beside the metaless record"
+
+  fakebin=$(make_fake_tmux "$TMP_ROOT/orphan-record-fake")
+  install_fake_docker "$fakebin" "$dockerdir"
+  printf 'sf-childx2-pg\n' >> "$dockerdir/running"
+  printf 'stoneflow-dev-pgadmin\n' >> "$dockerdir/running"
+
+  PATH="$fakebin:$PATH" FM_HOME="$home" \
+    FM_FAKE_TMUX_LOG="$TMP_ROOT/orphan-record-fake/tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/orphan-record-fake/pane.txt" \
+    FM_FAKE_DOCKER_DIR="$dockerdir" \
+    "$ROOT/bin/fm-teardown.sh" metaless --force >/dev/null 2>/dev/null \
+    || fail "forced secondmate retirement failed"
+
+  grep -Fxq sf-childx2-pg "$dockerdir/stopped.log" \
+    || fail "forced retirement erased a resource record whose meta was already gone without releasing it"
+  grep -Fxq stoneflow-dev-pgadmin "$dockerdir/running" \
+    || fail "forced retirement stopped a container no record named"
+  [ ! -d "$subhome" ] || fail "forced retirement retained the home"
+  pass "forced secondmate retirement releases a child record whose meta is already gone"
+}
+
+# The home and every record in it are destroyed either way, so the only thing
+# that can survive a container it could not stop is the name in the output.
+test_secondmate_force_teardown_names_unreleasable_child_container() {
+  local home subhome fakebin dockerdir err
+  home="$TMP_ROOT/stuck-resources-home"
+  subhome="$TMP_ROOT/stuck-resources-subhome"
+  dockerdir="$TMP_ROOT/stuck-resources-docker"
+  err="$TMP_ROOT/stuck-resources-teardown.err"
+  mkdir -p "$home/state" "$home/data" "$subhome/state"
+  mark_firstmate_home "$subhome"
+  printf 'stuck\n' > "$subhome/.fm-secondmate-home"
+  fm_write_secondmate_meta "$home/state/stuck.meta" "$subhome"
+  printf -- '- stuck - design domain (home: %s; scope: design domain; projects: alpha; added 2026-09-18)\n' \
+    "$subhome" > "$home/data/secondmates.md"
+  fm_write_meta "$subhome/state/child-x3.meta" \
+    "window=firstmate:fm-child-x3" \
+    "endpoint_task_id=child-x3" \
+    "worktree=$TMP_ROOT/stuck-resources-absent-wt" \
+    "project=$TMP_ROOT/stuck-resources-absent-project" \
+    "kind=ship" \
+    "mode=local-only"
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$subhome/state" \
+    "$ROOT/bin/fm-resource.sh" record child-x3 container sf-childx3-pg >/dev/null \
+    || fail "recording the stuck child container failed"
+
+  fakebin=$(make_fake_tmux "$TMP_ROOT/stuck-resources-fake")
+  install_fake_docker "$fakebin" "$dockerdir"
+  printf 'sf-childx3-pg\n' >> "$dockerdir/running"
+  printf 'sf-childx3-pg\n' >> "$dockerdir/unstoppable"
+
+  PATH="$fakebin:$PATH" FM_HOME="$home" \
+    FM_FAKE_TMUX_LOG="$TMP_ROOT/stuck-resources-fake/tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/stuck-resources-fake/pane.txt" \
+    FM_FAKE_DOCKER_DIR="$dockerdir" \
+    "$ROOT/bin/fm-teardown.sh" stuck --force >/dev/null 2>"$err" \
+    || fail "a container that could not be stopped blocked forced secondmate retirement"
+
+  [ ! -d "$subhome" ] || fail "forced retirement retained the home"
+  grep -Fxq sf-childx3-pg "$dockerdir/running" \
+    || fail "the fixture container was stopped after all; the test proves nothing"
+  grep -Fq sf-childx3-pg "$err" \
+    || fail "the name of the unreleasable container did not survive the destruction of its record"
+  grep -Fq "$subhome/state/child-x3.resources" "$err" \
+    && fail "forced retirement pointed the operator at a record it was about to destroy"
+  pass "forced secondmate retirement names a child container it could not release"
 }
 
 test_fm_home_parameterization
@@ -3091,3 +3188,5 @@ test_secondmate_charter_brief_is_idle_by_default
 test_backlog_handoff_aborts_safely
 test_backlog_handoff_refuses_done_items_and_non_secondmate_homes
 test_secondmate_force_teardown_releases_child_task_resources
+test_secondmate_force_teardown_releases_child_record_without_meta
+test_secondmate_force_teardown_names_unreleasable_child_container
