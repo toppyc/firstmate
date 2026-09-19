@@ -3083,7 +3083,7 @@ SH
   # Nothing was retired, so the refusal must keep the whole promise.
   grep -Fq 'preserving the home, lease, and retirement records for retry' "$err" \
     || fail "the refusal withdrew a promise that was still entirely true"$'\n'"$(cat "$err")"
-  if grep -Fq 'retired there, each stop printed' "$err"; then
+  if grep -Fq 'a record was retired there' "$err"; then
     fail "the refusal claimed records were retired when the sweep retired none"$'\n'"$(cat "$err")"
   fi
   pass "a process-event refusal after a sweep that retired nothing preserves records too"
@@ -3139,7 +3139,7 @@ SH
     || fail "the guard sweep did not stop the cleanly releasable child container"$'\n'"$(cat "$err")"
   [ ! -e "$subhome/state/child-q1.resources" ] \
     || fail "the guard sweep kept the record of a container it stopped"
-  grep -Fq 'retired there, each stop printed' "$err" \
+  grep -Fq 'a record was retired there only once every container it named was stopped or found already gone' "$err" \
     || fail "the refusal did not say which records the sweep had already retired"$'\n'"$(cat "$err")"
   if grep -Fq 'preserving the home, lease, and retirement records for retry' "$err"; then
     fail "the refusal still claimed every retirement record was preserved"$'\n'"$(cat "$err")"
@@ -3147,6 +3147,60 @@ SH
   grep -Fq 'preserving the home and its lease for retry, along with every record the sweep above did not retire' "$err" \
     || fail "the refusal no longer states what survives the sweep"$'\n'"$(cat "$err")"
   pass "an ordinary retirement's process-event refusal names what the guard sweep already retired"
+}
+
+test_nonforced_process_event_refusal_claims_no_stop_for_an_already_gone_container() {
+  local home subhome fakebin dockerdir err
+  home="$TMP_ROOT/procevent-gone-home"
+  subhome="$TMP_ROOT/procevent-gone-subhome"
+  dockerdir="$TMP_ROOT/procevent-gone-docker"
+  err="$TMP_ROOT/procevent-gone.err"
+  mkdir -p "$home/state" "$home/data" "$subhome/state/procevent" "$subhome/bin" "$dockerdir"
+  mark_firstmate_home "$subhome"
+  printf 'domain\n' > "$subhome/.fm-secondmate-home"
+  fm_write_secondmate_meta "$home/state/domain.meta" "$subhome"
+  printf -- '- domain - design domain (home: %s; scope: design domain; projects: alpha; added 2026-09-19)\n' \
+    "$subhome" > "$home/data/secondmates.md"
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$subhome/state" \
+    "$ROOT/bin/fm-resource.sh" record child-z container sf-z-pg >/dev/null \
+    || fail "recording the child task's container failed"
+  printf 'source\n' > "$subhome/state/procevent/x.source"
+  cat > "$subhome/bin/fm-procevent.sh" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  sweep-home)
+    [ "${2:-}" = --preflight ] && exit 0
+    echo "fake procevent: sweep-home failed" >&2
+    exit 1 ;;
+  reconcile) exit 0 ;;
+esac
+exit 0
+SH
+  chmod +x "$subhome/bin/fm-procevent.sh"
+
+  fakebin=$(make_fake_tmux "$TMP_ROOT/procevent-gone-fake")
+  install_fake_docker "$fakebin" "$dockerdir"
+  # sf-z-pg is deliberately absent from the running list: the daemon answers and
+  # proves it is already gone, so the record is retired with no stop performed.
+  if PATH="$fakebin:$PATH" FM_HOME="$home" \
+    FM_FAKE_TMUX_LOG="$TMP_ROOT/procevent-gone-fake/tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/procevent-gone-fake/pane.txt" \
+    FM_FAKE_DOCKER_DIR="$dockerdir" \
+    "$ROOT/bin/fm-teardown.sh" domain >/dev/null 2>"$err"; then
+    fail "ordinary retirement completed although its process-event cleanup failed"
+  fi
+
+  [ -d "$subhome" ] || fail "the refusal still removed the home"
+  [ ! -s "$dockerdir/stopped.log" ] \
+    || fail "the sweep stopped a container that was already gone"
+  [ ! -e "$subhome/state/child-z.resources" ] \
+    || fail "the guard sweep kept the record of a container proven already gone"
+  grep -Fq 'a record was retired there only once every container it named was stopped or found already gone' "$err" \
+    || fail "the refusal did not account for the retired record honestly"$'\n'"$(cat "$err")"
+  if grep -Fq 'each stop printed' "$err"; then
+    fail "the refusal claimed a stop for a container that was never stopped"$'\n'"$(cat "$err")"
+  fi
+  pass "a process-event refusal claims no stop for a child container already gone"
 }
 
 test_force_teardown_keeps_child_records_when_process_event_cleanup_fails() {
@@ -3776,6 +3830,7 @@ test_secondmate_force_teardown_releases_child_task_resources
 test_force_teardown_keeps_child_records_when_process_event_cleanup_fails
 test_nonforced_process_event_refusal_states_what_the_guard_sweep_already_retired
 test_nonforced_process_event_refusal_keeps_full_promise_when_nothing_was_retired
+test_nonforced_process_event_refusal_claims_no_stop_for_an_already_gone_container
 test_nonforced_retirement_refuses_when_a_proven_container_stop_times_out
 test_secondmate_force_teardown_releases_child_record_without_meta
 test_secondmate_force_teardown_names_unreleasable_child_container

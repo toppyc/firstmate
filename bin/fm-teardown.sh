@@ -195,12 +195,15 @@
 #     a refusal reached after the endpoint is gone cannot
 #     preserve what it refuses to protect, and a sweep run ahead of the other
 #     gates stops containers and deletes their records for a retirement one of
-#     them then refuses. Two refusals still follow that earlier sweep, both
-#     reachable only after the close is attempted or the home removal is under
-#     way: the herdr endpoint-confirmed-gone gate and the process-event cleanup
-#     inside the removal. Neither can be moved ahead of a sweep that must itself
-#     precede the endpoint kill, so both name what they actually retain instead
-#     of claiming every record. On the forced path, where no earlier sweep has
+#     them then refuses. Whatever refusals follow that earlier sweep are
+#     reachable only once the close has been attempted or the home removal is
+#     under way, so none of them can be moved ahead of a sweep that must itself
+#     precede the endpoint kill, and none of them can preserve a container: the
+#     sweep refuses the retirement outright unless every record released
+#     cleanly. What a refusal downstream of the sweep must not do is claim to
+#     retain a record the sweep may already have retired, so it names what it
+#     actually retains instead of claiming every record. On the forced path,
+#     where no earlier sweep has
 #     run, the process-event cleanup's own sweep position keeps the records
 #     genuinely intact at its refusal and it says so.
 #     A home is swept once however many call sites it passes
@@ -2138,8 +2141,8 @@ restore_firstmate_home_process_events() {
 # killed - nothing can be both before that kill and after a step that only runs
 # during removal, so on that path the claim is narrowed rather than the order.
 # Narrowing is safe only because that earlier sweep refuses the whole retirement
-# unless every record released cleanly, so a record it retired names a container
-# it verifiably stopped and printed.
+# unless every record released cleanly, so a record it retired names only
+# containers it verifiably stopped or proved already gone, each outcome printed.
 #
 # Having merely RUN is not enough to narrow: the sweep sets its dedupe marker
 # before it looks at a single record, and a secondmate home usually holds none at
@@ -2150,7 +2153,7 @@ firstmate_home_retry_preserves() {  # <home>
   state=$(cd "$1/state" 2>/dev/null && pwd -P) || state=
   if [ -n "$state" ] && [ "$state" = "$FM_RETIRING_HOME_SWEPT" ] \
     && [ "$FM_RETIRING_HOME_RETIRED" -gt 0 ]; then
-    printf 'preserving the home and its lease for retry, along with every record the sweep above did not retire; the records of children that released cleanly were retired there, each stop printed, so nothing they named is orphaned'
+    printf 'preserving the home and its lease for retry, along with every record the sweep above did not retire; a record was retired there only once every container it named was stopped or found already gone, and what happened to each was reported, so nothing they named is orphaned'
     return 0
   fi
   printf 'preserving the home, lease, and retirement records for retry'
