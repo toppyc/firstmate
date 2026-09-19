@@ -175,12 +175,16 @@
 #     left by that child's own earlier failed teardown - is released too.
 #     Whatever could not be released is NAMED together with what actually became
 #     of its record on the path taken. A retirement WITHOUT --force sweeps
-#     EARLIER, at the in-flight-work guard, before the secondmate's endpoint is
-#     killed and before anything else is touched, and refuses there when the
-#     daemon answered and a container could not be stopped - a refusal reached
-#     after the endpoint is gone cannot preserve what it refuses to protect. A
-#     home is swept once however many call sites it passes through: the removal
-#     path reuses what that guard already released. An UNREACHABLE daemon never
+#     EARLIER: after every gate that can still abort it - the in-flight-work
+#     guard, the process-event preflight, both public-followup gates and the
+#     herdr presentation-lock preflight - and before the secondmate's endpoint is
+#     killed or its home touched. It refuses there when the daemon answered and a
+#     container could not be stopped. Both halves of that position matter: a
+#     refusal reached after the endpoint is gone cannot preserve what it refuses
+#     to protect, and a sweep run ahead of the other gates stops containers and
+#     deletes their records for a retirement one of them then refuses. A home is
+#     swept once however many call sites it passes through: the removal path
+#     reuses what that sweep already released. An UNREACHABLE daemon never
 #     refuses on either path, because "I could not ask" is no more evidence that
 #     a container is running than that it is gone - the record is kept, the name
 #     is printed, and the retirement proceeds. Forced retirement never refuses at
@@ -1381,8 +1385,9 @@ release_task_resources() {  # <state-dir> <task-id>
 # docker could not be asked about at all, because only the first is evidence of
 # a container still holding anything and so only the first may refuse.
 # Sweeping the same home twice releases and reports nothing new: the ordinary
-# retirement sweeps at its early guard and the removal path then reuses that
-# result, so one home is swept once however many call sites it passes through.
+# retirement sweeps before its endpoint is killed and the removal path then
+# reuses that result, so one home is swept once however many call sites it
+# passes through.
 FM_RETIRING_HOME_UNRELEASED=()
 FM_RETIRING_HOME_UNCHECKED=()
 FM_RETIRING_HOME_HAS_UNRELEASED=0
@@ -1882,9 +1887,11 @@ EOF
 # to this function rather than to any one caller or to --force: every present and
 # future removal path is covered by construction. It runs once the removal target
 # is validated and before anything is deleted. The ordinary retirement's refusal
-# does NOT live here - it fires at the early in-flight guard, before the
-# secondmate's endpoint is killed, because a refusal reached after the endpoint
-# is gone cannot preserve what it refuses to protect.
+# does NOT live here - it fires once every gate that can abort the retirement has
+# passed and before the secondmate's endpoint is killed, because a refusal
+# reached after the endpoint is gone cannot preserve what it refuses to protect,
+# and one reached ahead of the other gates stops containers that a later refusal
+# then strands.
 remove_firstmate_home() {
   local home=$1 label=$2 expected_id=${3:-} abs_home_path rc=0
   [ -n "$home" ] || return 0
@@ -2471,22 +2478,6 @@ if [ "$KIND" = secondmate ] && [ "$FORCE" != "--force" ]; then
       echo "Found $(basename "$child_meta"). Let that home finish or explicitly discard with --force." >&2
       exit 1
     done
-    # Retiring the home destroys its resource records, so release them while
-    # refusing is still worth something: nothing has been killed yet. Every
-    # record still here belongs to a task already torn down - the loop above
-    # refused on any surviving meta - so releasing one takes nothing from a live
-    # worker. A container the daemon confirmed it could not stop refuses the
-    # retirement outright; one docker could not be asked about does not, because
-    # that is not evidence of anything running, and stalling cleanup on a downed
-    # daemon strands the operator exactly when the machine is under the pressure
-    # this fix exists for.
-    release_retiring_home_resources "$SUB_STATE"
-    if [ "$FM_RETIRING_HOME_HAS_UNRELEASED" = 1 ]; then
-      echo "REFUSED: secondmate home $HOME_PATH records a resource cleanup could not release." >&2
-      report_retiring_home_unreleased "its record is kept in $SUB_STATE, which was not removed"
-      echo "Release it by hand and rerun, or discard with --force to retire the home regardless." >&2
-      exit 1
-    fi
   fi
 fi
 
@@ -2585,6 +2576,33 @@ if [ "$BACKEND" = herdr ]; then
   fm_backend_herdr_parse_target "$T" || exit 1
   TEARDOWN_HERDR_SESSION=$FM_BACKEND_HERDR_SESSION
   TEARDOWN_HERDR_PANE=$FM_BACKEND_HERDR_PANE
+fi
+
+# Retiring the home destroys its resource records, so release them at the last
+# point where refusing is still worth something: every refusal that can abort
+# this retirement has now passed - the in-flight-work guard, the process-event
+# preflight, both public-followup gates and the herdr presentation-lock
+# preflight - and nothing of this home has been killed or removed yet. Sweeping
+# ahead of any of them would stop containers and delete their records for a
+# retirement that a later gate then refuses, which is the same defect as
+# refusing after the endpoint is already gone. Every record here belongs to a
+# task already torn down - the guard above refused on any surviving meta - so
+# releasing one takes nothing from a live worker. A container the daemon
+# confirmed it could not stop refuses the retirement outright; one docker could
+# not be asked about does not, because that is not evidence of anything running,
+# and stalling cleanup on a downed daemon strands the operator exactly when the
+# machine is under the pressure this fix exists for.
+if [ "$KIND" = secondmate ] && [ "$FORCE" != "--force" ]; then
+  SUB_STATE="$HOME_PATH/state"
+  if [ -d "$SUB_STATE" ]; then
+    release_retiring_home_resources "$SUB_STATE"
+    if [ "$FM_RETIRING_HOME_HAS_UNRELEASED" = 1 ]; then
+      echo "REFUSED: secondmate home $HOME_PATH records a resource cleanup could not release." >&2
+      report_retiring_home_unreleased "its record is kept in $SUB_STATE, which was not removed"
+      echo "Release it by hand and rerun, or discard with --force to retire the home regardless." >&2
+      exit 1
+    fi
+  fi
 fi
 
 # Fix 3 (see script header): sweep remote job workers abandoned by an already

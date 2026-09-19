@@ -3200,6 +3200,58 @@ test_secondmate_retirement_without_force_refuses_unreleasable_child_container() 
   pass "secondmate retirement without --force refuses a child container it could not release"
 }
 
+# A refusal that fires after the sweep cannot un-stop a container or un-delete
+# its record, so the sweep has to sit after every gate that can still abort the
+# retirement - not just before the endpoint kill. The owed-public-reply gate is
+# the last of them on this path; a retirement refused there must leave the
+# child's container running and its record where the operator can find it.
+test_secondmate_retirement_refused_after_guard_keeps_child_containers() {
+  local home subhome fakebin dockerdir err
+  home="$TMP_ROOT/late-refusal-resources-home"
+  subhome="$TMP_ROOT/late-refusal-resources-subhome"
+  dockerdir="$TMP_ROOT/late-refusal-resources-docker"
+  err="$TMP_ROOT/late-refusal-resources-teardown.err"
+  mkdir -p "$home/state/public-followup/registry" "$home/data" "$subhome/state"
+  mark_firstmate_home "$subhome"
+  printf 'plainlate\n' > "$subhome/.fm-secondmate-home"
+  fm_write_secondmate_meta "$home/state/plainlate.meta" "$subhome"
+  printf -- '- plainlate - design domain (home: %s; scope: design domain; projects: alpha; added 2026-09-19)\n' \
+    "$subhome" > "$home/data/secondmates.md"
+  printf 'FMX_PAIRING_TOKEN=test-token\n' > "$home/.env"
+  printf 'work_home=secondmate:plainlate\nwork_id=plainlate\n' > "$home/state/public-followup/registry/obligation"
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$subhome/state" \
+    "$ROOT/bin/fm-resource.sh" record child-x8 container sf-childx8-pg >/dev/null \
+    || fail "recording the child container failed"
+
+  fakebin=$(make_fake_tmux "$TMP_ROOT/late-refusal-resources-fake")
+  install_fake_docker "$fakebin" "$dockerdir"
+  printf 'sf-childx8-pg\n' >> "$dockerdir/running"
+  cat > "$fakebin/tasks-axi" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+  chmod +x "$fakebin/tasks-axi"
+
+  if PATH="$fakebin:$PATH" FM_HOME="$home" \
+    FM_FAKE_TMUX_LOG="$TMP_ROOT/late-refusal-resources-fake/tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/late-refusal-resources-fake/pane.txt" \
+    FM_FAKE_DOCKER_DIR="$dockerdir" \
+    "$ROOT/bin/fm-teardown.sh" plainlate >/dev/null 2>"$err"; then
+    fail "teardown bypassed the owed-public-reply refusal"
+  fi
+
+  grep -F 'still owes a public reply' "$err" >/dev/null \
+    || fail "the later public-followup refusal was not the one that stopped this teardown"
+  grep -Fxq sf-childx8-pg "$dockerdir/running" \
+    || fail "a retirement refused at a later gate had already stopped the child container"
+  [ ! -s "$dockerdir/stopped.log" ] \
+    || fail "a retirement refused at a later gate stopped a container anyway"
+  [ -e "$subhome/state/child-x8.resources" ] \
+    || fail "a retirement refused at a later gate destroyed the child's resource record"
+  [ -d "$subhome" ] || fail "the later refusal removed the secondmate home"
+  pass "a retirement refused after the in-flight guard keeps every child container and record"
+}
+
 # An unreachable daemon is not evidence that anything is running, so it must not
 # block the retirement - on the machine this whole change exists for, Docker
 # Desktop is exactly what memory pressure kills. The name still has to escape
@@ -3357,4 +3409,5 @@ test_secondmate_force_teardown_names_unreleasable_child_container
 test_secondmate_force_teardown_proceeds_when_daemon_unreachable
 test_secondmate_retirement_without_force_releases_child_records
 test_secondmate_retirement_without_force_refuses_unreleasable_child_container
+test_secondmate_retirement_refused_after_guard_keeps_child_containers
 test_secondmate_retirement_without_force_proceeds_when_daemon_unreachable
