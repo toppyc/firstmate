@@ -180,9 +180,16 @@
 #     EARLIER: after every gate that refuses with nothing yet touched - the
 #     in-flight-work guard, the process-event preflight, both public-followup
 #     gates and the herdr presentation-lock preflight - and before the
-#     secondmate's endpoint is killed or its home removed. It refuses there when
-#     the daemon answered and a container could not be stopped. Both halves of
-#     that position matter: a refusal reached after the endpoint is gone cannot
+#     secondmate's endpoint is killed or its home removed. The sweep itself is
+#     not inert, and its refusal is not a no-op rollback: sweeping stops every
+#     child container docker will stop and DELETES the record of each child whose
+#     entries were all released or proven gone, all of it before the refusal
+#     below is evaluated. What that refusal preserves is therefore the home, the
+#     endpoint, and every record it could NOT release - the ones the operator is
+#     told to act on - while a cleanly released child is left with nothing but
+#     the stop already printed for it. It refuses there when the daemon answered
+#     and a container could not be stopped. Both halves of that position matter:
+#     a refusal reached after the endpoint is gone cannot
 #     preserve what it refuses to protect, and a sweep run ahead of the other
 #     gates stops containers and deletes their records for a retirement one of
 #     them then refuses. The one refusal that still follows the sweep - the herdr
