@@ -2953,6 +2953,802 @@ EOF
   pass "fm-backlog-handoff refuses Done items under whitespace section headings and unsafe homes"
 }
 
+# A file-driven docker stand-in: $dir/running is the daemon's container list,
+# $dir/stopped.log records every successful stop, and a name in
+# $dir/unstoppable exists but refuses to stop, standing in for a daemon error.
+# Creating $dir/unreachable makes every invocation fail the way the real CLI
+# does when it cannot connect to the daemon at all.
+install_fake_docker() {  # <fake-bin-dir> <docker-state-dir>
+  local fakebin=$1 dir=$2
+  mkdir -p "$dir"
+  : > "$dir/running"
+  : > "$dir/stopped.log"
+  : > "$dir/unstoppable"
+  : > "$dir/stop-hangs"
+  cat > "$fakebin/docker" <<'SH'
+#!/usr/bin/env bash
+# stop-hangs: containers whose `docker stop` never answers, the way a daemon
+# that wedges after answering the inspect does. Only a deadline ends the call.
+dir=$FM_FAKE_DOCKER_DIR
+if [ -e "$dir/unreachable" ]; then
+  printf 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?\n' >&2
+  exit 1
+fi
+case "${1:-} ${2:-}" in
+  "container inspect") grep -Fxq "${3:-}" "$dir/running" && exit 0; exit 1 ;;
+  "version --format") printf '27.0.0\n'; exit 0 ;;
+esac
+if [ "${1:-}" = stop ]; then
+  if grep -Fxq "${2:-}" "$dir/stop-hangs" 2>/dev/null; then
+    sleep 300
+    exit 0
+  fi
+  grep -Fxq "${2:-}" "$dir/running" || exit 1
+  ! grep -Fxq "${2:-}" "$dir/unstoppable" || exit 1
+  grep -Fxv "${2:-}" "$dir/running" > "$dir/running.next" 2>/dev/null || :
+  mv "$dir/running.next" "$dir/running"
+  printf '%s\n' "${2:-}" >> "$dir/stopped.log"
+  exit 0
+fi
+exit 125
+SH
+  chmod +x "$fakebin/docker"
+}
+
+test_nonforced_retirement_refuses_when_a_proven_container_stop_times_out() {
+  local home subhome fakebin dockerdir err
+  home="$TMP_ROOT/stophang-home"
+  subhome="$TMP_ROOT/stophang-subhome"
+  dockerdir="$TMP_ROOT/stophang-docker"
+  err="$TMP_ROOT/stophang.err"
+  mkdir -p "$home/state" "$home/data" "$subhome/state" "$dockerdir"
+  mark_firstmate_home "$subhome"
+  printf 'domain\n' > "$subhome/.fm-secondmate-home"
+  fm_write_secondmate_meta "$home/state/domain.meta" "$subhome"
+  printf -- '- domain - design domain (home: %s; scope: design domain; projects: alpha; added 2026-09-19)\n' \
+    "$subhome" > "$home/data/secondmates.md"
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$subhome/state" \
+    "$ROOT/bin/fm-resource.sh" record child-h1 container sf-childh1-pg >/dev/null \
+    || fail "recording the child task's container failed"
+
+  fakebin=$(make_fake_tmux "$TMP_ROOT/stophang-fake")
+  install_fake_docker "$fakebin" "$dockerdir"
+  # The daemon ANSWERS the inspect - the container is proven to exist - and then
+  # never answers the stop.
+  printf 'sf-childh1-pg\n' >> "$dockerdir/running"
+  printf 'sf-childh1-pg\n' > "$dockerdir/stop-hangs"
+
+  if PATH="$fakebin:$PATH" FM_HOME="$home" \
+    FM_RESOURCE_DOCKER_TIMEOUT=2 \
+    FM_FAKE_TMUX_LOG="$TMP_ROOT/stophang-fake/tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/stophang-fake/pane.txt" \
+    FM_FAKE_DOCKER_DIR="$dockerdir" \
+    "$ROOT/bin/fm-teardown.sh" domain >/dev/null 2>"$err"; then
+    fail "the retirement proceeded over a container proven to exist and not stopped"$'\n'"$(cat "$err")"
+  fi
+
+  [ -d "$subhome" ] || fail "the refusal still removed the home"
+  [ -e "$subhome/state/child-h1.resources" ] \
+    || fail "the refusal destroyed the only durable pointer to a running container"$'\n'"$(cat "$err")"
+  grep -Fxq sf-childh1-pg "$dockerdir/running" \
+    || fail "the fixture lost the container the stop never answered for"
+  grep -Fq 'is still holding resources' "$err" \
+    || fail "a proven container whose stop timed out was not reported as still holding resources"$'\n'"$(cat "$err")"
+  if grep -Fq 'docker could not be asked about' "$err"; then
+    fail "a daemon that answered the inspect was reported as unreachable"$'\n'"$(cat "$err")"
+  fi
+  pass "a stop that times out after a successful inspect refuses the ordinary retirement"
+}
+
+test_nonforced_process_event_refusal_keeps_full_promise_when_nothing_was_retired() {
+  local home subhome fakebin dockerdir err
+  home="$TMP_ROOT/procevent-norec-home"
+  subhome="$TMP_ROOT/procevent-norec-subhome"
+  dockerdir="$TMP_ROOT/procevent-norec-docker"
+  err="$TMP_ROOT/procevent-norec.err"
+  mkdir -p "$home/state" "$home/data" "$subhome/state/procevent" "$subhome/bin" "$dockerdir"
+  mark_firstmate_home "$subhome"
+  printf 'domain\n' > "$subhome/.fm-secondmate-home"
+  fm_write_secondmate_meta "$home/state/domain.meta" "$subhome"
+  printf -- '- domain - design domain (home: %s; scope: design domain; projects: alpha; added 2026-09-19)\n' \
+    "$subhome" > "$home/data/secondmates.md"
+  # The ordinary shape of a secondmate home: no *.resources records at all, so
+  # the guard sweep runs and retires nothing.
+  printf 'source\n' > "$subhome/state/procevent/x.source"
+  cat > "$subhome/bin/fm-procevent.sh" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  sweep-home)
+    [ "${2:-}" = --preflight ] && exit 0
+    echo "fake procevent: sweep-home failed" >&2
+    exit 1 ;;
+  reconcile) exit 0 ;;
+esac
+exit 0
+SH
+  chmod +x "$subhome/bin/fm-procevent.sh"
+
+  fakebin=$(make_fake_tmux "$TMP_ROOT/procevent-norec-fake")
+  install_fake_docker "$fakebin" "$dockerdir"
+
+  if PATH="$fakebin:$PATH" FM_HOME="$home" \
+    FM_FAKE_TMUX_LOG="$TMP_ROOT/procevent-norec-fake/tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/procevent-norec-fake/pane.txt" \
+    FM_FAKE_DOCKER_DIR="$dockerdir" \
+    "$ROOT/bin/fm-teardown.sh" domain >/dev/null 2>"$err"; then
+    fail "ordinary retirement completed although its process-event cleanup failed"
+  fi
+
+  [ -d "$subhome" ] || fail "the refusal still removed the home"
+  # Nothing was retired, so the refusal must keep the whole promise.
+  grep -Fq 'preserving the home, lease, and retirement records for retry' "$err" \
+    || fail "the refusal withdrew a promise that was still entirely true"$'\n'"$(cat "$err")"
+  if grep -Fq 'a record was retired there' "$err"; then
+    fail "the refusal claimed records were retired when the sweep retired none"$'\n'"$(cat "$err")"
+  fi
+  pass "a process-event refusal after a sweep that retired nothing preserves records too"
+}
+
+test_nonforced_process_event_refusal_states_what_the_guard_sweep_already_retired() {
+  local home subhome fakebin dockerdir err
+  home="$TMP_ROOT/procevent-plain-home"
+  subhome="$TMP_ROOT/procevent-plain-subhome"
+  dockerdir="$TMP_ROOT/procevent-plain-docker"
+  err="$TMP_ROOT/procevent-plain.err"
+  mkdir -p "$home/state" "$home/data" "$subhome/state/procevent" "$subhome/bin" "$dockerdir"
+  mark_firstmate_home "$subhome"
+  printf 'domain\n' > "$subhome/.fm-secondmate-home"
+  fm_write_secondmate_meta "$home/state/domain.meta" "$subhome"
+  printf -- '- domain - design domain (home: %s; scope: design domain; projects: alpha; added 2026-09-19)\n' \
+    "$subhome" > "$home/data/secondmates.md"
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$subhome/state" \
+    "$ROOT/bin/fm-resource.sh" record child-q1 container sf-childq1-pg >/dev/null \
+    || fail "recording the child task's container failed"
+  printf 'source\n' > "$subhome/state/procevent/x.source"
+  cat > "$subhome/bin/fm-procevent.sh" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  sweep-home)
+    [ "${2:-}" = --preflight ] && exit 0
+    echo "fake procevent: sweep-home failed" >&2
+    exit 1 ;;
+  reconcile) exit 0 ;;
+esac
+exit 0
+SH
+  chmod +x "$subhome/bin/fm-procevent.sh"
+
+  fakebin=$(make_fake_tmux "$TMP_ROOT/procevent-plain-fake")
+  install_fake_docker "$fakebin" "$dockerdir"
+  printf 'sf-childq1-pg\n' >> "$dockerdir/running"
+
+  # No --force: the guard sweep runs before the endpoint kill, so by the time the
+  # process-event cleanup refuses, the cleanly released child's record is gone.
+  if PATH="$fakebin:$PATH" FM_HOME="$home" \
+    FM_FAKE_TMUX_LOG="$TMP_ROOT/procevent-plain-fake/tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/procevent-plain-fake/pane.txt" \
+    FM_FAKE_DOCKER_DIR="$dockerdir" \
+    "$ROOT/bin/fm-teardown.sh" domain >/dev/null 2>"$err"; then
+    fail "ordinary retirement completed although its process-event cleanup failed"
+  fi
+
+  [ -d "$subhome" ] || fail "the refusal still removed the home"
+  # The state the refusal must describe: the container was verifiably stopped and
+  # its record retired before the refusal, so nothing it named is orphaned.
+  grep -Fxq sf-childq1-pg "$dockerdir/stopped.log" \
+    || fail "the guard sweep did not stop the cleanly releasable child container"$'\n'"$(cat "$err")"
+  [ ! -e "$subhome/state/child-q1.resources" ] \
+    || fail "the guard sweep kept the record of a container it stopped"
+  grep -Fq 'a record was retired there only once every container it named was stopped or found already gone' "$err" \
+    || fail "the refusal did not say which records the sweep had already retired"$'\n'"$(cat "$err")"
+  if grep -Fq 'preserving the home, lease, and retirement records for retry' "$err"; then
+    fail "the refusal still claimed every retirement record was preserved"$'\n'"$(cat "$err")"
+  fi
+  grep -Fq 'preserving the home and its lease for retry, along with every record the sweep above did not retire' "$err" \
+    || fail "the refusal no longer states what survives the sweep"$'\n'"$(cat "$err")"
+  pass "an ordinary retirement's process-event refusal names what the guard sweep already retired"
+}
+
+test_nonforced_process_event_refusal_claims_no_stop_for_an_already_gone_container() {
+  local home subhome fakebin dockerdir err
+  home="$TMP_ROOT/procevent-gone-home"
+  subhome="$TMP_ROOT/procevent-gone-subhome"
+  dockerdir="$TMP_ROOT/procevent-gone-docker"
+  err="$TMP_ROOT/procevent-gone.err"
+  mkdir -p "$home/state" "$home/data" "$subhome/state/procevent" "$subhome/bin" "$dockerdir"
+  mark_firstmate_home "$subhome"
+  printf 'domain\n' > "$subhome/.fm-secondmate-home"
+  fm_write_secondmate_meta "$home/state/domain.meta" "$subhome"
+  printf -- '- domain - design domain (home: %s; scope: design domain; projects: alpha; added 2026-09-19)\n' \
+    "$subhome" > "$home/data/secondmates.md"
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$subhome/state" \
+    "$ROOT/bin/fm-resource.sh" record child-z container sf-z-pg >/dev/null \
+    || fail "recording the child task's container failed"
+  printf 'source\n' > "$subhome/state/procevent/x.source"
+  cat > "$subhome/bin/fm-procevent.sh" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  sweep-home)
+    [ "${2:-}" = --preflight ] && exit 0
+    echo "fake procevent: sweep-home failed" >&2
+    exit 1 ;;
+  reconcile) exit 0 ;;
+esac
+exit 0
+SH
+  chmod +x "$subhome/bin/fm-procevent.sh"
+
+  fakebin=$(make_fake_tmux "$TMP_ROOT/procevent-gone-fake")
+  install_fake_docker "$fakebin" "$dockerdir"
+  # sf-z-pg is deliberately absent from the running list: the daemon answers and
+  # proves it is already gone, so the record is retired with no stop performed.
+  if PATH="$fakebin:$PATH" FM_HOME="$home" \
+    FM_FAKE_TMUX_LOG="$TMP_ROOT/procevent-gone-fake/tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/procevent-gone-fake/pane.txt" \
+    FM_FAKE_DOCKER_DIR="$dockerdir" \
+    "$ROOT/bin/fm-teardown.sh" domain >/dev/null 2>"$err"; then
+    fail "ordinary retirement completed although its process-event cleanup failed"
+  fi
+
+  [ -d "$subhome" ] || fail "the refusal still removed the home"
+  [ ! -s "$dockerdir/stopped.log" ] \
+    || fail "the sweep stopped a container that was already gone"
+  [ ! -e "$subhome/state/child-z.resources" ] \
+    || fail "the guard sweep kept the record of a container proven already gone"
+  grep -Fq 'a record was retired there only once every container it named was stopped or found already gone' "$err" \
+    || fail "the refusal did not account for the retired record honestly"$'\n'"$(cat "$err")"
+  if grep -Fq 'each stop printed' "$err"; then
+    fail "the refusal claimed a stop for a container that was never stopped"$'\n'"$(cat "$err")"
+  fi
+  pass "a process-event refusal claims no stop for a child container already gone"
+}
+
+test_force_teardown_keeps_child_records_when_process_event_cleanup_fails() {
+  local home subhome fakebin dockerdir err
+  home="$TMP_ROOT/procevent-fail-home"
+  subhome="$TMP_ROOT/procevent-fail-subhome"
+  dockerdir="$TMP_ROOT/procevent-fail-docker"
+  err="$TMP_ROOT/procevent-fail.err"
+  mkdir -p "$home/state" "$home/data" "$subhome/state/procevent" "$subhome/bin" "$dockerdir"
+  mark_firstmate_home "$subhome"
+  printf 'domain\n' > "$subhome/.fm-secondmate-home"
+  fm_write_secondmate_meta "$home/state/domain.meta" "$subhome"
+  printf -- '- domain - design domain (home: %s; scope: design domain; projects: alpha; added 2026-09-19)\n' \
+    "$subhome" > "$home/data/secondmates.md"
+  # A child record whose own task meta is already gone: exactly what the sweep
+  # would stop and delete if it ran.
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$subhome/state" \
+    "$ROOT/bin/fm-resource.sh" record child-p1 container sf-childp1-pg >/dev/null \
+    || fail "recording the child task's container failed"
+  # Process-event state whose dry-run preflight passes and whose real sweep then
+  # fails - the case the preflight cannot rule out.
+  printf 'source\n' > "$subhome/state/procevent/x.source"
+  cat > "$subhome/bin/fm-procevent.sh" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  sweep-home)
+    [ "${2:-}" = --preflight ] && exit 0
+    echo "fake procevent: sweep-home failed" >&2
+    exit 1 ;;
+  reconcile) exit 0 ;;
+esac
+exit 0
+SH
+  chmod +x "$subhome/bin/fm-procevent.sh"
+
+  fakebin=$(make_fake_tmux "$TMP_ROOT/procevent-fail-fake")
+  install_fake_docker "$fakebin" "$dockerdir"
+  printf 'sf-childp1-pg\n' >> "$dockerdir/running"
+
+  if PATH="$fakebin:$PATH" FM_HOME="$home" \
+    FM_FAKE_TMUX_LOG="$TMP_ROOT/procevent-fail-fake/tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/procevent-fail-fake/pane.txt" \
+    FM_FAKE_DOCKER_DIR="$dockerdir" \
+    "$ROOT/bin/fm-teardown.sh" domain --force >/dev/null 2>"$err"; then
+    fail "forced retirement completed although its process-event cleanup failed"
+  fi
+
+  # The refusal promises the home and its retirement records survive for a
+  # retry, so nothing may have been swept before it.
+  [ -d "$subhome" ] || fail "the refusal still removed the home"
+  [ -e "$subhome/state/child-p1.resources" ] \
+    || fail "the child's resource record was destroyed before the refusal"$'\n'"$(cat "$err")"
+  grep -Fxq sf-childp1-pg "$dockerdir/running" \
+    || fail "the child's container was stopped before the refusal"$'\n'"$(cat "$err")"
+  grep -Fq 'preserving the home, lease, and retirement records for retry' "$err" \
+    || fail "the process-event refusal was not the one that fired"$'\n'"$(cat "$err")"
+  pass "a forced retirement refused by process-event cleanup keeps every child record"
+}
+
+test_secondmate_force_teardown_releases_child_task_resources() {
+  local home subhome fakebin log dockerdir
+  home="$TMP_ROOT/child-resources-home"
+  subhome="$TMP_ROOT/child-resources-subhome"
+  dockerdir="$TMP_ROOT/child-resources-docker"
+  mkdir -p "$home/state" "$home/data" "$subhome/state" "$dockerdir"
+  mark_firstmate_home "$subhome"
+  printf 'domain\n' > "$subhome/.fm-secondmate-home"
+  fm_write_secondmate_meta "$home/state/domain.meta" "$subhome"
+  printf -- '- domain - design domain (home: %s; scope: design domain; projects: alpha; added 2026-09-18)\n' \
+    "$subhome" > "$home/data/secondmates.md"
+  # One ordinary task inside the retiring home, holding a container it recorded.
+  fm_write_meta "$subhome/state/child-x1.meta" \
+    "window=firstmate:fm-child-x1" \
+    "endpoint_task_id=child-x1" \
+    "worktree=$TMP_ROOT/child-resources-absent-wt" \
+    "project=$TMP_ROOT/child-resources-absent-project" \
+    "kind=ship" \
+    "mode=local-only"
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$subhome/state" \
+    "$ROOT/bin/fm-resource.sh" record child-x1 container sf-childx1-pg >/dev/null \
+    || fail "recording the child task's container failed"
+
+  fakebin=$(make_fake_tmux "$TMP_ROOT/child-resources-fake")
+  log="$TMP_ROOT/child-resources-fake/tmux.log"
+  install_fake_docker "$fakebin" "$dockerdir"
+  printf 'sf-childx1-pg\n' >> "$dockerdir/running"
+  printf 'stoneflow-dev-postgres\n' >> "$dockerdir/running"
+
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/child-resources-fake/pane.txt" \
+    FM_FAKE_DOCKER_DIR="$dockerdir" \
+    "$ROOT/bin/fm-teardown.sh" domain --force >/dev/null 2>/dev/null \
+    || fail "forced secondmate retirement failed"
+
+  grep -Fxq sf-childx1-pg "$dockerdir/stopped.log" \
+    || fail "forced retirement erased the child task's records without stopping the container it recorded"
+  grep -Fxq stoneflow-dev-postgres "$dockerdir/running" \
+    || fail "forced retirement stopped a container no record named"
+  [ ! -d "$subhome" ] || fail "forced retirement retained the home"
+  pass "forced secondmate retirement releases each child task's recorded resources"
+}
+
+# A child whose own teardown already retired its meta but kept its resource
+# record is the case most likely to be orphaned: nothing else points at that
+# container any more, and the home is about to be erased with the record in it.
+test_secondmate_force_teardown_releases_child_record_without_meta() {
+  local home subhome fakebin dockerdir
+  home="$TMP_ROOT/orphan-record-home"
+  subhome="$TMP_ROOT/orphan-record-subhome"
+  dockerdir="$TMP_ROOT/orphan-record-docker"
+  mkdir -p "$home/state" "$home/data" "$subhome/state"
+  mark_firstmate_home "$subhome"
+  printf 'metaless\n' > "$subhome/.fm-secondmate-home"
+  fm_write_secondmate_meta "$home/state/metaless.meta" "$subhome"
+  printf -- '- metaless - design domain (home: %s; scope: design domain; projects: alpha; added 2026-09-18)\n' \
+    "$subhome" > "$home/data/secondmates.md"
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$subhome/state" \
+    "$ROOT/bin/fm-resource.sh" record child-x2 container sf-childx2-pg >/dev/null \
+    || fail "recording the orphaned child container failed"
+  [ ! -e "$subhome/state/child-x2.meta" ] || fail "fixture left a meta beside the metaless record"
+
+  fakebin=$(make_fake_tmux "$TMP_ROOT/orphan-record-fake")
+  install_fake_docker "$fakebin" "$dockerdir"
+  printf 'sf-childx2-pg\n' >> "$dockerdir/running"
+  printf 'stoneflow-dev-pgadmin\n' >> "$dockerdir/running"
+
+  PATH="$fakebin:$PATH" FM_HOME="$home" \
+    FM_FAKE_TMUX_LOG="$TMP_ROOT/orphan-record-fake/tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/orphan-record-fake/pane.txt" \
+    FM_FAKE_DOCKER_DIR="$dockerdir" \
+    "$ROOT/bin/fm-teardown.sh" metaless --force >/dev/null 2>/dev/null \
+    || fail "forced secondmate retirement failed"
+
+  grep -Fxq sf-childx2-pg "$dockerdir/stopped.log" \
+    || fail "forced retirement erased a resource record whose meta was already gone without releasing it"
+  grep -Fxq stoneflow-dev-pgadmin "$dockerdir/running" \
+    || fail "forced retirement stopped a container no record named"
+  [ ! -d "$subhome" ] || fail "forced retirement retained the home"
+  pass "forced secondmate retirement releases a child record whose meta is already gone"
+}
+
+# The home and every record in it are destroyed either way, so the only thing
+# that can survive a container it could not stop is the name in the output.
+test_secondmate_force_teardown_names_unreleasable_child_container() {
+  local home subhome fakebin dockerdir err
+  home="$TMP_ROOT/stuck-resources-home"
+  subhome="$TMP_ROOT/stuck-resources-subhome"
+  dockerdir="$TMP_ROOT/stuck-resources-docker"
+  err="$TMP_ROOT/stuck-resources-teardown.err"
+  mkdir -p "$home/state" "$home/data" "$subhome/state"
+  mark_firstmate_home "$subhome"
+  printf 'stuck\n' > "$subhome/.fm-secondmate-home"
+  fm_write_secondmate_meta "$home/state/stuck.meta" "$subhome"
+  printf -- '- stuck - design domain (home: %s; scope: design domain; projects: alpha; added 2026-09-18)\n' \
+    "$subhome" > "$home/data/secondmates.md"
+  fm_write_meta "$subhome/state/child-x3.meta" \
+    "window=firstmate:fm-child-x3" \
+    "endpoint_task_id=child-x3" \
+    "worktree=$TMP_ROOT/stuck-resources-absent-wt" \
+    "project=$TMP_ROOT/stuck-resources-absent-project" \
+    "kind=ship" \
+    "mode=local-only"
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$subhome/state" \
+    "$ROOT/bin/fm-resource.sh" record child-x3 container sf-childx3-pg >/dev/null \
+    || fail "recording the stuck child container failed"
+
+  fakebin=$(make_fake_tmux "$TMP_ROOT/stuck-resources-fake")
+  install_fake_docker "$fakebin" "$dockerdir"
+  printf 'sf-childx3-pg\n' >> "$dockerdir/running"
+  printf 'sf-childx3-pg\n' >> "$dockerdir/unstoppable"
+
+  PATH="$fakebin:$PATH" FM_HOME="$home" \
+    FM_FAKE_TMUX_LOG="$TMP_ROOT/stuck-resources-fake/tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/stuck-resources-fake/pane.txt" \
+    FM_FAKE_DOCKER_DIR="$dockerdir" \
+    "$ROOT/bin/fm-teardown.sh" stuck --force >/dev/null 2>"$err" \
+    || fail "a container that could not be stopped blocked forced secondmate retirement"
+
+  [ ! -d "$subhome" ] || fail "forced retirement retained the home"
+  grep -Fxq sf-childx3-pg "$dockerdir/running" \
+    || fail "the fixture container was stopped after all; the test proves nothing"
+  grep -Fq sf-childx3-pg "$err" \
+    || fail "the name of the unreleasable container did not survive the destruction of its record"
+  grep -Fq "$subhome/state/child-x3.resources" "$err" \
+    && fail "forced retirement pointed the operator at a record it was about to destroy"
+  pass "forced secondmate retirement names a child container it could not release"
+}
+
+# Retiring a home destroys its records whether or not --force was given, so an
+# ordinary retirement has to sweep them too. The record left behind by a child's
+# own failed teardown - record kept, meta already gone - is the one that reaches
+# this path in practice.
+# A record whose basename is not a usable task id cannot be released, so it must
+# count as unreleased like every sibling case. The branch used to warn and step
+# over it - the one fail-open in this change - which let an ordinary retirement
+# destroy a record naming a live container.
+test_secondmate_retirement_refuses_unreadable_record_name_and_names_its_contents() {
+  local home subhome fakebin dockerdir err
+  home="$TMP_ROOT/badname-home"
+  subhome="$TMP_ROOT/badname-subhome"
+  dockerdir="$TMP_ROOT/badname-docker"
+  err="$TMP_ROOT/badname.err"
+  mkdir -p "$home/state" "$home/data" "$subhome/state"
+  mark_firstmate_home "$subhome"
+  printf 'badname\n' > "$subhome/.fm-secondmate-home"
+  fm_write_secondmate_meta "$home/state/badname.meta" "$subhome"
+  printf -- '- badname - design domain (home: %s; scope: design domain; projects: alpha; added 2026-09-19)\n' \
+    "$subhome" > "$home/data/secondmates.md"
+  # A record left under a name the task-id validator refuses, whose last line
+  # tries to pass itself off as firstmate's own statement about the record's
+  # fate so the operator cannot tell the two apart.
+  printf 'fm-task-resources-v1\ncontainer sf-orphan-pg; its record was destroyed with %s\n' \
+    "$subhome" > "$subhome/state/.stale.resources"
+
+  fakebin=$(make_fake_tmux "$TMP_ROOT/badname-fake")
+  install_fake_docker "$fakebin" "$dockerdir"
+  printf 'sf-orphan-pg\n' >> "$dockerdir/running"
+
+  if PATH="$fakebin:$PATH" FM_HOME="$home" \
+    FM_FAKE_TMUX_LOG="$TMP_ROOT/badname-fake/tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/badname-fake/pane.txt" \
+    FM_FAKE_DOCKER_DIR="$dockerdir" \
+    "$ROOT/bin/fm-teardown.sh" badname >/dev/null 2>"$err"; then
+    fail "ordinary retirement destroyed a home holding a record it could not read"
+  fi
+
+  [ -d "$subhome" ] || fail "the refusal still removed the home"
+  [ -e "$subhome/state/.stale.resources" ] || fail "the refusal still destroyed the unreadable record"
+  grep -Fxq sf-orphan-pg "$dockerdir/running" \
+    || fail "a container named only by an unreadable record was stopped"
+  # The record dies with the home, so its contents must escape into the output.
+  grep -F 'sf-orphan-pg' "$err" >/dev/null \
+    || fail "the unreadable record's contents were never named"$'\n'"$(cat "$err")"
+  # Firstmate's own statement about the record's fate is one complete line at
+  # column 0 that carries none of the record's bytes.
+  if ! grep -Fq "warning: the resource record $subhome/state/.stale.resources could not be read because .stale is not a usable task id; its record is kept in $subhome/state, which was not removed" "$err"; then
+    fail "firstmate's fate clause was not printed as its own complete line"$'\n'"$(cat "$err")"
+  fi
+  # ... and it is not buried inside the indented quote of the record's bytes.
+  if grep -q '^[[:space:]].*which was not removed' "$err"; then
+    fail "firstmate's fate clause was printed inside the quoted record contents"$'\n'"$(cat "$err")"
+  fi
+  # The record's bytes appear only between fence markers, indented, so the
+  # forged fate clause inside them cannot be read as firstmate speaking.
+  if ! grep -Fq "begin quoted contents of the unreadable record $subhome/state/.stale.resources" "$err"; then
+    fail "the quoted record contents had no opening fence"$'\n'"$(cat "$err")"
+  fi
+  if ! grep -Fq "end quoted contents of the unreadable record $subhome/state/.stale.resources" "$err"; then
+    fail "the quoted record contents had no closing fence"$'\n'"$(cat "$err")"
+  fi
+  if grep -F 'sf-orphan-pg; its record was destroyed with' "$err" | grep -qv '^[[:space:]]'; then
+    fail "the record's forged fate clause escaped the quoted block"$'\n'"$(cat "$err")"
+  fi
+  pass "an unreadable record name refuses the ordinary retirement and its contents are fenced"
+}
+
+test_secondmate_retirement_without_force_releases_child_records() {
+  local home subhome fakebin dockerdir
+  home="$TMP_ROOT/plain-retire-home"
+  subhome="$TMP_ROOT/plain-retire-subhome"
+  dockerdir="$TMP_ROOT/plain-retire-docker"
+  mkdir -p "$home/state" "$home/data" "$subhome/state"
+  mark_firstmate_home "$subhome"
+  printf 'plainretire\n' > "$subhome/.fm-secondmate-home"
+  fm_write_secondmate_meta "$home/state/plainretire.meta" "$subhome"
+  printf -- '- plainretire - design domain (home: %s; scope: design domain; projects: alpha; added 2026-09-19)\n' \
+    "$subhome" > "$home/data/secondmates.md"
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$subhome/state" \
+    "$ROOT/bin/fm-resource.sh" record child-x4 container sf-childx4-pg >/dev/null \
+    || fail "recording the orphaned child container failed"
+  [ ! -e "$subhome/state/child-x4.meta" ] || fail "fixture left a meta beside the metaless record"
+
+  fakebin=$(make_fake_tmux "$TMP_ROOT/plain-retire-fake")
+  install_fake_docker "$fakebin" "$dockerdir"
+  printf 'sf-childx4-pg\n' >> "$dockerdir/running"
+  printf 'stoneflow-dev-postgres\n' >> "$dockerdir/running"
+
+  PATH="$fakebin:$PATH" FM_HOME="$home" \
+    FM_FAKE_TMUX_LOG="$TMP_ROOT/plain-retire-fake/tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/plain-retire-fake/pane.txt" \
+    FM_FAKE_DOCKER_DIR="$dockerdir" \
+    "$ROOT/bin/fm-teardown.sh" plainretire >/dev/null 2>/dev/null \
+    || fail "ordinary secondmate retirement failed"
+
+  grep -Fxq sf-childx4-pg "$dockerdir/stopped.log" \
+    || fail "an ordinary retirement erased the home's resource records without releasing them"
+  grep -Fxq stoneflow-dev-postgres "$dockerdir/running" \
+    || fail "an ordinary retirement stopped a container no record named"
+  [ ! -d "$subhome" ] || fail "ordinary retirement retained the home"
+  pass "secondmate retirement without --force releases the home's recorded resources"
+}
+
+# Without discard authority there is no reason to destroy the one durable pointer
+# to a container still running, so the ordinary path refuses instead.
+test_secondmate_retirement_without_force_refuses_unreleasable_child_container() {
+  local home subhome fakebin dockerdir err
+  home="$TMP_ROOT/plain-stuck-home"
+  subhome="$TMP_ROOT/plain-stuck-subhome"
+  dockerdir="$TMP_ROOT/plain-stuck-docker"
+  err="$TMP_ROOT/plain-stuck-teardown.err"
+  mkdir -p "$home/state" "$home/data" "$subhome/state"
+  mark_firstmate_home "$subhome"
+  printf 'plainstuck\n' > "$subhome/.fm-secondmate-home"
+  fm_write_secondmate_meta "$home/state/plainstuck.meta" "$subhome"
+  printf -- '- plainstuck - design domain (home: %s; scope: design domain; projects: alpha; added 2026-09-19)\n' \
+    "$subhome" > "$home/data/secondmates.md"
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$subhome/state" \
+    "$ROOT/bin/fm-resource.sh" record child-x5 container sf-childx5-pg >/dev/null \
+    || fail "recording the stuck child container failed"
+
+  fakebin=$(make_fake_tmux "$TMP_ROOT/plain-stuck-fake")
+  install_fake_docker "$fakebin" "$dockerdir"
+  printf 'sf-childx5-pg\n' >> "$dockerdir/running"
+  printf 'sf-childx5-pg\n' >> "$dockerdir/unstoppable"
+
+  if PATH="$fakebin:$PATH" FM_HOME="$home" \
+    FM_FAKE_TMUX_LOG="$TMP_ROOT/plain-stuck-fake/tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/plain-stuck-fake/pane.txt" \
+    FM_FAKE_DOCKER_DIR="$dockerdir" \
+    "$ROOT/bin/fm-teardown.sh" plainstuck >/dev/null 2>"$err"; then
+    fail "an ordinary retirement destroyed a home holding a container it could not release"
+  fi
+
+  grep -Fq sf-childx5-pg "$err" || fail "the refusal did not name the container it could not release"
+  grep -Fq REFUSED "$err" || fail "the retirement stopped without a refusal line"
+  [ -d "$subhome" ] || fail "the refusal removed the home anyway"
+  [ -e "$subhome/state/child-x5.resources" ] \
+    || fail "the refusal destroyed the record that is the only pointer to the container"
+  grep -Fxq sf-childx5-pg "$dockerdir/running" \
+    || fail "the fixture container was stopped after all; the test proves nothing"
+  ! grep -q kill-window "$TMP_ROOT/plain-stuck-fake/tmux.log" 2>/dev/null \
+    || fail "the refusal fired only after the secondmate's endpoint was already killed"
+  pass "secondmate retirement without --force refuses a child container it could not release"
+}
+
+# A refusal that fires after the sweep cannot un-stop a container or un-delete
+# its record, so the sweep has to sit after every gate that can still abort the
+# retirement - not just before the endpoint kill. The owed-public-reply gate is
+# the last of them on this path; a retirement refused there must leave the
+# child's container running and its record where the operator can find it.
+test_secondmate_retirement_refused_after_guard_keeps_child_containers() {
+  local home subhome fakebin dockerdir err
+  home="$TMP_ROOT/late-refusal-resources-home"
+  subhome="$TMP_ROOT/late-refusal-resources-subhome"
+  dockerdir="$TMP_ROOT/late-refusal-resources-docker"
+  err="$TMP_ROOT/late-refusal-resources-teardown.err"
+  mkdir -p "$home/state/public-followup/registry" "$home/data" "$subhome/state"
+  mark_firstmate_home "$subhome"
+  printf 'plainlate\n' > "$subhome/.fm-secondmate-home"
+  fm_write_secondmate_meta "$home/state/plainlate.meta" "$subhome"
+  printf -- '- plainlate - design domain (home: %s; scope: design domain; projects: alpha; added 2026-09-19)\n' \
+    "$subhome" > "$home/data/secondmates.md"
+  printf 'FMX_PAIRING_TOKEN=test-token\n' > "$home/.env"
+  printf 'work_home=secondmate:plainlate\nwork_id=plainlate\n' > "$home/state/public-followup/registry/obligation"
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$subhome/state" \
+    "$ROOT/bin/fm-resource.sh" record child-x8 container sf-childx8-pg >/dev/null \
+    || fail "recording the child container failed"
+
+  fakebin=$(make_fake_tmux "$TMP_ROOT/late-refusal-resources-fake")
+  install_fake_docker "$fakebin" "$dockerdir"
+  printf 'sf-childx8-pg\n' >> "$dockerdir/running"
+  cat > "$fakebin/tasks-axi" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+  chmod +x "$fakebin/tasks-axi"
+
+  if PATH="$fakebin:$PATH" FM_HOME="$home" \
+    FM_FAKE_TMUX_LOG="$TMP_ROOT/late-refusal-resources-fake/tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/late-refusal-resources-fake/pane.txt" \
+    FM_FAKE_DOCKER_DIR="$dockerdir" \
+    "$ROOT/bin/fm-teardown.sh" plainlate >/dev/null 2>"$err"; then
+    fail "teardown bypassed the owed-public-reply refusal"
+  fi
+
+  grep -F 'still owes a public reply' "$err" >/dev/null \
+    || fail "the later public-followup refusal was not the one that stopped this teardown"
+  grep -Fxq sf-childx8-pg "$dockerdir/running" \
+    || fail "a retirement refused at a later gate had already stopped the child container"
+  [ ! -s "$dockerdir/stopped.log" ] \
+    || fail "a retirement refused at a later gate stopped a container anyway"
+  [ -e "$subhome/state/child-x8.resources" ] \
+    || fail "a retirement refused at a later gate destroyed the child's resource record"
+  [ -d "$subhome" ] || fail "the later refusal removed the secondmate home"
+  pass "a retirement refused after the in-flight guard keeps every child container and record"
+}
+
+# An unreachable daemon is not evidence that anything is running, so it must not
+# block the retirement - on the machine this whole change exists for, Docker
+# Desktop is exactly what memory pressure kills. The name still has to escape
+# before the record dies with the home.
+test_secondmate_retirement_without_force_proceeds_when_daemon_unreachable() {
+  local home subhome fakebin dockerdir err
+  home="$TMP_ROOT/plain-daemon-down-home"
+  subhome="$TMP_ROOT/plain-daemon-down-subhome"
+  dockerdir="$TMP_ROOT/plain-daemon-down-docker"
+  err="$TMP_ROOT/plain-daemon-down-teardown.err"
+  mkdir -p "$home/state" "$home/data" "$subhome/state"
+  mark_firstmate_home "$subhome"
+  printf 'plaindown\n' > "$subhome/.fm-secondmate-home"
+  fm_write_secondmate_meta "$home/state/plaindown.meta" "$subhome"
+  printf -- '- plaindown - design domain (home: %s; scope: design domain; projects: alpha; added 2026-09-19)\n' \
+    "$subhome" > "$home/data/secondmates.md"
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$subhome/state" \
+    "$ROOT/bin/fm-resource.sh" record child-x6 container sf-childx6-pg >/dev/null \
+    || fail "recording the child container failed"
+
+  fakebin=$(make_fake_tmux "$TMP_ROOT/plain-daemon-down-fake")
+  install_fake_docker "$fakebin" "$dockerdir"
+  printf 'sf-childx6-pg\n' >> "$dockerdir/running"
+  : > "$dockerdir/unreachable"
+
+  PATH="$fakebin:$PATH" FM_HOME="$home" \
+    FM_FAKE_TMUX_LOG="$TMP_ROOT/plain-daemon-down-fake/tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/plain-daemon-down-fake/pane.txt" \
+    FM_FAKE_DOCKER_DIR="$dockerdir" \
+    "$ROOT/bin/fm-teardown.sh" plaindown >/dev/null 2>"$err" \
+    || fail "an unreachable docker daemon blocked an ordinary secondmate retirement"
+
+  [ ! -d "$subhome" ] || fail "the retirement did not retire the home"
+  grep -Fq sf-childx6-pg "$err" \
+    || fail "the container docker could not be asked about was never named before its record died"
+  grep -Fq 'its record was destroyed with' "$err" \
+    || fail "the run never said what became of the record naming the container it could not check"
+  ! grep -Fq 'its record kept' "$err" \
+    || fail "the run claimed the record was kept and then reported it destroyed with the home"
+  pass "an unreachable daemon does not refuse an ordinary secondmate retirement"
+}
+
+# The one refusal that still follows the retiring-home sweep cannot be evaluated
+# before the close is attempted, so it must not promise more than it keeps: by
+# then the sweep has already destroyed the record of every child it released
+# cleanly.
+test_herdr_endpoint_refusal_after_sweep_states_what_it_retains() {
+  local home subhome fakebin dockerdir err
+  home="$TMP_ROOT/herdr-endpoint-refusal-home"
+  subhome="$TMP_ROOT/herdr-endpoint-refusal-subhome"
+  dockerdir="$TMP_ROOT/herdr-endpoint-refusal-docker"
+  err="$TMP_ROOT/herdr-endpoint-refusal.err"
+  mkdir -p "$home/state" "$home/data" "$subhome/state"
+  mark_firstmate_home "$subhome"
+  printf 'herdrmate\n' > "$subhome/.fm-secondmate-home"
+  fm_write_secondmate_meta "$home/state/herdrmate.meta" "$subhome" default:wG:pQ
+  printf '%s\n' \
+    'backend=herdr' \
+    'herdr_session=default' \
+    'herdr_workspace_id=wG' \
+    'herdr_tab_id=wG:tQ' \
+    'herdr_pane_id=wG:pQ' >> "$home/state/herdrmate.meta"
+  printf -- '- herdrmate - design domain (home: %s; scope: design domain; projects: alpha; added 2026-09-19)\n' \
+    "$subhome" > "$home/data/secondmates.md"
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$subhome/state" \
+    "$ROOT/bin/fm-resource.sh" record child-x9 container sf-childx9-pg >/dev/null \
+    || fail "recording the child container failed"
+
+  fakebin=$(fm_fakebin "$TMP_ROOT/herdr-endpoint-refusal-fake")
+  install_fake_docker "$fakebin" "$dockerdir"
+  printf 'sf-childx9-pg\n' >> "$dockerdir/running"
+  cat > "$fakebin/herdr" <<SH
+#!/usr/bin/env bash
+set -u
+case "\${1:-} \${2:-}" in
+  "workspace list")
+    printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"wG","active_tab_id":"wG:tQ","focused":true}]}}'
+    ;;
+  "tab list")
+    printf '%s\n' '{"result":{"tabs":[{"tab_id":"wG:tQ","workspace_id":"wG"}]}}'
+    ;;
+  "pane list")
+    printf '%s\n' '{"result":{"panes":[{"pane_id":"wG:pQ","tab_id":"wG:tQ"}]}}'
+    ;;
+  "status --json")
+    printf '%s\n' '{"server":{"running":true}}'
+    ;;
+  "session list")
+    printf '%s\n' '{"sessions":[{"name":"default","running":true,"socket_path":"$subhome/herdr.sock"}]}'
+    ;;
+  "pane close")
+    exit 1
+    ;;
+  "pane get")
+    printf '%s\n' '{"result":{"pane":{"pane_id":"wG:pQ","tab_id":"wG:tQ","workspace_id":"wG"}}}'
+    ;;
+  "agent get")
+    printf '%s\n' '{"error":{"code":"agent_not_found"}}' >&2
+    exit 1
+    ;;
+esac
+SH
+  chmod +x "$fakebin/herdr"
+
+  if PATH="$fakebin:$PATH" FM_HOME="$home" \
+    FM_FAKE_DOCKER_DIR="$dockerdir" \
+    FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1 \
+    "$ROOT/bin/fm-teardown.sh" herdrmate >/dev/null 2>"$err"; then
+    fail "teardown reported success while the herdr pane was never confirmed gone"
+  fi
+
+  grep -Fq 'not confirmed gone' "$err" \
+    || fail "the endpoint-confirmation refusal was not the one that stopped this teardown"
+  grep -Fxq sf-childx9-pg "$dockerdir/stopped.log" \
+    || fail "the sweep never ran, so this refusal cannot be tested for what it claims to retain"
+  [ ! -e "$subhome/state/child-x9.resources" ] \
+    || fail "the released child record survived the sweep; the fixture proves nothing"
+  ! grep -Fq 'every durable task record' "$err" \
+    || fail "the refusal claimed every durable task record was retained after the sweep destroyed one"
+  [ -e "$home/state/herdrmate.meta" ] \
+    || fail "the refusal did not retain the durable records it says it retains"
+  [ -d "$subhome" ] || fail "the refusal removed the secondmate home"
+  pass "the herdr endpoint refusal after a home sweep states what it actually retains"
+}
+
+# Forced retirement never refuses over a resource, whatever the reason it could
+# not be released; the name is the only thing that can survive the home.
+test_secondmate_force_teardown_proceeds_when_daemon_unreachable() {
+  local home subhome fakebin dockerdir err
+  home="$TMP_ROOT/force-daemon-down-home"
+  subhome="$TMP_ROOT/force-daemon-down-subhome"
+  dockerdir="$TMP_ROOT/force-daemon-down-docker"
+  err="$TMP_ROOT/force-daemon-down-teardown.err"
+  mkdir -p "$home/state" "$home/data" "$subhome/state"
+  mark_firstmate_home "$subhome"
+  printf 'forcedown\n' > "$subhome/.fm-secondmate-home"
+  fm_write_secondmate_meta "$home/state/forcedown.meta" "$subhome"
+  printf -- '- forcedown - design domain (home: %s; scope: design domain; projects: alpha; added 2026-09-19)\n' \
+    "$subhome" > "$home/data/secondmates.md"
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$subhome/state" \
+    "$ROOT/bin/fm-resource.sh" record child-x7 container sf-childx7-pg >/dev/null \
+    || fail "recording the child container failed"
+
+  fakebin=$(make_fake_tmux "$TMP_ROOT/force-daemon-down-fake")
+  install_fake_docker "$fakebin" "$dockerdir"
+  printf 'sf-childx7-pg\n' >> "$dockerdir/running"
+  : > "$dockerdir/unreachable"
+
+  PATH="$fakebin:$PATH" FM_HOME="$home" \
+    FM_FAKE_TMUX_LOG="$TMP_ROOT/force-daemon-down-fake/tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/force-daemon-down-fake/pane.txt" \
+    FM_FAKE_DOCKER_DIR="$dockerdir" \
+    "$ROOT/bin/fm-teardown.sh" forcedown --force >/dev/null 2>"$err" \
+    || fail "an unreachable docker daemon blocked forced secondmate retirement"
+
+  [ ! -d "$subhome" ] || fail "forced retirement retained the home"
+  grep -Fq sf-childx7-pg "$err" \
+    || fail "forced retirement destroyed the record without naming the container it could not check"
+  pass "an unreachable daemon does not refuse forced secondmate retirement"
+}
+
 test_fm_home_parameterization
 test_lock_status_is_per_home
 test_seed_allows_overlapping_clones_and_drops_owner
@@ -3030,3 +3826,18 @@ test_secondmate_idle_pane_is_not_stale
 test_secondmate_charter_brief_is_idle_by_default
 test_backlog_handoff_aborts_safely
 test_backlog_handoff_refuses_done_items_and_non_secondmate_homes
+test_secondmate_force_teardown_releases_child_task_resources
+test_force_teardown_keeps_child_records_when_process_event_cleanup_fails
+test_nonforced_process_event_refusal_states_what_the_guard_sweep_already_retired
+test_nonforced_process_event_refusal_keeps_full_promise_when_nothing_was_retired
+test_nonforced_process_event_refusal_claims_no_stop_for_an_already_gone_container
+test_nonforced_retirement_refuses_when_a_proven_container_stop_times_out
+test_secondmate_force_teardown_releases_child_record_without_meta
+test_secondmate_force_teardown_names_unreleasable_child_container
+test_secondmate_force_teardown_proceeds_when_daemon_unreachable
+test_secondmate_retirement_without_force_releases_child_records
+test_secondmate_retirement_without_force_refuses_unreleasable_child_container
+test_secondmate_retirement_refused_after_guard_keeps_child_containers
+test_secondmate_retirement_without_force_proceeds_when_daemon_unreachable
+test_herdr_endpoint_refusal_after_sweep_states_what_it_retains
+test_secondmate_retirement_refuses_unreadable_record_name_and_names_its_contents

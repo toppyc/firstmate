@@ -49,6 +49,10 @@
 # declared-external-wait verb (FM_CLASSIFY_PAUSED_VERB, default "paused") from
 # "blocked:": pause for a known external wait expected to clear on its own,
 # blocked when firstmate must act.
+# Crewmate ship and scout briefs both carry the external-resource rule: a worker
+# that starts a service container records it with bin/fm-resource.sh, because
+# cleanup can only stop what is recorded and never guesses a name. A charter does
+# not, since a secondmate home is not a task with its own cleanup.
 # Ship tasks include a project-memory section so durable project-intrinsic
 # learnings can be committed to AGENTS.md through the project's delivery path;
 # it carries the AGENTS.md authoring bar (widely useful knowledge only, pointers
@@ -177,6 +181,7 @@ shell_quote() {
 }
 
 STATUS_FILE=$(shell_quote "$STATE/$ID.status")
+FM_HOME_Q=$(shell_quote "$FM_HOME")
 
 if [ "$KIND" = secondmate ]; then
 SECONDMATE_PROJECTS=""
@@ -315,7 +320,7 @@ The report is the only thing that survives, so anything worth keeping must be in
 
 # Rules
 1. Never push to any remote and never open a PR.
-2. Stay inside this worktree; the only files you may write outside it are the report and the status file below.
+2. Stay inside this worktree; the only files you may write outside it are the report, the status file, and the resource record below.
 3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.
 4. Report status by appending one line:
    \`echo "{state}: {one short line}" >> $STATUS_FILE\`
@@ -335,6 +340,14 @@ The report is the only thing that survives, so anything worth keeping must be in
 7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
    every lane/home, so restarting it kills other lanes' in-flight pipeline runs. On ANY no-mistakes
    daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
+8. If you start anything that keeps running outside this worktree - a database or
+   other service container, for instance - record it the moment you create it:
+   \`FM_HOME=$FM_HOME_Q $FM_ROOT/bin/fm-resource.sh record $ID container {name}\`
+   Cleanup stops exactly what you recorded and nothing else. It cannot work out the
+   name you invented, and it will never guess one: other tasks and the captain's own
+   containers share that daemon. Anything you leave unrecorded outlives this task and
+   holds its memory forever. If you stop one yourself, drop it again with
+   \`FM_HOME=$FM_HOME_Q $FM_ROOT/bin/fm-resource.sh forget $ID container {name}\`.
 
 # Definition of done
 Write your findings to \`$DATA/$ID/report.md\`.
@@ -429,7 +442,7 @@ If the top-level path is the primary checkout or not the worktree you were launc
 
 # Rules
 $RULE1
-2. Stay inside this worktree; modify nothing outside it.
+2. Stay inside this worktree; modify nothing outside it except the status file and the resource record below.
 3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.
 4. Report status by appending one line:
    \`echo "{state}: {one short line}" >> $STATUS_FILE\`
@@ -452,6 +465,14 @@ $RULE1
 7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
    every lane/home, so restarting it kills other lanes' in-flight pipeline runs. On ANY no-mistakes
    daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
+8. If you start anything that keeps running outside this worktree - a database or
+   other service container, for instance - record it the moment you create it:
+   \`FM_HOME=$FM_HOME_Q $FM_ROOT/bin/fm-resource.sh record $ID container {name}\`
+   Cleanup stops exactly what you recorded and nothing else. It cannot work out the
+   name you invented, and it will never guess one: other tasks and the captain's own
+   containers share that daemon. Anything you leave unrecorded outlives this task and
+   holds its memory forever. If you stop one yourself, drop it again with
+   \`FM_HOME=$FM_HOME_Q $FM_ROOT/bin/fm-resource.sh forget $ID container {name}\`.
 
 # Project memory
 If \`AGENTS.md\` or \`CLAUDE.md\` already exists, or if this task produced durable project-intrinsic knowledge, run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree.

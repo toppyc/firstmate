@@ -89,10 +89,12 @@
 # checks before any destructive return. Teardown output notes every wait, retry, and
 # removal so the operator can see what happened.
 #
-# Pre-teardown cleanup sequence (runs once every landed/discard-work safety
-# refusal above has already passed, and BEFORE any worktree return, branch
-# delete, or backend kill below - a still-active run or a leaked process may
-# own live work in that worktree):
+# Cleanup fixes, numbered as the code refers to them. Fix 1 to Fix 3 are the
+# pre-teardown sequence: they run once every landed/discard-work safety refusal
+# above has already passed, and BEFORE any worktree return, branch delete, or
+# backend kill below - a still-active run or a leaked process may own live work
+# in that worktree. Fix 4 is described here with them but deliberately runs
+# LAST, after every verification in the run; its own POSITION note owns why.
 #   Fix 1 - conclude the task's own no-mistakes run. A ship task's worktree can
 #     be torn down while its no-mistakes pipeline run is still PARKED at a gate
 #     (awaiting_approval/fix_review/any awaiting_agent field), with no worker
@@ -139,6 +141,83 @@
 #     root still exists, so the account's healthy LaunchAgent worker and every
 #     live remote secondmate worker are out of scope. Best effort: a sweep
 #     failure never blocks this teardown.
+#   Fix 4 - release the external resources this task recorded for itself. A
+#     worker that stands up its own service container (one isolated Postgres per
+#     task lane, say) leaves it running past teardown, because nothing here ever
+#     shut one down (observed 2026-09-18: four task containers from long-merged
+#     tasks still up, one for four days, ~380 MB of resident memory between them
+#     on a machine that was swapping). The container's name is INVENTED by the
+#     worker - sf-opstatus-pg for stoneflow-operational-status-phase-gate - so it
+#     is not derivable from the task id and cleanup never guesses: the creator
+#     records it with bin/fm-resource.sh and release_task_resources stops exactly
+#     what state/<id>.resources names. A name-pattern sweep is forbidden for the
+#     same reason broad process kills are: sibling lanes and the captain's own
+#     development containers share the daemon. No record is a silent no-op; an
+#     unusable record releases nothing; a recorded container that no longer exists
+#     is reported, not an error. Never fatal - on the ordinary task path anything
+#     that cannot be released is reported and its record RETAINED as the
+#     operator's durable pointer to it, while the rest of cleanup still runs.
+#     POSITION: the release runs LAST, after the herdr endpoint-confirmed-gone
+#     gate and immediately before this task's durable records are removed - NOT
+#     with the pre-teardown cleanup above. Every landed/discard-work
+#     verification in the run has passed by then: the pre-return safety pass, the
+#     post-stale-lock re-check teardown_treehouse_return performs, and the Orca
+#     worktree path-match. So no refusal can claim an intact task while its
+#     database is already stopped, and a refused teardown leaves the container
+#     running for the worker who will resume. The tradeoff, taken deliberately:
+#     the release now happens AFTER the isolated copy is returned, so a container
+#     bind-mounting that copy is no longer stopped ahead of the return. A failed
+#     return aborts having stopped nothing and the operator reruns, and the
+#     leaked-process reap that protects the return is unaffected - it runs far
+#     earlier and targets worktree-cwd processes.
+#     Retiring a secondmate home erases the whole home, records and all, so the
+#     sweep is tied to the home removal itself rather than to any one caller
+#     or to --force, and within that removal it runs only once the process-event
+#     cleanup has SUCCEEDED, below the refusals that promise the home and its
+#     retirement records survive for a retry and above every irreversible step.
+#     Every <home>/state/*.resources record is released there,
+#     keyed on the records themselves, so one whose task meta is already gone -
+#     left by that child's own earlier failed teardown - is released too.
+#     Whatever could not be released is NAMED together with what actually became
+#     of its record on the path taken. A retirement WITHOUT --force sweeps
+#     EARLIER: after every gate that refuses with nothing yet touched - the
+#     in-flight-work guard, the process-event preflight, both public-followup
+#     gates and the herdr presentation-lock preflight - and before the
+#     secondmate's endpoint is killed or its home removed. The sweep itself is
+#     not inert, and its refusal is not a no-op rollback: sweeping stops every
+#     child container docker will stop and DELETES the record of each child whose
+#     entries were all released or proven gone, all of it before the refusal
+#     below is evaluated. What that refusal preserves is therefore the home, the
+#     endpoint, and every record it could NOT release - the ones the operator is
+#     told to act on - while a cleanly released child is left with nothing but
+#     the stop already printed for it. It refuses there when the daemon answered
+#     and a container could not be stopped. Both halves of that position matter:
+#     a refusal reached after the endpoint is gone cannot
+#     preserve what it refuses to protect, and a sweep run ahead of the other
+#     gates stops containers and deletes their records for a retirement one of
+#     them then refuses. Whatever refusals follow that earlier sweep are
+#     reachable only once the close has been attempted or the home removal is
+#     under way, so none of them can be moved ahead of a sweep that must itself
+#     precede the endpoint kill. What the sweep leaves them is narrower than a
+#     refusal: it retires a record only when every container that record named
+#     was stopped or proven already gone, so a record naming anything it could
+#     not release, or could not check, is still there when they run. What a
+#     refusal downstream of the sweep must not do is claim to retain a record
+#     the sweep may already have retired, so it names what it actually retains
+#     instead of claiming every record. On the forced path,
+#     where no earlier sweep has
+#     run, the process-event cleanup's own sweep position keeps the records
+#     genuinely intact at its refusal and it says so.
+#     A home is swept once however many call sites it passes
+#     through: the removal path reuses what that sweep already released. An
+#     UNREACHABLE daemon never refuses on either path, because "I could not ask"
+#     is no more evidence that a container is running than that it is gone - the
+#     name is printed before anything is destroyed, whatever becomes of the
+#     record naming it is reported by the path that takes it, and the retirement
+#     proceeds. Forced retirement never refuses at
+#     all, because forced retirement exists for when normal cleanup cannot run -
+#     it names what it could not release and proceeds.
+#     bin/fm-resource-lib.sh owns the record format and the release contract.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -174,6 +253,10 @@ SUB_HOME_PARENT_MARKER=".fm-secondmate-parent"
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 # shellcheck source=bin/fm-nm-run-lib.sh
 . "$SCRIPT_DIR/fm-nm-run-lib.sh"
+# shellcheck source=bin/fm-timeout-lib.sh
+. "$SCRIPT_DIR/fm-timeout-lib.sh"  # fm_run_timed: the shared hard bound
+# shellcheck source=bin/fm-resource-lib.sh
+. "$SCRIPT_DIR/fm-resource-lib.sh"
 if [ "$#" -lt 1 ] || ! fm_task_id_path_safe "$1"; then
   echo "error: invalid teardown request" >&2
   exit 2
@@ -1291,6 +1374,172 @@ conclude_task_no_mistakes_run() {  # <worktree>
   return 1
 }
 
+# Release the external resources this task recorded for itself (Fix 4 in the
+# script header). Proof of ownership is the record and nothing else, so a task
+# that recorded nothing is cleaned up exactly as before. Never fatal: a resource
+# that cannot be released is reported and its record retained, and cleanup
+# continues.
+TASK_RESOURCES_RETAINED=0
+release_task_resources() {  # <state-dir> <task-id>
+  local state=$1 id=$2 entry rc=0
+  fm_resource_release_all "$state" "$id" || rc=1
+  if [ "$FM_RESOURCE_RECORD_UNUSABLE" = 1 ]; then
+    echo "warning: task $id has an unusable resource record at $(fm_resource_record_path "$state" "$id"); released nothing from it" >&2
+    return "$rc"
+  fi
+  for entry in "${FM_RESOURCE_RELEASED[@]+"${FM_RESOURCE_RELEASED[@]}"}"; do
+    echo "resource: stopped $entry recorded by $id"
+  done
+  for entry in "${FM_RESOURCE_ABSENT[@]+"${FM_RESOURCE_ABSENT[@]}"}"; do
+    echo "resource: $entry recorded by $id no longer exists; nothing to stop"
+  done
+  for entry in "${FM_RESOURCE_RETAINED[@]+"${FM_RESOURCE_RETAINED[@]}"}"; do
+    echo "warning: could not release $entry recorded by $id; it is still holding resources" >&2
+  done
+  for entry in "${FM_RESOURCE_UNREACHABLE[@]+"${FM_RESOURCE_UNREACHABLE[@]}"}"; do
+    echo "warning: could not ask docker about $entry recorded by $id; it was left alone" >&2
+  done
+  return "$rc"
+}
+
+# Sweep the resource records of a firstmate home that is about to be removed
+# outright (Fix 4 in the script header). Keyed on the records themselves rather
+# than on the task metas beside them, because a record left by a child's OWN
+# earlier failed teardown has no meta any more and is exactly the one most
+# likely to be orphaned. What could not be released is collected rather than
+# announced here: whether its record survives depends on what the removal does
+# next, and a message that overclaims in the reassuring direction is no better
+# than one that overclaims in the alarming direction. A proven-unreleasable
+# entry - the daemon answered and the stop failed - is kept apart from one
+# docker could not be asked about at all, because only the first is evidence of
+# a container still holding anything and so only the first may refuse.
+# Sweeping the same home twice releases and reports nothing new: the ordinary
+# retirement sweeps before its endpoint is killed and the removal path then
+# reuses that result, so one home is swept once however many call sites it
+# passes through.
+FM_RETIRING_HOME_UNRELEASED=()
+FM_RETIRING_HOME_UNCHECKED=()
+FM_RETIRING_HOME_HAS_UNRELEASED=0
+FM_RETIRING_HOME_SWEPT=
+FM_RETIRING_HOME_RETIRED=0
+FM_RETIRING_HOME_QUOTED_PATHS=()
+FM_RETIRING_HOME_QUOTED_TEXT=()
+# Render an untrusted name or path so it can sit inside one of firstmate's own
+# sentences. A record's basename and a state directory's path are as
+# attacker-shaped as the record's bytes, and a sentence firstmate asserts must
+# be a complete line that nothing in it can end, extend or restart: every
+# control character goes, INCLUDING the line feed that is deliberately kept
+# inside a quoted record body, and the length is bounded.
+resource_display_text() {  # <untrusted-text>
+  printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177' | head -c 512
+}
+
+# Capture a short, sanitized copy of a resource record whose own reader refused
+# it, so the container names inside still reach the operator before the record
+# is destroyed with its home. Captured at sweep time, not at report time,
+# because the removal path reports after the home is already gone.
+#
+# The record failed validation, so its bytes are UNTRUSTED input, never a parsed
+# entry. They never enter one of firstmate's sentences: the report fences them
+# in their own block below every assertion firstmate makes, each line indented,
+# so the operator can see exactly where the record's own bytes begin and end.
+#
+# The tr set is every byte 0-31 plus DEL EXCEPT decimal 9 (TAB) and 10 (LF):
+# \000-\010 is 0-8, \013-\037 is 11-31, \177 is DEL. LF survives because the
+# rendering is line-oriented and that line structure is what makes the contents
+# readable; TAB survives because it cannot move the cursor off its own line.
+# Carriage return does NOT survive - it returns the cursor to column 0, so a
+# crafted record could erase the indent that marks its bytes as quoted. The line
+# count and the total length stay bounded. Captures nothing when there is
+# nothing readable to show.
+capture_resource_record_contents() {  # <record-path>
+  local record=$1 raw
+  [ -f "$record" ] && [ ! -L "$record" ] || return 0
+  raw=$(LC_ALL=C tr -d '\000-\010\013-\037\177' < "$record" 2>/dev/null \
+    | head -c 2000 | head -n 20 | sed 's/^/    /' ) || return 0
+  [ -n "$raw" ] || return 0
+  FM_RETIRING_HOME_QUOTED_PATHS+=("$(resource_display_text "$record")")
+  FM_RETIRING_HOME_QUOTED_TEXT+=("$raw")
+}
+
+release_retiring_home_resources() {  # <state-dir>
+  local state=$1 record child_id entry resolved
+  resolved=$(cd "$state" 2>/dev/null && pwd -P) || resolved=
+  if [ -n "$resolved" ] && [ "$resolved" = "$FM_RETIRING_HOME_SWEPT" ]; then
+    return 0
+  fi
+  FM_RETIRING_HOME_UNRELEASED=()
+  FM_RETIRING_HOME_UNCHECKED=()
+  FM_RETIRING_HOME_HAS_UNRELEASED=0
+  FM_RETIRING_HOME_RETIRED=0
+  FM_RETIRING_HOME_QUOTED_PATHS=()
+  FM_RETIRING_HOME_QUOTED_TEXT=()
+  [ -d "$state" ] || return 0
+  FM_RETIRING_HOME_SWEPT=$resolved
+  # Both globs: a plain shell glob skips dot-prefixed names, and a record the
+  # sweep cannot even SEE is the same silent orphan as one it mishandles. No
+  # valid task id starts with a dot (fm_task_id_path_safe refuses it), so any
+  # such file is by definition unreadable and falls to the fail-closed branch
+  # below rather than being released.
+  for record in "$state"/*.resources "$state"/.*.resources; do
+    [ -e "$record" ] || continue
+    child_id=$(basename "$record" .resources)
+    if ! fm_task_id_path_safe "$child_id"; then
+      # Fail CLOSED, like every sibling case. A record whose basename is not a
+      # usable task id cannot be released, so it must count as unreleased rather
+      # than being warned about and stepped over - the one fail-open branch here
+      # would let a non-forced retirement destroy a record naming a live
+      # container. Name its contents too: the record dies with the home.
+      FM_RETIRING_HOME_HAS_UNRELEASED=1
+      FM_RETIRING_HOME_UNRELEASED+=("the resource record $(resource_display_text "$record") could not be read \
+because $(resource_display_text "$child_id") is not a usable task id")
+      capture_resource_record_contents "$record"
+      continue
+    fi
+    if release_task_resources "$state" "$child_id"; then
+      rm -f "$record"
+      FM_RETIRING_HOME_RETIRED=$((FM_RETIRING_HOME_RETIRED + 1))
+      continue
+    fi
+    if [ "$FM_RESOURCE_RECORD_UNUSABLE" = 1 ]; then
+      FM_RETIRING_HOME_HAS_UNRELEASED=1
+      FM_RETIRING_HOME_UNRELEASED+=("the unusable resource record of $child_id released nothing")
+      capture_resource_record_contents "$record"
+      continue
+    fi
+    for entry in "${FM_RESOURCE_RETAINED[@]+"${FM_RESOURCE_RETAINED[@]}"}"; do
+      FM_RETIRING_HOME_HAS_UNRELEASED=1
+      FM_RETIRING_HOME_UNRELEASED+=("$entry recorded by $child_id is still holding resources")
+    done
+    for entry in "${FM_RESOURCE_UNREACHABLE[@]+"${FM_RESOURCE_UNREACHABLE[@]}"}"; do
+      FM_RETIRING_HOME_UNCHECKED+=("$entry recorded by $child_id was left alone because docker could not be asked about it")
+    done
+  done
+}
+
+# Every sentence firstmate asserts is printed first, each one a complete line
+# carrying no record bytes. Only then are the captured contents of unreadable
+# records replayed, each fenced between its own begin and end marker: a marker
+# starts at column 0 and a quoted line never does, so nothing a record contains
+# can pass itself off as firstmate speaking.
+report_retiring_home_unreleased() {  # <what-became-of-the-record>
+  local entry fate i=0 count
+  fate=$(resource_display_text "$1")
+  for entry in "${FM_RETIRING_HOME_UNRELEASED[@]+"${FM_RETIRING_HOME_UNRELEASED[@]}"}"; do
+    echo "warning: $entry; $fate" >&2
+  done
+  for entry in "${FM_RETIRING_HOME_UNCHECKED[@]+"${FM_RETIRING_HOME_UNCHECKED[@]}"}"; do
+    echo "warning: $entry; $fate" >&2
+  done
+  count=${#FM_RETIRING_HOME_QUOTED_PATHS[@]}
+  while [ "$i" -lt "$count" ]; do
+    echo "warning: begin quoted contents of the unreadable record ${FM_RETIRING_HOME_QUOTED_PATHS[$i]}; every indented line below is that record's own bytes, which firstmate did not interpret" >&2
+    printf '%s\n' "${FM_RETIRING_HOME_QUOTED_TEXT[$i]}" >&2
+    echo "warning: end quoted contents of the unreadable record ${FM_RETIRING_HOME_QUOTED_PATHS[$i]}" >&2
+    i=$((i + 1))
+  done
+}
+
 # Fix 2 (see script header): pids of every process whose CURRENT WORKING
 # DIRECTORY is exactly $1 or under it, from one bounded system-wide `lsof -a
 # -d cwd` scan (never the recursive +D file-tree walk, which lsof itself
@@ -1735,17 +1984,53 @@ EOF
   printf '%s\n' "$abs_home_path"
 }
 
+# Removing the home is what destroys its resource records, so the sweep is tied
+# to this removal rather than to any one caller or to --force: every present and
+# future removal path is covered by construction. Within the removal it sits as
+# late as it can - below the process-event cleanup, whose refusals promise the
+# home and its retirement records survive for a retry, and above every
+# irreversible step. The ordinary retirement's refusal does NOT live here - it
+# fires once every gate that can abort the retirement has passed and before the
+# secondmate's endpoint is killed, because a refusal reached after the endpoint
+# is gone cannot preserve what it refuses to protect, and one reached ahead of
+# the other gates stops containers that a later refusal then strands.
 remove_firstmate_home() {
-  local home=$1 label=$2 expected_id=${3:-} abs_home_path process_event_backup
+  local home=$1 label=$2 expected_id=${3:-} abs_home_path sweep_state rc=0
   [ -n "$home" ] || return 0
   [ -e "$home" ] || return 0
   abs_home_path=$(validate_firstmate_home_for_removal "$home" "$label" "$expected_id") || return 1
   [ -n "$abs_home_path" ] || return 0
+  sweep_state=$(cd "$abs_home_path/state" 2>/dev/null && pwd -P) || sweep_state=
+  remove_validated_firstmate_home "$abs_home_path" "$label" || rc=$?
+  # Only this home's own sweep may be reported here. A removal that refused
+  # before reaching the sweep leaves whatever an earlier home's sweep collected
+  # in place, and reporting that against this home's fate would describe records
+  # that were never touched.
+  if [ -n "$sweep_state" ] && [ "$sweep_state" = "$FM_RETIRING_HOME_SWEPT" ]; then
+    if [ "$rc" -eq 0 ]; then
+      report_retiring_home_unreleased "its record was destroyed with $abs_home_path"
+    else
+      report_retiring_home_unreleased "its record survives in $abs_home_path/state, which was not removed"
+    fi
+  fi
+  return "$rc"
+}
+
+remove_validated_firstmate_home() {  # <validated-abs-home> <label>
+  local abs_home_path=$1 label=$2 process_event_backup
   process_event_backup=$(snapshot_firstmate_home_process_events "$abs_home_path" "$label") || return 1
   if ! cleanup_firstmate_home_process_events "$abs_home_path" "$label"; then
     restore_firstmate_home_process_events "$abs_home_path" "$label" "$process_event_backup" || return $?
     return 1
   fi
+  # The sweep sits HERE, below the process-event refusals and above every
+  # irreversible removal, because those refusals promise the home and its
+  # retirement records are preserved for retry and a sweep ahead of them has
+  # already stopped containers and deleted the records of the children that
+  # released cleanly. The two treehouse errors below make no such claim. The
+  # dedupe in release_retiring_home_resources keeps the non-forced path, which
+  # sweeps and refuses earlier at the in-flight guard, from sweeping twice.
+  release_retiring_home_resources "$abs_home_path/state"
   if firstmate_home_has_treehouse_slot "$abs_home_path"; then
     command -v treehouse >/dev/null 2>&1 || {
       echo "error: treehouse command not found; cannot return $label $abs_home_path" >&2
@@ -1848,6 +2133,35 @@ restore_firstmate_home_process_events() {
   rm -rf -- "$backup"
 }
 
+# What a process-event cleanup refusal can honestly promise, which turns on one
+# question: has a sweep already retired any of THIS home's resource records by
+# the time the refusal fires?
+#
+# The forced path's sweep runs below this cleanup, so it has retired none of the
+# home's resource records here. The ordinary retirement sweeps EARLIER, at the
+# in-flight guard, because its own refusal has to land before the endpoint is
+# killed - nothing can be both before that kill and after a step that only runs
+# during removal, so on that path the claim is narrowed rather than the order.
+# Narrowing is safe only because that earlier sweep retires a record only when
+# release succeeded for it, so a record it retired names only containers it
+# verifiably stopped or proved already gone, each outcome printed. A record it
+# could not release, or could not check, is kept rather than retired.
+#
+# Having merely RUN is not enough to narrow: the sweep sets its dedupe marker
+# before it looks at a single record, and a secondmate home usually holds none at
+# all. Claiming records may already be gone when none was touched withdraws a
+# true promise, which is the same defect as making a false one.
+firstmate_home_retry_preserves() {  # <home>
+  local state
+  state=$(cd "$1/state" 2>/dev/null && pwd -P) || state=
+  if [ -n "$state" ] && [ "$state" = "$FM_RETIRING_HOME_SWEPT" ] \
+    && [ "$FM_RETIRING_HOME_RETIRED" -gt 0 ]; then
+    printf 'preserving the home and its lease for retry, along with every record the sweep above did not retire; a record was retired there only once every container it named was stopped or found already gone, and what happened to each was reported, so nothing they named is orphaned'
+    return 0
+  fi
+  printf 'preserving the home, lease, and retirement records for retry'
+}
+
 cleanup_firstmate_home_process_events() {
   local home=$1 label=$2 runner="$1/bin/fm-procevent.sh"
   firstmate_home_has_process_events "$home" || return 0
@@ -1856,11 +2170,11 @@ cleanup_firstmate_home_process_events() {
     return 1
   fi
   if ! FM_HOME="$home" FM_ROOT_OVERRIDE="$home" "$runner" sweep-home; then
-    echo "REFUSED: process-event cleanup is incomplete for $label $home; preserving the home, lease, and retirement records for retry" >&2
+    echo "REFUSED: process-event cleanup is incomplete for $label $home; $(firstmate_home_retry_preserves "$home")" >&2
     return 1
   fi
   if firstmate_home_has_process_events "$home"; then
-    echo "REFUSED: process-event state remains for $label $home after its bounded sweep; preserving the home, lease, and retirement records for retry" >&2
+    echo "REFUSED: process-event state remains for $label $home after its bounded sweep; $(firstmate_home_retry_preserves "$home")" >&2
     return 1
   fi
 }
@@ -2413,6 +2727,39 @@ if [ "$BACKEND" = herdr ]; then
   TEARDOWN_HERDR_PANE=$FM_BACKEND_HERDR_PANE
 fi
 
+# Retiring the home destroys its resource records, so release them at the last
+# point where refusing still preserves what this refusal protects: every refusal
+# that precedes the endpoint kill has now passed - the in-flight-work guard, the
+# process-event preflight, both public-followup gates and the herdr
+# presentation-lock preflight - and nothing of this home has been killed or
+# removed yet. Sweeping ahead of any of them would stop containers and delete
+# their records for a retirement that a later gate then refuses, which is the
+# same defect as refusing after the endpoint is already gone. Gates that cannot
+# be evaluated until the close is attempted or the removal is under way do still
+# follow this point, and more may be added; the standing requirement on any of
+# them is the one this whole change exists to enforce - a gate downstream of the
+# sweep must not claim to preserve what the sweep may already have retired, so
+# it either makes no retention claim or states what is actually retained.
+# Every record here belongs to a
+# task already torn down - the guard above refused on any surviving meta - so
+# releasing one takes nothing from a live worker. A container the daemon
+# confirmed it could not stop refuses the retirement outright; one docker could
+# not be asked about does not, because that is not evidence of anything running,
+# and stalling cleanup on a downed daemon strands the operator exactly when the
+# machine is under the pressure this fix exists for.
+if [ "$KIND" = secondmate ] && [ "$FORCE" != "--force" ]; then
+  SUB_STATE="$HOME_PATH/state"
+  if [ -d "$SUB_STATE" ]; then
+    release_retiring_home_resources "$SUB_STATE"
+    if [ "$FM_RETIRING_HOME_HAS_UNRELEASED" = 1 ]; then
+      echo "REFUSED: secondmate home $HOME_PATH records a resource cleanup could not release." >&2
+      report_retiring_home_unreleased "its record is kept in $SUB_STATE, which was not removed"
+      echo "Release it by hand and rerun, or discard with --force to retire the home regardless." >&2
+      exit 1
+    fi
+  fi
+fi
+
 # Best-effort: drop the local task branch so the shared repo does not accumulate refs.
 if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
   if [ "$ORCA_PATH_MATCH_VERIFIED" != 1 ]; then
@@ -2522,11 +2869,11 @@ fi
 if [ "$BACKEND" = herdr ]; then
   fm_backend_source herdr || true
   if ! declare -F fm_backend_herdr_endpoint_confirmed_gone >/dev/null 2>&1; then
-    echo "error: herdr endpoint confirmation is unavailable for $ID; retaining every durable task record" >&2
+    echo "error: herdr endpoint confirmation is unavailable for $ID; retaining the durable records of $ID and every resource record this run could not release" >&2
     exit 1
   fi
   if ! fm_backend_herdr_endpoint_confirmed_gone "$T"; then
-    echo "error: herdr pane $T for $ID is not confirmed gone after its close was refused, skipped, or failed; retaining every durable task record - rerun teardown once the close can run under the session lock" >&2
+    echo "error: herdr pane $T for $ID is not confirmed gone after its close was refused, skipped, or failed; retaining the durable records of $ID and every resource record this run could not release - rerun teardown once the close can run under the session lock" >&2
     exit 1
   fi
 fi
@@ -2535,6 +2882,33 @@ if [ "$KIND" = secondmate ]; then
   remove_firstmate_home "$HOME_PATH" "secondmate home" "$ID" || exit $?
   remove_secondmate_registry_entry "$ID"
 fi
+
+# Fix 4 (see script header): stop the external resources this task recorded.
+# Placed HERE deliberately: every gate that could still preserve this task's
+# unlanded work has passed, and what remains below is the retirement of the
+# task's own records. Steps below can still abort the run - remove_pr_poll_
+# artifacts re-validates the PR-check quarantine and refuses "preserving task
+# state" - but by then the isolated copy has already been returned, so none of
+# them is protecting work a worker could come back to, and the resource record
+# itself survives until further down. The standing requirement on anything added
+# below this line is the same one the home sweep carries: do not claim to
+# preserve what this release may already have stopped. Each refusal above means
+# the task is still alive and still owes the captain its
+# work, and several of them promise the worktree, the endpoint or the records are
+# intact - a promise that cannot hold if its database is already stopped. The
+# landed/discard-work verifications that run after the old pre-teardown position
+# are the post-stale-lock safety re-check inside teardown_treehouse_return and
+# the Orca worktree path-match; reaching this line means both have passed. An
+# early exit anywhere above leaves the container running for the worker who will
+# resume. The tradeoff: the release is now after the isolated copy is returned,
+# so a container bind-mounting that copy is not stopped ahead of the return - a
+# failed return aborts having stopped nothing, the operator reruns, and the
+# leaked-process reap that protects the return is unaffected because it runs far
+# earlier and targets worktree-cwd processes. Every kind is covered: the record,
+# not the task shape, is what says whether there is anything to release.
+TASK_RESOURCES_RETAINED=0
+release_task_resources "$STATE" "$ID" || TASK_RESOURCES_RETAINED=1
+
 remove_grok_turnend_auth "$STATE" "$ID" || exit 1
 remove_kimi_turnend_auth "$STATE" "$ID" || exit 1
 fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
@@ -2544,6 +2918,38 @@ fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 remove_pr_poll_artifacts "$STATE" "$ID" || exit 1
 retire_busy_state "$STATE" "$ID" "$BUSY_GEN" || exit 1
 status_retire_presentation_task "$STATE" "$ID" || exit 1
+# The resource record is retired with the rest of the volatile state ONLY when
+# it has nothing left to point at. When a recorded resource could not be
+# released, the record is the operator's one durable pointer to what is still
+# running - deleting it here would orphan exactly the container this change
+# exists to stop.
+# The two reasons for keeping it are NOT the same instruction to the operator,
+# so they are not given the same sentence. A container the daemon ANSWERED about
+# and refused to stop is known to be running, and "release it by hand" is the
+# right thing to ask. A container the daemon could not be ASKED about is not
+# known to be running at all; telling someone to go and release it asserts a
+# fact nothing established. Both can be true in one teardown, so both sentences
+# can print, each naming only its own entries.
+if [ "$TASK_RESOURCES_RETAINED" = 1 ]; then
+  task_resources_record_path=$(fm_resource_record_path "$STATE" "$ID")
+  if [ "${#FM_RESOURCE_RETAINED[@]}" -gt 0 ]; then
+    echo "warning: retaining $task_resources_record_path for task $ID because ${FM_RESOURCE_RETAINED[*]} could not be stopped; release by hand, then delete the record" >&2
+  fi
+  if [ "${#FM_RESOURCE_UNREACHABLE[@]}" -gt 0 ]; then
+    echo "warning: retaining $task_resources_record_path for task $ID because docker could not be asked about ${FM_RESOURCE_UNREACHABLE[*]}; nothing proved it is running, so check it when the daemon is reachable again and delete the record then" >&2
+  fi
+  if [ "${#FM_RESOURCE_RETAINED[@]}" -eq 0 ] && [ "${#FM_RESOURCE_UNREACHABLE[@]}" -eq 0 ]; then
+    echo "warning: retaining $task_resources_record_path for task $ID; it could not be read, so what it names is unknown" >&2
+  fi
+else
+  rm -f "$STATE/$ID.resources"
+fi
+# The record's sibling lock goes unconditionally, kept or not: a leftover lock
+# is never the durable pointer that justifies retaining the record, and one left
+# behind by a worker killed mid-write would make a later task's bounded wait
+# fail against a hold nothing owns. fm_resource_lock_path keeps its location in
+# one place, and fm_lock_remove_path takes the owner directory with it.
+fm_lock_remove_path "$(fm_resource_lock_path "$STATE" "$ID")" || true
 rm -f "$STATE/$ID.turn-ended" "$STATE/$ID.meta" \
   "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" \
   "$STATE/$ID.kimi-turnend-token" "$STATE/$ID.muse-session" \
