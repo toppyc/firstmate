@@ -2967,6 +2967,7 @@ install_fake_docker() {  # <fake-bin-dir> <docker-state-dir>
 dir=$FM_FAKE_DOCKER_DIR
 case "${1:-} ${2:-}" in
   "container inspect") grep -Fxq "${3:-}" "$dir/running" && exit 0; exit 1 ;;
+  "version --format") printf '27.0.0\n'; exit 0 ;;
 esac
 if [ "${1:-}" = stop ]; then
   grep -Fxq "${2:-}" "$dir/running" || exit 1

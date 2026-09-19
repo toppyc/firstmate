@@ -2619,14 +2619,23 @@ add_fake_docker() {
 #   calls.log    every invocation, as received
 #   stopped.log  every container this fake actually stopped
 #   stop-fails   containers whose `docker stop` reports a daemon error
+#   unreachable  when present, every invocation fails the way the real CLI does
+#                when it cannot connect to the daemon at all
 dir=${FM_FAKE_DOCKER_DIR:-}
 [ -n "$dir" ] || { echo "fake docker: FM_FAKE_DOCKER_DIR unset" >&2; exit 125; }
 printf '%s\n' "$*" >> "$dir/calls.log"
+if [ -e "$dir/unreachable" ]; then
+  printf 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?\n' >&2
+  exit 1
+fi
 case "${1:-} ${2:-}" in
   "container inspect")
     if grep -Fxq "${3:-}" "$dir/running" 2>/dev/null; then exit 0; fi
     printf 'Error: No such container: %s\n' "${3:-}" >&2
     exit 1 ;;
+  "version --format")
+    printf '27.0.0\n'
+    exit 0 ;;
 esac
 if [ "${1:-}" = stop ]; then
   name=${2:-}
@@ -2740,6 +2749,29 @@ test_recorded_container_already_gone_is_reported_not_an_error() {
   docker_is_running "$case_dir" sf-other-pg \
     || fail "resource-gone: an unrelated container was stopped"
   pass "a recorded container that no longer exists is reported, and cleanup completes"
+}
+
+test_unreachable_daemon_is_not_mistaken_for_a_missing_container() {
+  local case_dir rc
+  case_dir=$(make_landed_case resource-daemon-down)
+  add_fake_docker "$case_dir" sf-x1-pg
+  record_container "$case_dir" sf-x1-pg
+  : > "$case_dir/docker/unreachable"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "resource-daemon-down: an unreachable daemon must not abort cleanup"
+  assert_grep "teardown task-x1 complete" "$case_dir/stdout" "resource-daemon-down: cleanup did not complete"
+  assert_no_grep "no longer exists" "$case_dir/stdout" \
+    "resource-daemon-down: a container the daemon could not be asked about was reported as gone"
+  assert_grep "sf-x1-pg" "$case_dir/stderr" \
+    "resource-daemon-down: the unreleased container was not named"
+  assert_grep "container sf-x1-pg" "$case_dir/state/task-x1.resources" \
+    "resource-daemon-down: the record was deleted although nothing proved the container gone"
+  pass "a container the daemon cannot be asked about is retained, not reported gone"
 }
 
 test_task_without_a_resource_record_is_torn_down_unchanged() {
@@ -2990,6 +3022,7 @@ test_run_abort_precedes_process_reap_precedes_worktree_removal
 test_recorded_container_is_stopped_by_teardown
 test_unrecorded_containers_survive_teardown
 test_recorded_container_already_gone_is_reported_not_an_error
+test_unreachable_daemon_is_not_mistaken_for_a_missing_container
 test_task_without_a_resource_record_is_torn_down_unchanged
 test_unlanded_work_still_refuses_and_leaves_the_container_running
 test_dirty_worktree_refusal_survives_a_recorded_container

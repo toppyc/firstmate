@@ -152,14 +152,27 @@ fm_resource_record_remove() {  # <state> <task-id> <kind> <name>
 
 # Stop one recorded container. Echoes a short outcome word:
 #   released  - the container was running and is now stopped
-#   absent    - no such container; nothing to stop
-#   retained  - could not be released (no docker, or the stop failed)
+#   absent    - the daemon answered and has no such container; nothing to stop
+#   retained  - could not be released (no docker, an unreachable daemon, or the
+#               stop failed)
+#
+# Absence is a positive finding, never a default: `docker container inspect`
+# exits non-zero both for "no such container" and for "cannot connect to the
+# daemon", and only the first may be reported as absent - the caller retires the
+# record on `absent`, so mistaking a downed daemon for a stopped container
+# destroys the operator's only pointer to a container that is still running.
+# Anything that cannot PROVE absence is retained. The daemon probe costs a
+# second docker call only after inspect has already failed.
 fm_resource_release_container() {  # <name>
   local name=$1
   command -v docker >/dev/null 2>&1 || { printf 'retained\n'; return 1; }
   if ! docker container inspect "$name" >/dev/null 2>&1; then
-    printf 'absent\n'
-    return 0
+    if docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
+      printf 'absent\n'
+      return 0
+    fi
+    printf 'retained\n'
+    return 1
   fi
   if docker stop "$name" >/dev/null 2>&1; then
     printf 'released\n'
