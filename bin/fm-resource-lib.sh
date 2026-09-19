@@ -25,7 +25,8 @@
 # ([A-Za-z0-9][A-Za-z0-9_.-]*, at most 128 chars), which also keeps a name from
 # ever being read as a CLI flag or a shell word.
 #
-# Callers must have sourced bin/fm-pr-lib.sh first (fm_pr_task_id_valid,
+# Callers must have sourced bin/fm-wake-lib.sh first (fm_lock_try_acquire,
+# fm_lock_release) and bin/fm-pr-lib.sh first (fm_pr_task_id_valid,
 # fm_pr_file_device, fm_pr_file_link_count, fm_pr_private_file_valid,
 # fm_pr_regular_destination_on_device_or_absent).
 
@@ -36,6 +37,47 @@ FM_RESOURCE_RETAINED=()
 FM_RESOURCE_UNREACHABLE=()
 # shellcheck disable=SC2034 # Read by callers of fm_resource_release_all (bin/fm-teardown.sh), not this lib.
 FM_RESOURCE_RECORD_UNUSABLE=0
+
+# Serialize one task's record against concurrent writers.
+#
+# Both mutators below are read-modify-write: they read the whole record, build a
+# replacement and rename it into place. Two `fm-resource.sh record` calls for the
+# same task - a worker bringing up Postgres and Redis in parallel, or two
+# subagents of one task - would otherwise both read the same file and the later
+# rename would win, silently dropping an entry while its command printed
+# "recorded:" and exited 0. The lost container is then never released and never
+# pointed at: the exact orphan this record exists to prevent, arrived at through
+# a success report.
+#
+# The wait is deliberately BOUNDED and then fails loudly. A worker calls this
+# mid-task, having just started a container it must record; blocking it forever
+# on a stale lock would be a worse failure than the race - it strands the task
+# and looks indistinguishable from a wedged worker. Failing lets the caller
+# report and carry on, and the caller's own error path keeps the container's
+# name in front of a human.
+FM_RESOURCE_LOCK_WAIT_SECS=${FM_RESOURCE_LOCK_WAIT_SECS:-10}
+
+fm_resource_lock_path() {  # <state> <task-id>
+  printf '%s/.%s.resources.lock\n' "$1" "$2"
+}
+
+fm_resource_lock_acquire() {  # <state> <task-id>
+  local lock waited=0
+  lock=$(fm_resource_lock_path "$1" "$2")
+  while ! fm_lock_try_acquire "$lock"; do
+    if [ "$waited" -ge "$FM_RESOURCE_LOCK_WAIT_SECS" ]; then
+      echo "error: another fm-resource.sh call is still holding $lock after ${FM_RESOURCE_LOCK_WAIT_SECS}s; not writing $2's record" >&2
+      return 1
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 0
+}
+
+fm_resource_lock_release() {  # <state> <task-id>
+  fm_lock_release "$(fm_resource_lock_path "$1" "$2")"
+}
 
 fm_resource_record_path() {  # <state> <task-id>
   printf '%s/%s.resources\n' "$1" "$2"
@@ -94,11 +136,20 @@ fm_resource_entries() {  # <state> <task-id>
 # recording the same kind and name twice leaves one entry.
 # Returns 0 on success, 2 on invalid input, 1 on a storage failure.
 fm_resource_record_add() {  # <state> <task-id> <kind> <name>
+  local rc
+  fm_pr_task_id_valid "${2-}" || return 2
+  fm_resource_kind_valid "${3-}" || return 2
+  fm_resource_name_valid "${4-}" || return 2
+  [ -d "${1-}" ] && [ ! -L "${1-}" ] || return 1
+  fm_resource_lock_acquire "$1" "$2" || return 1
+  fm_resource_record_add_locked "$@"
+  rc=$?
+  fm_resource_lock_release "$1" "$2"
+  return "$rc"
+}
+
+fm_resource_record_add_locked() {  # <state> <task-id> <kind> <name>
   local state=$1 id=$2 kind=$3 name=$4 path device tmp existing
-  fm_pr_task_id_valid "$id" || return 2
-  fm_resource_kind_valid "$kind" || return 2
-  fm_resource_name_valid "$name" || return 2
-  [ -d "$state" ] && [ ! -L "$state" ] || return 1
   path=$(fm_resource_record_path "$state" "$id")
   device=$(fm_pr_file_device "$state") || return 1
   fm_pr_regular_destination_on_device_or_absent "$path" "$device" || return 1
@@ -124,10 +175,19 @@ fm_resource_record_add() {  # <state> <task-id> <kind> <name>
 # Returns 0 when the entry is gone afterwards, 2 on invalid input, 1 on a
 # storage failure or an unusable record.
 fm_resource_record_remove() {  # <state> <task-id> <kind> <name>
+  local rc
+  fm_pr_task_id_valid "${2-}" || return 2
+  fm_resource_kind_valid "${3-}" || return 2
+  fm_resource_name_valid "${4-}" || return 2
+  fm_resource_lock_acquire "$1" "$2" || return 1
+  fm_resource_record_remove_locked "$@"
+  rc=$?
+  fm_resource_lock_release "$1" "$2"
+  return "$rc"
+}
+
+fm_resource_record_remove_locked() {  # <state> <task-id> <kind> <name>
   local state=$1 id=$2 kind=$3 name=$4 path device tmp existing kept line
-  fm_pr_task_id_valid "$id" || return 2
-  fm_resource_kind_valid "$kind" || return 2
-  fm_resource_name_valid "$name" || return 2
   path=$(fm_resource_record_path "$state" "$id")
   existing=$(fm_resource_entries "$state" "$id") || return 1
   [ -n "$existing" ] || return 0

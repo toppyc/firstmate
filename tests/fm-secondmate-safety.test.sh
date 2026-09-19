@@ -3121,6 +3121,47 @@ test_secondmate_force_teardown_names_unreleasable_child_container() {
 # ordinary retirement has to sweep them too. The record left behind by a child's
 # own failed teardown - record kept, meta already gone - is the one that reaches
 # this path in practice.
+# A record whose basename is not a usable task id cannot be released, so it must
+# count as unreleased like every sibling case. The branch used to warn and step
+# over it - the one fail-open in this change - which let an ordinary retirement
+# destroy a record naming a live container.
+test_secondmate_retirement_refuses_unreadable_record_name_and_names_its_contents() {
+  local home subhome fakebin dockerdir err
+  home="$TMP_ROOT/badname-home"
+  subhome="$TMP_ROOT/badname-subhome"
+  dockerdir="$TMP_ROOT/badname-docker"
+  err="$TMP_ROOT/badname.err"
+  mkdir -p "$home/state" "$home/data" "$subhome/state"
+  mark_firstmate_home "$subhome"
+  printf 'badname\n' > "$subhome/.fm-secondmate-home"
+  fm_write_secondmate_meta "$home/state/badname.meta" "$subhome"
+  printf -- '- badname - design domain (home: %s; scope: design domain; projects: alpha; added 2026-09-19)\n' \
+    "$subhome" > "$home/data/secondmates.md"
+  # A record left under a name the task-id validator refuses.
+  printf 'fm-task-resources-v1\ncontainer sf-orphan-pg\n' > "$subhome/state/.stale.resources"
+
+  fakebin=$(make_fake_tmux "$TMP_ROOT/badname-fake")
+  install_fake_docker "$fakebin" "$dockerdir"
+  printf 'sf-orphan-pg\n' >> "$dockerdir/running"
+
+  if PATH="$fakebin:$PATH" FM_HOME="$home" \
+    FM_FAKE_TMUX_LOG="$TMP_ROOT/badname-fake/tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/badname-fake/pane.txt" \
+    FM_FAKE_DOCKER_DIR="$dockerdir" \
+    "$ROOT/bin/fm-teardown.sh" badname >/dev/null 2>"$err"; then
+    fail "ordinary retirement destroyed a home holding a record it could not read"
+  fi
+
+  [ -d "$subhome" ] || fail "the refusal still removed the home"
+  [ -e "$subhome/state/.stale.resources" ] || fail "the refusal still destroyed the unreadable record"
+  grep -Fxq sf-orphan-pg "$dockerdir/running" \
+    || fail "a container named only by an unreadable record was stopped"
+  # The record dies with the home, so its contents must escape into the output.
+  grep -F 'sf-orphan-pg' "$err" >/dev/null \
+    || fail "the unreadable record's contents were never named"$'\n'"$(cat "$err")"
+  pass "an unreadable record name refuses the ordinary retirement and its contents are named"
+}
+
 test_secondmate_retirement_without_force_releases_child_records() {
   local home subhome fakebin dockerdir
   home="$TMP_ROOT/plain-retire-home"
@@ -3499,3 +3540,4 @@ test_secondmate_retirement_without_force_refuses_unreleasable_child_container
 test_secondmate_retirement_refused_after_guard_keeps_child_containers
 test_secondmate_retirement_without_force_proceeds_when_daemon_unreachable
 test_herdr_endpoint_refusal_after_sweep_states_what_it_retains
+test_secondmate_retirement_refuses_unreadable_record_name_and_names_its_contents

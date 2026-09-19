@@ -1406,6 +1406,22 @@ FM_RETIRING_HOME_UNRELEASED=()
 FM_RETIRING_HOME_UNCHECKED=()
 FM_RETIRING_HOME_HAS_UNRELEASED=0
 FM_RETIRING_HOME_SWEPT=
+# Echo a short, sanitized rendering of a resource record whose own reader
+# refused it, so the container names inside still reach the operator before the
+# record is destroyed with its home. The record failed validation, so its bytes
+# are UNTRUSTED input, never a parsed entry: control characters are stripped,
+# the line count and each line's length are bounded, and the result is clearly
+# labelled as the unreadable record's raw content rather than as a resource
+# firstmate recognises. Prints nothing when there is nothing readable to show.
+resource_record_contents_note() {  # <record-path>
+  local record=$1 raw
+  [ -f "$record" ] && [ ! -L "$record" ] || return 0
+  raw=$(LC_ALL=C tr -d '\000-\010\013\014\016-\037\177' < "$record" 2>/dev/null \
+    | head -c 2000 | head -n 20 | sed 's/^/    /' ) || return 0
+  [ -n "$raw" ] || return 0
+  printf '; its unreadable contents were:\n%s' "$raw"
+}
+
 release_retiring_home_resources() {  # <state-dir>
   local state=$1 record child_id entry resolved
   resolved=$(cd "$state" 2>/dev/null && pwd -P) || resolved=
@@ -1417,11 +1433,23 @@ release_retiring_home_resources() {  # <state-dir>
   FM_RETIRING_HOME_HAS_UNRELEASED=0
   [ -d "$state" ] || return 0
   FM_RETIRING_HOME_SWEPT=$resolved
-  for record in "$state"/*.resources; do
+  # Both globs: a plain shell glob skips dot-prefixed names, and a record the
+  # sweep cannot even SEE is the same silent orphan as one it mishandles. No
+  # valid task id starts with a dot (fm_task_id_path_safe refuses it), so any
+  # such file is by definition unreadable and falls to the fail-closed branch
+  # below rather than being released.
+  for record in "$state"/*.resources "$state"/.*.resources; do
     [ -e "$record" ] || continue
     child_id=$(basename "$record" .resources)
     if ! fm_task_id_path_safe "$child_id"; then
-      echo "warning: ignoring resource record $record in the retiring home; $child_id is not a usable task id" >&2
+      # Fail CLOSED, like every sibling case. A record whose basename is not a
+      # usable task id cannot be released, so it must count as unreleased rather
+      # than being warned about and stepped over - the one fail-open branch here
+      # would let a non-forced retirement destroy a record naming a live
+      # container. Name its contents too: the record dies with the home.
+      FM_RETIRING_HOME_HAS_UNRELEASED=1
+      FM_RETIRING_HOME_UNRELEASED+=("the resource record $record could not be read \
+because $child_id is not a usable task id$(resource_record_contents_note "$record")")
       continue
     fi
     if release_task_resources "$state" "$child_id"; then
@@ -1430,7 +1458,7 @@ release_retiring_home_resources() {  # <state-dir>
     fi
     if [ "$FM_RESOURCE_RECORD_UNUSABLE" = 1 ]; then
       FM_RETIRING_HOME_HAS_UNRELEASED=1
-      FM_RETIRING_HOME_UNRELEASED+=("the unusable resource record of $child_id released nothing")
+      FM_RETIRING_HOME_UNRELEASED+=("the unusable resource record of $child_id released nothing$(resource_record_contents_note "$record")")
       continue
     fi
     for entry in "${FM_RESOURCE_RETAINED[@]+"${FM_RESOURCE_RETAINED[@]}"}"; do
@@ -2576,6 +2604,10 @@ if [ "$KIND" != secondmate ]; then
   reap_task_worktree_processes worktree "$WT" "$TASK_TMP"
 fi
 
+# Fix 3 (see script header): sweep remote job workers abandoned by an already
+# pruned code root. Best effort - a sweep failure never blocks this teardown.
+"$SCRIPT_DIR/fm-remote-job-reap-orphans.sh" >&2 || true
+
 # A Herdr close may reposition shared workspace order, so the whole
 # destructive sequence below (worktree return, pane close, record removal)
 # runs under the named-session presentation lock, acquired BEFORE anything is
@@ -2618,10 +2650,6 @@ if [ "$KIND" = secondmate ] && [ "$FORCE" != "--force" ]; then
     fi
   fi
 fi
-
-# Fix 3 (see script header): sweep remote job workers abandoned by an already
-# pruned code root. Best effort - a sweep failure never blocks this teardown.
-"$SCRIPT_DIR/fm-remote-job-reap-orphans.sh" >&2 || true
 
 # Best-effort: drop the local task branch so the shared repo does not accumulate refs.
 if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
@@ -2779,8 +2807,24 @@ status_retire_presentation_task "$STATE" "$ID" || exit 1
 # released, the record is the operator's one durable pointer to what is still
 # running - deleting it here would orphan exactly the container this change
 # exists to stop.
+# The two reasons for keeping it are NOT the same instruction to the operator,
+# so they are not given the same sentence. A container the daemon ANSWERED about
+# and refused to stop is known to be running, and "release it by hand" is the
+# right thing to ask. A container the daemon could not be ASKED about is not
+# known to be running at all; telling someone to go and release it asserts a
+# fact nothing established. Both can be true in one teardown, so both sentences
+# can print, each naming only its own entries.
 if [ "$TASK_RESOURCES_RETAINED" = 1 ]; then
-  echo "warning: retaining $(fm_resource_record_path "$STATE" "$ID") for task $ID; release its entries by hand, then delete it" >&2
+  task_resources_record_path=$(fm_resource_record_path "$STATE" "$ID")
+  if [ "${#FM_RESOURCE_RETAINED[@]}" -gt 0 ]; then
+    echo "warning: retaining $task_resources_record_path for task $ID because ${FM_RESOURCE_RETAINED[*]} could not be stopped; release by hand, then delete the record" >&2
+  fi
+  if [ "${#FM_RESOURCE_UNREACHABLE[@]}" -gt 0 ]; then
+    echo "warning: retaining $task_resources_record_path for task $ID because docker could not be asked about ${FM_RESOURCE_UNREACHABLE[*]}; nothing proved it is running, so check it when the daemon is reachable again and delete the record then" >&2
+  fi
+  if [ "${#FM_RESOURCE_RETAINED[@]}" -eq 0 ] && [ "${#FM_RESOURCE_UNREACHABLE[@]}" -eq 0 ]; then
+    echo "warning: retaining $task_resources_record_path for task $ID; it could not be read, so what it names is unknown" >&2
+  fi
 else
   rm -f "$STATE/$ID.resources"
 fi

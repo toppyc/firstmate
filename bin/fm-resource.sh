@@ -35,6 +35,9 @@ esac
 
 # shellcheck source=bin/fm-pr-lib.sh
 . "$SCRIPT_DIR/fm-pr-lib.sh"
+# fm-resource-lib.sh serializes its record writes with the shared lock helpers.
+# shellcheck source=bin/fm-wake-lib.sh
+. "$SCRIPT_DIR/fm-wake-lib.sh"
 # shellcheck source=bin/fm-resource-lib.sh
 . "$SCRIPT_DIR/fm-resource-lib.sh"
 

@@ -2961,6 +2961,32 @@ test_unusable_resource_record_releases_nothing_and_completes() {
   pass "an unusable resource record releases nothing and cleanup still completes"
 }
 
+test_unreachable_daemon_retention_message_does_not_order_a_hand_release() {
+  local case_dir rc out
+  case_dir=$(make_landed_case resource-unreachable-wording)
+  add_fake_docker "$case_dir" sf-x1-pg
+  record_container "$case_dir" sf-x1-pg
+  # The daemon is down, exactly as it is when memory pressure kills Docker
+  # Desktop on the machine this change exists for.
+  : > "$case_dir/docker/unreachable"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "resource-unreachable-wording: cleanup should complete with the daemon down"
+  assert_grep "container sf-x1-pg" "$case_dir/state/task-x1.resources" \
+    "resource-unreachable-wording: the record was deleted although nothing could be checked"
+  out=$(cat "$case_dir/stderr")
+  assert_contains "$out" "sf-x1-pg" "resource-unreachable-wording: the container was not named"
+  # Nothing proved it is running, so the operator must not be told to go and
+  # release it. That instruction belongs only to the answering-daemon case.
+  assert_not_contains "$out" "release its entries by hand" \
+    "resource-unreachable-wording: an unreachable daemon still produced a hand-release instruction"
+  pass "an unreachable daemon keeps the record without ordering a release by hand"
+}
+
 test_local_only_fork_remote_allows
 test_teardown_prompts_tasks_axi_done_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
@@ -3029,3 +3055,4 @@ test_dirty_worktree_refusal_survives_a_recorded_container
 test_post_stale_lock_refusal_leaves_the_recorded_container_running
 test_container_that_cannot_be_stopped_is_reported_and_its_record_retained
 test_unusable_resource_record_releases_nothing_and_completes
+test_unreachable_daemon_retention_message_does_not_order_a_hand_release

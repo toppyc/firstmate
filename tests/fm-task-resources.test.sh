@@ -214,6 +214,50 @@ test_brief_tells_workers_to_record_what_they_start() {
   pass "fm-brief.sh: ship and scout briefs tell workers to record what they start"
 }
 
+test_concurrent_records_never_lose_an_entry() {
+  local home i out
+  home=$(make_home concurrent)
+  # A worker bringing up two services in parallel. Before serialization both
+  # calls read the same record and the later write won, dropping one entry
+  # while its command still printed "recorded:" and exited 0 - an orphan
+  # arriving through a success report.
+  for i in 1 2 3 4 5 6; do
+    run_resource "$home" record task-a container "sf-svc-$i" >/dev/null &
+  done
+  wait
+  out=$(run_resource "$home" list task-a) || fail "listing after concurrent records failed"
+  for i in 1 2 3 4 5 6; do
+    assert_contains "$out" "container sf-svc-$i" \
+      "concurrent recording lost entry sf-svc-$i"
+  done
+  pass "fm-resource.sh: concurrent records for one task never lose an entry"
+}
+
+test_record_fails_loudly_rather_than_hanging_on_a_held_lock() {
+  local home rc out start elapsed holder
+  home=$(make_home held-lock)
+  # A stale lock must not strand a worker mid-task: the wait is bounded and then
+  # fails, because hanging forever is worse than the race it guards.
+  # A LIVE holder: a lock whose recorded owner is dead is deliberately recovered
+  # by the shared lock helpers, so only a live one exercises the bounded wait.
+  sleep 60 &
+  holder=$!
+  mkdir -p "$home/state/.task-a.resources.lock"
+  printf '%s\n' "$holder" > "$home/state/.task-a.resources.lock/pid"
+  start=$(date +%s)
+  set +e
+  out=$(FM_RESOURCE_LOCK_WAIT_SECS=2 run_resource "$home" record task-a container sf-a-pg 2>&1)
+  rc=$?
+  set -e
+  elapsed=$(( $(date +%s) - start ))
+  kill "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+  [ "$rc" -ne 0 ] || fail "recording against a live held lock reported success"
+  assert_contains "$out" "error:" "the bounded-wait failure printed no error"
+  [ "$elapsed" -lt 30 ] || fail "recording blocked for ${elapsed}s instead of failing on its bounded wait"
+  pass "fm-resource.sh: a held lock fails loudly on a bounded wait instead of hanging a worker"
+}
+
 test_record_then_list_round_trips
 test_record_is_idempotent
 test_record_is_private_and_versioned
@@ -225,3 +269,5 @@ test_record_refuses_to_append_to_an_unusable_record
 test_record_is_per_task
 test_list_of_an_unrecorded_task_is_empty_and_clean
 test_brief_tells_workers_to_record_what_they_start
+test_concurrent_records_never_lose_an_entry
+test_record_fails_loudly_rather_than_hanging_on_a_held_lock
