@@ -241,9 +241,12 @@ If `treehouse return` fails for a leased home, teardown stops with state intact 
 Before either return or direct removal, teardown asks the target home's process-event runner to retire its registrations and physically owned machine-wide claims through the safe generation-bound path.
 It refuses retirement while that cleanup is uncertain or unavailable, preserving the home and retirement records for a later retry.
 Raw deletion is unsupported because a blocking process-event child can outlive its home.
+Retiring a home also destroys the `state/<id>.resources` records its tasks wrote with `bin/fm-resource.sh`, so teardown releases the containers they name before the home goes.
+Without `--force` it refuses over anything in those records it could not release, including a record it cannot read, naming what it found and keeping both the record and the home; a container docker could not be asked about is named but refuses nothing, because an unreachable daemon is no evidence that anything is running.
 
 With `--force`, teardown is the explicit discard path.
 It kills child windows, discards child work and state inside the secondmate home, removes the route, releases the lease, and removes the retired secondmate home.
+It releases those recorded containers too and never refuses over one; anything it could not release is named in the message itself, because the record dies with the home.
 If forced teardown contends with a fresh task publication in any affected home, one command refuses without publishing or removing task state; treat that refusal as terminal and inspect the other operation before retrying.
 Relaunch and non-forced teardown remain outside that serialization.
 Never use `--force` unless the captain explicitly said to discard the work.
