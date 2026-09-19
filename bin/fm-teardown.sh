@@ -175,19 +175,24 @@
 #     left by that child's own earlier failed teardown - is released too.
 #     Whatever could not be released is NAMED together with what actually became
 #     of its record on the path taken. A retirement WITHOUT --force sweeps
-#     EARLIER: after every gate that can still abort it - the in-flight-work
-#     guard, the process-event preflight, both public-followup gates and the
-#     herdr presentation-lock preflight - and before the secondmate's endpoint is
-#     killed or its home touched. It refuses there when the daemon answered and a
-#     container could not be stopped. Both halves of that position matter: a
-#     refusal reached after the endpoint is gone cannot preserve what it refuses
-#     to protect, and a sweep run ahead of the other gates stops containers and
-#     deletes their records for a retirement one of them then refuses. A home is
-#     swept once however many call sites it passes through: the removal path
-#     reuses what that sweep already released. An UNREACHABLE daemon never
-#     refuses on either path, because "I could not ask" is no more evidence that
-#     a container is running than that it is gone - the record is kept, the name
-#     is printed, and the retirement proceeds. Forced retirement never refuses at
+#     EARLIER: after every gate that refuses with nothing yet touched - the
+#     in-flight-work guard, the process-event preflight, both public-followup
+#     gates and the herdr presentation-lock preflight - and before the
+#     secondmate's endpoint is killed or its home removed. It refuses there when
+#     the daemon answered and a container could not be stopped. Both halves of
+#     that position matter: a refusal reached after the endpoint is gone cannot
+#     preserve what it refuses to protect, and a sweep run ahead of the other
+#     gates stops containers and deletes their records for a retirement one of
+#     them then refuses. The one refusal that still follows the sweep - the herdr
+#     endpoint-confirmed-gone gate, which can only be evaluated after the close
+#     is attempted - therefore names what it actually retains instead of claiming
+#     every record. A home is swept once however many call sites it passes
+#     through: the removal path reuses what that sweep already released. An
+#     UNREACHABLE daemon never refuses on either path, because "I could not ask"
+#     is no more evidence that a container is running than that it is gone - the
+#     name is printed before anything is destroyed, whatever becomes of the
+#     record naming it is reported by the path that takes it, and the retirement
+#     proceeds. Forced retirement never refuses at
 #     all, because forced retirement exists for when normal cleanup cannot run -
 #     it names what it could not release and proceeds.
 #     bin/fm-resource-lib.sh owns the record format and the release contract.
@@ -1368,7 +1373,7 @@ release_task_resources() {  # <state-dir> <task-id>
     echo "warning: could not release $entry recorded by $id; it is still holding resources" >&2
   done
   for entry in "${FM_RESOURCE_UNREACHABLE[@]+"${FM_RESOURCE_UNREACHABLE[@]}"}"; do
-    echo "warning: could not ask docker about $entry recorded by $id; it was left alone and its record kept" >&2
+    echo "warning: could not ask docker about $entry recorded by $id; it was left alone" >&2
   done
   return "$rc"
 }
@@ -2718,11 +2723,11 @@ fi
 if [ "$BACKEND" = herdr ]; then
   fm_backend_source herdr || true
   if ! declare -F fm_backend_herdr_endpoint_confirmed_gone >/dev/null 2>&1; then
-    echo "error: herdr endpoint confirmation is unavailable for $ID; retaining every durable task record" >&2
+    echo "error: herdr endpoint confirmation is unavailable for $ID; retaining the durable records of $ID and every resource record this run could not release" >&2
     exit 1
   fi
   if ! fm_backend_herdr_endpoint_confirmed_gone "$T"; then
-    echo "error: herdr pane $T for $ID is not confirmed gone after its close was refused, skipped, or failed; retaining every durable task record - rerun teardown once the close can run under the session lock" >&2
+    echo "error: herdr pane $T for $ID is not confirmed gone after its close was refused, skipped, or failed; retaining the durable records of $ID and every resource record this run could not release - rerun teardown once the close can run under the session lock" >&2
     exit 1
   fi
 fi

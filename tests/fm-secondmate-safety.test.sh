@@ -3287,7 +3287,94 @@ test_secondmate_retirement_without_force_proceeds_when_daemon_unreachable() {
   [ ! -d "$subhome" ] || fail "the retirement did not retire the home"
   grep -Fq sf-childx6-pg "$err" \
     || fail "the container docker could not be asked about was never named before its record died"
+  grep -Fq 'its record was destroyed with' "$err" \
+    || fail "the run never said what became of the record naming the container it could not check"
+  ! grep -Fq 'its record kept' "$err" \
+    || fail "the run claimed the record was kept and then reported it destroyed with the home"
   pass "an unreachable daemon does not refuse an ordinary secondmate retirement"
+}
+
+# The one refusal that still follows the retiring-home sweep cannot be evaluated
+# before the close is attempted, so it must not promise more than it keeps: by
+# then the sweep has already destroyed the record of every child it released
+# cleanly.
+test_herdr_endpoint_refusal_after_sweep_states_what_it_retains() {
+  local home subhome fakebin dockerdir err
+  home="$TMP_ROOT/herdr-endpoint-refusal-home"
+  subhome="$TMP_ROOT/herdr-endpoint-refusal-subhome"
+  dockerdir="$TMP_ROOT/herdr-endpoint-refusal-docker"
+  err="$TMP_ROOT/herdr-endpoint-refusal.err"
+  mkdir -p "$home/state" "$home/data" "$subhome/state"
+  mark_firstmate_home "$subhome"
+  printf 'herdrmate\n' > "$subhome/.fm-secondmate-home"
+  fm_write_secondmate_meta "$home/state/herdrmate.meta" "$subhome" default:wG:pQ
+  printf '%s\n' \
+    'backend=herdr' \
+    'herdr_session=default' \
+    'herdr_workspace_id=wG' \
+    'herdr_tab_id=wG:tQ' \
+    'herdr_pane_id=wG:pQ' >> "$home/state/herdrmate.meta"
+  printf -- '- herdrmate - design domain (home: %s; scope: design domain; projects: alpha; added 2026-09-19)\n' \
+    "$subhome" > "$home/data/secondmates.md"
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$subhome/state" \
+    "$ROOT/bin/fm-resource.sh" record child-x9 container sf-childx9-pg >/dev/null \
+    || fail "recording the child container failed"
+
+  fakebin=$(fm_fakebin "$TMP_ROOT/herdr-endpoint-refusal-fake")
+  install_fake_docker "$fakebin" "$dockerdir"
+  printf 'sf-childx9-pg\n' >> "$dockerdir/running"
+  cat > "$fakebin/herdr" <<SH
+#!/usr/bin/env bash
+set -u
+case "\${1:-} \${2:-}" in
+  "workspace list")
+    printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"wG","active_tab_id":"wG:tQ","focused":true}]}}'
+    ;;
+  "tab list")
+    printf '%s\n' '{"result":{"tabs":[{"tab_id":"wG:tQ","workspace_id":"wG"}]}}'
+    ;;
+  "pane list")
+    printf '%s\n' '{"result":{"panes":[{"pane_id":"wG:pQ","tab_id":"wG:tQ"}]}}'
+    ;;
+  "status --json")
+    printf '%s\n' '{"server":{"running":true}}'
+    ;;
+  "session list")
+    printf '%s\n' '{"sessions":[{"name":"default","running":true,"socket_path":"$subhome/herdr.sock"}]}'
+    ;;
+  "pane close")
+    exit 1
+    ;;
+  "pane get")
+    printf '%s\n' '{"result":{"pane":{"pane_id":"wG:pQ","tab_id":"wG:tQ","workspace_id":"wG"}}}'
+    ;;
+  "agent get")
+    printf '%s\n' '{"error":{"code":"agent_not_found"}}' >&2
+    exit 1
+    ;;
+esac
+SH
+  chmod +x "$fakebin/herdr"
+
+  if PATH="$fakebin:$PATH" FM_HOME="$home" \
+    FM_FAKE_DOCKER_DIR="$dockerdir" \
+    FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1 \
+    "$ROOT/bin/fm-teardown.sh" herdrmate >/dev/null 2>"$err"; then
+    fail "teardown reported success while the herdr pane was never confirmed gone"
+  fi
+
+  grep -Fq 'not confirmed gone' "$err" \
+    || fail "the endpoint-confirmation refusal was not the one that stopped this teardown"
+  grep -Fxq sf-childx9-pg "$dockerdir/stopped.log" \
+    || fail "the sweep never ran, so this refusal cannot be tested for what it claims to retain"
+  [ ! -e "$subhome/state/child-x9.resources" ] \
+    || fail "the released child record survived the sweep; the fixture proves nothing"
+  ! grep -Fq 'every durable task record' "$err" \
+    || fail "the refusal claimed every durable task record was retained after the sweep destroyed one"
+  [ -e "$home/state/herdrmate.meta" ] \
+    || fail "the refusal did not retain the durable records it says it retains"
+  [ -d "$subhome" ] || fail "the refusal removed the secondmate home"
+  pass "the herdr endpoint refusal after a home sweep states what it actually retains"
 }
 
 # Forced retirement never refuses over a resource, whatever the reason it could
@@ -3411,3 +3498,4 @@ test_secondmate_retirement_without_force_releases_child_records
 test_secondmate_retirement_without_force_refuses_unreleasable_child_container
 test_secondmate_retirement_refused_after_guard_keeps_child_containers
 test_secondmate_retirement_without_force_proceeds_when_daemon_unreachable
+test_herdr_endpoint_refusal_after_sweep_states_what_it_retains
