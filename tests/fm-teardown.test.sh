@@ -2704,6 +2704,32 @@ test_recorded_container_is_stopped_by_teardown() {
   pass "teardown stops the container its task recorded"
 }
 
+test_stale_resource_lock_does_not_outlive_its_task() {
+  local case_dir rc lock
+  case_dir=$(make_landed_case resource-stale-lock)
+  add_fake_docker "$case_dir" sf-x1-pg
+  record_container "$case_dir" sf-x1-pg
+  # A worker killed between acquiring the record lock and releasing it: the
+  # acquiring shell exits without ever reaching the release.
+  lock=$(
+    . "$ROOT/bin/fm-wake-lib.sh"
+    . "$ROOT/bin/fm-resource-lib.sh"
+    fm_resource_lock_acquire "$case_dir/state" task-x1 >/dev/null || exit 1
+    fm_resource_lock_path "$case_dir/state" task-x1
+  ) || fail "resource-stale-lock: could not seed a held lock"
+  assert_present "$lock" "resource-stale-lock: the fixture did not leave a lock behind"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "resource-stale-lock: teardown should succeed"
+  assert_absent "$lock" \
+    "resource-stale-lock: the record lock outlived the task it belonged to"
+  pass "a stale record lock is removed with the rest of the task's volatile state"
+}
+
 test_unrecorded_containers_survive_teardown() {
   local case_dir rc
   case_dir=$(make_landed_case resource-unrecorded)
@@ -2961,13 +2987,19 @@ test_unusable_resource_record_releases_nothing_and_completes() {
   pass "an unusable resource record releases nothing and cleanup still completes"
 }
 
-test_unreachable_daemon_retention_message_does_not_order_a_hand_release() {
+test_retention_message_diverges_on_whether_the_daemon_answered() {
   local case_dir rc out
+  # Both halves are asserted positively, in both directions, so collapsing the
+  # two retention messages back into one breaks this test rather than quietly
+  # satisfying it: the unreachable case must carry the unreachable sentence and
+  # must NOT carry the hand-release instruction, and the answering case must
+  # carry the hand-release instruction.
+
+  # The daemon is down, exactly as it is when memory pressure kills Docker
+  # Desktop on the machine this change exists for.
   case_dir=$(make_landed_case resource-unreachable-wording)
   add_fake_docker "$case_dir" sf-x1-pg
   record_container "$case_dir" sf-x1-pg
-  # The daemon is down, exactly as it is when memory pressure kills Docker
-  # Desktop on the machine this change exists for.
   : > "$case_dir/docker/unreachable"
 
   set +e
@@ -2979,12 +3011,34 @@ test_unreachable_daemon_retention_message_does_not_order_a_hand_release() {
   assert_grep "container sf-x1-pg" "$case_dir/state/task-x1.resources" \
     "resource-unreachable-wording: the record was deleted although nothing could be checked"
   out=$(cat "$case_dir/stderr")
-  assert_contains "$out" "sf-x1-pg" "resource-unreachable-wording: the container was not named"
+  assert_contains "$out" "docker could not be asked about container sf-x1-pg" \
+    "resource-unreachable-wording: the unreachable daemon was not reported against the named container"
+  assert_contains "$out" "check it when the daemon is reachable again" \
+    "resource-unreachable-wording: the operator was not told to check once the daemon answers"
   # Nothing proved it is running, so the operator must not be told to go and
   # release it. That instruction belongs only to the answering-daemon case.
-  assert_not_contains "$out" "release its entries by hand" \
+  assert_not_contains "$out" "release by hand" \
     "resource-unreachable-wording: an unreachable daemon still produced a hand-release instruction"
-  pass "an unreachable daemon keeps the record without ordering a release by hand"
+
+  # A daemon that ANSWERED and refused to stop the container: it is known to be
+  # running, so the hand-release instruction is the right thing to ask for.
+  case_dir=$(make_landed_case resource-answering-wording)
+  add_fake_docker "$case_dir" sf-x1-pg
+  printf 'sf-x1-pg\n' > "$case_dir/docker/stop-fails"
+  record_container "$case_dir" sf-x1-pg
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "resource-answering-wording: an unreleasable container must not abort cleanup"
+  out=$(cat "$case_dir/stderr")
+  assert_contains "$out" "container sf-x1-pg could not be stopped; release by hand, then delete the record" \
+    "resource-answering-wording: an answering daemon did not produce the hand-release instruction"
+  assert_not_contains "$out" "docker could not be asked about" \
+    "resource-answering-wording: a daemon that answered was reported as unreachable"
+  pass "the retention message diverges on whether the daemon answered"
 }
 
 test_local_only_fork_remote_allows
@@ -3046,6 +3100,7 @@ test_persistent_scan_refuses_after_bounded_retries
 test_process_exit_during_identity_lookup_does_not_refuse
 test_run_abort_precedes_process_reap_precedes_worktree_removal
 test_recorded_container_is_stopped_by_teardown
+test_stale_resource_lock_does_not_outlive_its_task
 test_unrecorded_containers_survive_teardown
 test_recorded_container_already_gone_is_reported_not_an_error
 test_unreachable_daemon_is_not_mistaken_for_a_missing_container
@@ -3055,4 +3110,4 @@ test_dirty_worktree_refusal_survives_a_recorded_container
 test_post_stale_lock_refusal_leaves_the_recorded_container_running
 test_container_that_cannot_be_stopped_is_reported_and_its_record_retained
 test_unusable_resource_record_releases_nothing_and_completes
-test_unreachable_daemon_retention_message_does_not_order_a_hand_release
+test_retention_message_diverges_on_whether_the_daemon_answered

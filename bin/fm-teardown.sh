@@ -1413,10 +1413,18 @@ FM_RETIRING_HOME_SWEPT=
 # the line count and each line's length are bounded, and the result is clearly
 # labelled as the unreadable record's raw content rather than as a resource
 # firstmate recognises. Prints nothing when there is nothing readable to show.
+#
+# The tr set is every byte 0-31 plus DEL EXCEPT decimal 9 (TAB) and 10 (LF):
+# \000-\010 is 0-8, \013-\037 is 11-31, \177 is DEL. LF survives because the
+# rendering is line-oriented and that line structure is what makes the contents
+# readable; TAB survives because it cannot move the cursor off its own line.
+# Carriage return does NOT survive - it returns the cursor to column 0, so a
+# crafted record could overwrite the indent and the preceding output and forge
+# what this function reports.
 resource_record_contents_note() {  # <record-path>
   local record=$1 raw
   [ -f "$record" ] && [ ! -L "$record" ] || return 0
-  raw=$(LC_ALL=C tr -d '\000-\010\013\014\016-\037\177' < "$record" 2>/dev/null \
+  raw=$(LC_ALL=C tr -d '\000-\010\013-\037\177' < "$record" 2>/dev/null \
     | head -c 2000 | head -n 20 | sed 's/^/    /' ) || return 0
   [ -n "$raw" ] || return 0
   printf '; its unreadable contents were:\n%s' "$raw"
@@ -2828,6 +2836,12 @@ if [ "$TASK_RESOURCES_RETAINED" = 1 ]; then
 else
   rm -f "$STATE/$ID.resources"
 fi
+# The record's sibling lock goes unconditionally, kept or not: a leftover lock
+# is never the durable pointer that justifies retaining the record, and one left
+# behind by a worker killed mid-write would make a later task's bounded wait
+# fail against a hold nothing owns. fm_resource_lock_path keeps its location in
+# one place, and fm_lock_remove_path takes the owner directory with it.
+fm_lock_remove_path "$(fm_resource_lock_path "$STATE" "$ID")" || true
 rm -f "$STATE/$ID.turn-ended" "$STATE/$ID.meta" \
   "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" \
   "$STATE/$ID.kimi-turnend-token" "$STATE/$ID.muse-session" \
