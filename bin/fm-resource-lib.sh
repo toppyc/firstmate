@@ -215,10 +215,11 @@ fm_resource_record_remove_locked() {  # <state> <task-id> <kind> <name>
 # Stop one recorded container. Echoes a short outcome word:
 #   released     - the container was running and is now stopped
 #   absent       - the daemon answered and has no such container; nothing to stop
-#   retained     - the daemon answered and the stop failed; the container is
-#                  known to be there and could not be released
-#   unreachable  - docker could not be asked at all (no binary, or the daemon did
-#                  not answer); nothing about the container is proven either way
+#   retained     - the container is proven to be there and is not stopped, the
+#                  stop having failed or never completed
+#   unreachable  - nothing about the container is proven either way, because
+#                  docker could not be asked (no binary, or the daemon did not
+#                  answer the call that would have proved anything)
 #
 # Absence is a positive finding, never a default: `docker container inspect`
 # exits non-zero both for "no such container" and for "cannot connect to the
@@ -240,7 +241,11 @@ fm_resource_record_remove_locked() {  # <state> <task-id> <kind> <name>
 FM_RESOURCE_DOCKER_TIMEOUT=${FM_RESOURCE_DOCKER_TIMEOUT:-20}
 
 # Run one docker call under the shared hard bound. Exit 124 means the bound was
-# hit, which every caller below reads as `unreachable`.
+# hit; what that establishes is whatever the call itself would have established.
+# A bounded call made while nothing is yet known about the container proves
+# nothing and reads as `unreachable`; one made after the inspect has already
+# answered leaves the container proven present and not stopped, which is
+# `retained`.
 #
 # The ABSENCE of a usable bound is itself a failure, reported as 124 rather than
 # degraded into an unbounded call: a bound of 0 disables the deadline in both

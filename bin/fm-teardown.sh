@@ -198,11 +198,13 @@
 #     them then refuses. Whatever refusals follow that earlier sweep are
 #     reachable only once the close has been attempted or the home removal is
 #     under way, so none of them can be moved ahead of a sweep that must itself
-#     precede the endpoint kill, and none of them can preserve a container: the
-#     sweep refuses the retirement outright unless every record released
-#     cleanly. What a refusal downstream of the sweep must not do is claim to
-#     retain a record the sweep may already have retired, so it names what it
-#     actually retains instead of claiming every record. On the forced path,
+#     precede the endpoint kill. What the sweep leaves them is narrower than a
+#     refusal: it retires a record only when every container that record named
+#     was stopped or proven already gone, so a record naming anything it could
+#     not release, or could not check, is still there when they run. What a
+#     refusal downstream of the sweep must not do is claim to retain a record
+#     the sweep may already have retired, so it names what it actually retains
+#     instead of claiming every record. On the forced path,
 #     where no earlier sweep has
 #     run, the process-event cleanup's own sweep position keeps the records
 #     genuinely intact at its refusal and it says so.
@@ -2140,9 +2142,10 @@ restore_firstmate_home_process_events() {
 # in-flight guard, because its own refusal has to land before the endpoint is
 # killed - nothing can be both before that kill and after a step that only runs
 # during removal, so on that path the claim is narrowed rather than the order.
-# Narrowing is safe only because that earlier sweep refuses the whole retirement
-# unless every record released cleanly, so a record it retired names only
-# containers it verifiably stopped or proved already gone, each outcome printed.
+# Narrowing is safe only because that earlier sweep retires a record only when
+# release succeeded for it, so a record it retired names only containers it
+# verifiably stopped or proved already gone, each outcome printed. A record it
+# could not release, or could not check, is kept rather than retired.
 #
 # Having merely RUN is not enough to narrow: the sweep sets its dedupe marker
 # before it looks at a single record, and a secondmate home usually holds none at
