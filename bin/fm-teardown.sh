@@ -1416,6 +1416,7 @@ FM_RETIRING_HOME_UNRELEASED=()
 FM_RETIRING_HOME_UNCHECKED=()
 FM_RETIRING_HOME_HAS_UNRELEASED=0
 FM_RETIRING_HOME_SWEPT=
+FM_RETIRING_HOME_RETIRED=0
 FM_RETIRING_HOME_QUOTED_PATHS=()
 FM_RETIRING_HOME_QUOTED_TEXT=()
 # Render an untrusted name or path so it can sit inside one of firstmate's own
@@ -1465,6 +1466,7 @@ release_retiring_home_resources() {  # <state-dir>
   FM_RETIRING_HOME_UNRELEASED=()
   FM_RETIRING_HOME_UNCHECKED=()
   FM_RETIRING_HOME_HAS_UNRELEASED=0
+  FM_RETIRING_HOME_RETIRED=0
   FM_RETIRING_HOME_QUOTED_PATHS=()
   FM_RETIRING_HOME_QUOTED_TEXT=()
   [ -d "$state" ] || return 0
@@ -1491,6 +1493,7 @@ because $(resource_display_text "$child_id") is not a usable task id")
     fi
     if release_task_resources "$state" "$child_id"; then
       rm -f "$record"
+      FM_RETIRING_HOME_RETIRED=$((FM_RETIRING_HOME_RETIRED + 1))
       continue
     fi
     if [ "$FM_RESOURCE_RECORD_UNUSABLE" = 1 ]; then
@@ -2125,23 +2128,29 @@ restore_firstmate_home_process_events() {
   rm -rf -- "$backup"
 }
 
-# What a process-event cleanup refusal can honestly promise, which depends on
-# whether this home's records have already been swept when it fires.
+# What a process-event cleanup refusal can honestly promise, which turns on one
+# question: has a sweep already retired any of THIS home's resource records by
+# the time the refusal fires?
 #
-# Forced retirement sweeps below this cleanup, so its records are untouched here
-# and the refusal says so. The ordinary retirement sweeps EARLIER, at the
+# The forced path's sweep runs below this cleanup, so it has retired none of the
+# home's resource records here. The ordinary retirement sweeps EARLIER, at the
 # in-flight guard, because its own refusal has to land before the endpoint is
 # killed - nothing can be both before that kill and after a step that only runs
 # during removal, so on that path the claim is narrowed rather than the order.
-# Narrowing is safe here and only here: that earlier sweep refuses the whole
-# retirement unless every record released cleanly, so a record it retired names
-# a container it verifiably stopped and printed. The home and the lease are
-# genuinely preserved either way.
+# Narrowing is safe only because that earlier sweep refuses the whole retirement
+# unless every record released cleanly, so a record it retired names a container
+# it verifiably stopped and printed.
+#
+# Having merely RUN is not enough to narrow: the sweep sets its dedupe marker
+# before it looks at a single record, and a secondmate home usually holds none at
+# all. Claiming records may already be gone when none was touched withdraws a
+# true promise, which is the same defect as making a false one.
 firstmate_home_retry_preserves() {  # <home>
   local state
   state=$(cd "$1/state" 2>/dev/null && pwd -P) || state=
-  if [ -n "$state" ] && [ "$state" = "$FM_RETIRING_HOME_SWEPT" ]; then
-    printf 'preserving the home and its lease for retry; the resource records of children that released cleanly were already retired by the sweep above, each stop printed, so nothing they named is orphaned'
+  if [ -n "$state" ] && [ "$state" = "$FM_RETIRING_HOME_SWEPT" ] \
+    && [ "$FM_RETIRING_HOME_RETIRED" -gt 0 ]; then
+    printf 'preserving the home and its lease for retry, along with every record the sweep above did not retire; the records of children that released cleanly were retired there, each stop printed, so nothing they named is orphaned'
     return 0
   fi
   printf 'preserving the home, lease, and retirement records for retry'
@@ -2719,10 +2728,12 @@ fi
 # presentation-lock preflight - and nothing of this home has been killed or
 # removed yet. Sweeping ahead of any of them would stop containers and delete
 # their records for a retirement that a later gate then refuses, which is the
-# same defect as refusing after the endpoint is already gone. Two gates do still
-# follow, neither reachable before the kill: the herdr endpoint-confirmed-gone
-# check and the process-event cleanup inside the removal. Both say what they
-# actually retain once this sweep has run rather than claiming every record.
+# same defect as refusing after the endpoint is already gone. Gates that cannot
+# be evaluated until the close is attempted or the removal is under way do still
+# follow this point, and more may be added; the standing requirement on any of
+# them is the one this whole change exists to enforce - a gate downstream of the
+# sweep must not claim to preserve what the sweep may already have retired, so
+# it either makes no retention claim or states what is actually retained.
 # Every record here belongs to a
 # task already torn down - the guard above refused on any surviving meta - so
 # releasing one takes nothing from a live worker. A container the daemon
