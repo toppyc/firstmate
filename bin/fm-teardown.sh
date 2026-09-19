@@ -171,8 +171,11 @@
 #     leaked-process reap that protects the return is unaffected - it runs far
 #     earlier and targets worktree-cwd processes.
 #     Retiring a secondmate home erases the whole home, records and all, so the
-#     sweep is tied to remove_firstmate_home itself rather than to any one caller
-#     or to --force: every <home>/state/*.resources record is released there,
+#     sweep is tied to the home removal itself rather than to any one caller
+#     or to --force, and within that removal it runs only once the process-event
+#     cleanup has SUCCEEDED, below the refusals that promise the home and its
+#     retirement records survive for a retry and above every irreversible step.
+#     Every <home>/state/*.resources record is released there,
 #     keyed on the records themselves, so one whose task meta is already gone -
 #     left by that child's own earlier failed teardown - is released too.
 #     Whatever could not be released is NAMED together with what actually became
@@ -192,10 +195,12 @@
 #     a refusal reached after the endpoint is gone cannot
 #     preserve what it refuses to protect, and a sweep run ahead of the other
 #     gates stops containers and deletes their records for a retirement one of
-#     them then refuses. The one refusal that still follows the sweep - the herdr
-#     endpoint-confirmed-gone gate, which can only be evaluated after the close
-#     is attempted - therefore names what it actually retains instead of claiming
-#     every record. A home is swept once however many call sites it passes
+#     them then refuses. Two refusals still follow that earlier sweep, both
+#     reachable only after the close is attempted or the home removal is under
+#     way: the herdr endpoint-confirmed-gone gate, which therefore names what it
+#     actually retains instead of claiming every record, and the process-event
+#     cleanup inside the removal, whose own sweep position is what keeps it
+#     honest on the forced path. A home is swept once however many call sites it passes
 #     through: the removal path reuses what that sweep already released. An
 #     UNREACHABLE daemon never refuses on either path, because "I could not ask"
 #     is no more evidence that a container is running than that it is gone - the
@@ -240,6 +245,8 @@ SUB_HOME_PARENT_MARKER=".fm-secondmate-parent"
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 # shellcheck source=bin/fm-nm-run-lib.sh
 . "$SCRIPT_DIR/fm-nm-run-lib.sh"
+# shellcheck source=bin/fm-timeout-lib.sh
+. "$SCRIPT_DIR/fm-timeout-lib.sh"  # fm_run_timed: the shared hard bound
 # shellcheck source=bin/fm-resource-lib.sh
 . "$SCRIPT_DIR/fm-resource-lib.sh"
 if [ "$#" -lt 1 ] || ! fm_task_id_path_safe "$1"; then
@@ -1967,26 +1974,33 @@ EOF
 }
 
 # Removing the home is what destroys its resource records, so the sweep is tied
-# to this function rather than to any one caller or to --force: every present and
-# future removal path is covered by construction. It runs once the removal target
-# is validated and before anything is deleted. The ordinary retirement's refusal
-# does NOT live here - it fires once every gate that can abort the retirement has
-# passed and before the secondmate's endpoint is killed, because a refusal
-# reached after the endpoint is gone cannot preserve what it refuses to protect,
-# and one reached ahead of the other gates stops containers that a later refusal
-# then strands.
+# to this removal rather than to any one caller or to --force: every present and
+# future removal path is covered by construction. Within the removal it sits as
+# late as it can - below the process-event cleanup, whose refusals promise the
+# home and its retirement records survive for a retry, and above every
+# irreversible step. The ordinary retirement's refusal does NOT live here - it
+# fires once every gate that can abort the retirement has passed and before the
+# secondmate's endpoint is killed, because a refusal reached after the endpoint
+# is gone cannot preserve what it refuses to protect, and one reached ahead of
+# the other gates stops containers that a later refusal then strands.
 remove_firstmate_home() {
-  local home=$1 label=$2 expected_id=${3:-} abs_home_path rc=0
+  local home=$1 label=$2 expected_id=${3:-} abs_home_path sweep_state rc=0
   [ -n "$home" ] || return 0
   [ -e "$home" ] || return 0
   abs_home_path=$(validate_firstmate_home_for_removal "$home" "$label" "$expected_id") || return 1
   [ -n "$abs_home_path" ] || return 0
-  release_retiring_home_resources "$abs_home_path/state"
+  sweep_state=$(cd "$abs_home_path/state" 2>/dev/null && pwd -P) || sweep_state=
   remove_validated_firstmate_home "$abs_home_path" "$label" || rc=$?
-  if [ "$rc" -eq 0 ]; then
-    report_retiring_home_unreleased "its record was destroyed with $abs_home_path"
-  else
-    report_retiring_home_unreleased "its record survives in $abs_home_path/state, which was not removed"
+  # Only this home's own sweep may be reported here. A removal that refused
+  # before reaching the sweep leaves whatever an earlier home's sweep collected
+  # in place, and reporting that against this home's fate would describe records
+  # that were never touched.
+  if [ -n "$sweep_state" ] && [ "$sweep_state" = "$FM_RETIRING_HOME_SWEPT" ]; then
+    if [ "$rc" -eq 0 ]; then
+      report_retiring_home_unreleased "its record was destroyed with $abs_home_path"
+    else
+      report_retiring_home_unreleased "its record survives in $abs_home_path/state, which was not removed"
+    fi
   fi
   return "$rc"
 }
@@ -1998,6 +2012,14 @@ remove_validated_firstmate_home() {  # <validated-abs-home> <label>
     restore_firstmate_home_process_events "$abs_home_path" "$label" "$process_event_backup" || return $?
     return 1
   fi
+  # The sweep sits HERE, below the process-event refusals and above every
+  # irreversible removal, because those refusals promise the home and its
+  # retirement records are preserved for retry and a sweep ahead of them has
+  # already stopped containers and deleted the records of the children that
+  # released cleanly. The two treehouse errors below make no such claim. The
+  # dedupe in release_retiring_home_resources keeps the non-forced path, which
+  # sweeps and refuses earlier at the in-flight guard, from sweeping twice.
+  release_retiring_home_resources "$abs_home_path/state"
   if firstmate_home_has_treehouse_slot "$abs_home_path"; then
     command -v treehouse >/dev/null 2>&1 || {
       echo "error: treehouse command not found; cannot return $label $abs_home_path" >&2

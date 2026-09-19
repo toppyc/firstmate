@@ -26,9 +26,10 @@
 # ever being read as a CLI flag or a shell word.
 #
 # Callers must have sourced bin/fm-wake-lib.sh first (fm_lock_try_acquire,
-# fm_lock_release) and bin/fm-pr-lib.sh first (fm_pr_task_id_valid,
+# fm_lock_release), bin/fm-pr-lib.sh first (fm_pr_task_id_valid,
 # fm_pr_file_device, fm_pr_file_link_count, fm_pr_private_file_valid,
-# fm_pr_regular_destination_on_device_or_absent).
+# fm_pr_regular_destination_on_device_or_absent) and, for the release path,
+# bin/fm-timeout-lib.sh (fm_run_timed).
 
 FM_RESOURCE_RECORD_VERSION=fm-task-resources-v1
 FM_RESOURCE_RELEASED=()
@@ -230,20 +231,57 @@ fm_resource_record_remove_locked() {  # <state> <task-id> <kind> <name>
 # daemon it could not reach. Both keep the record; only `retained` proves the
 # container is there. The daemon probe costs a second docker call only after
 # inspect has already failed.
+
+# Bound for one docker call. A daemon that is DOWN refuses the socket and fails
+# fast; a daemon that is WEDGED accepts the connection and never answers, which
+# is a normal outcome of the memory pressure this whole record exists for, and
+# the docker CLI puts no deadline on that request. Cleanup that blocks there is
+# indistinguishable from the wedge itself.
+FM_RESOURCE_DOCKER_TIMEOUT=${FM_RESOURCE_DOCKER_TIMEOUT:-20}
+
+# Run one docker call under the shared hard bound. Exit 124 means the bound was
+# hit, which every caller below reads as `unreachable`.
+#
+# The ABSENCE of a usable bound is itself a failure, reported as 124 rather than
+# degraded into an unbounded call: a bound of 0 disables the deadline in both
+# `timeout` and the perl fallback, and a missing fm_run_timed means the sourcing
+# contract above was not met. Either way docker is never asked, because an
+# unbounded ask is exactly the hang this exists to prevent and it would report
+# success while doing it.
+fm_resource_run_docker() {  # <docker-args...>
+  case "$FM_RESOURCE_DOCKER_TIMEOUT" in
+    ''|*[!0-9]*) return 124 ;;
+  esac
+  [ "$FM_RESOURCE_DOCKER_TIMEOUT" -gt 0 ] || return 124
+  command -v fm_run_timed >/dev/null 2>&1 || return 124
+  fm_run_timed "$FM_RESOURCE_DOCKER_TIMEOUT" docker "$@"
+}
+
 fm_resource_release_container() {  # <name>
-  local name=$1
+  local name=$1 rc=0
   command -v docker >/dev/null 2>&1 || { printf 'unreachable\n'; return 1; }
-  if ! docker container inspect "$name" >/dev/null 2>&1; then
-    if docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
+  fm_resource_run_docker container inspect "$name" >/dev/null 2>&1 || rc=$?
+  if [ "$rc" -eq 124 ]; then
+    printf 'unreachable\n'
+    return 1
+  fi
+  if [ "$rc" -ne 0 ]; then
+    if fm_resource_run_docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
       printf 'absent\n'
       return 0
     fi
     printf 'unreachable\n'
     return 1
   fi
-  if docker stop "$name" >/dev/null 2>&1; then
+  rc=0
+  fm_resource_run_docker stop "$name" >/dev/null 2>&1 || rc=$?
+  if [ "$rc" -eq 0 ]; then
     printf 'released\n'
     return 0
+  fi
+  if [ "$rc" -eq 124 ]; then
+    printf 'unreachable\n'
+    return 1
   fi
   printf 'retained\n'
   return 1

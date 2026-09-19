@@ -2988,6 +2988,63 @@ SH
   chmod +x "$fakebin/docker"
 }
 
+test_force_teardown_keeps_child_records_when_process_event_cleanup_fails() {
+  local home subhome fakebin dockerdir err
+  home="$TMP_ROOT/procevent-fail-home"
+  subhome="$TMP_ROOT/procevent-fail-subhome"
+  dockerdir="$TMP_ROOT/procevent-fail-docker"
+  err="$TMP_ROOT/procevent-fail.err"
+  mkdir -p "$home/state" "$home/data" "$subhome/state/procevent" "$subhome/bin" "$dockerdir"
+  mark_firstmate_home "$subhome"
+  printf 'domain\n' > "$subhome/.fm-secondmate-home"
+  fm_write_secondmate_meta "$home/state/domain.meta" "$subhome"
+  printf -- '- domain - design domain (home: %s; scope: design domain; projects: alpha; added 2026-09-19)\n' \
+    "$subhome" > "$home/data/secondmates.md"
+  # A child record whose own task meta is already gone: exactly what the sweep
+  # would stop and delete if it ran.
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$subhome/state" \
+    "$ROOT/bin/fm-resource.sh" record child-p1 container sf-childp1-pg >/dev/null \
+    || fail "recording the child task's container failed"
+  # Process-event state whose dry-run preflight passes and whose real sweep then
+  # fails - the case the preflight cannot rule out.
+  printf 'source\n' > "$subhome/state/procevent/x.source"
+  cat > "$subhome/bin/fm-procevent.sh" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  sweep-home)
+    [ "${2:-}" = --preflight ] && exit 0
+    echo "fake procevent: sweep-home failed" >&2
+    exit 1 ;;
+  reconcile) exit 0 ;;
+esac
+exit 0
+SH
+  chmod +x "$subhome/bin/fm-procevent.sh"
+
+  fakebin=$(make_fake_tmux "$TMP_ROOT/procevent-fail-fake")
+  install_fake_docker "$fakebin" "$dockerdir"
+  printf 'sf-childp1-pg\n' >> "$dockerdir/running"
+
+  if PATH="$fakebin:$PATH" FM_HOME="$home" \
+    FM_FAKE_TMUX_LOG="$TMP_ROOT/procevent-fail-fake/tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/procevent-fail-fake/pane.txt" \
+    FM_FAKE_DOCKER_DIR="$dockerdir" \
+    "$ROOT/bin/fm-teardown.sh" domain --force >/dev/null 2>"$err"; then
+    fail "forced retirement completed although its process-event cleanup failed"
+  fi
+
+  # The refusal promises the home and its retirement records survive for a
+  # retry, so nothing may have been swept before it.
+  [ -d "$subhome" ] || fail "the refusal still removed the home"
+  [ -e "$subhome/state/child-p1.resources" ] \
+    || fail "the child's resource record was destroyed before the refusal"$'\n'"$(cat "$err")"
+  grep -Fxq sf-childp1-pg "$dockerdir/running" \
+    || fail "the child's container was stopped before the refusal"$'\n'"$(cat "$err")"
+  grep -Fq 'preserving the home, lease, and retirement records for retry' "$err" \
+    || fail "the process-event refusal was not the one that fired"$'\n'"$(cat "$err")"
+  pass "a forced retirement refused by process-event cleanup keeps every child record"
+}
+
 test_secondmate_force_teardown_releases_child_task_resources() {
   local home subhome fakebin log dockerdir
   home="$TMP_ROOT/child-resources-home"
@@ -3555,6 +3612,7 @@ test_secondmate_charter_brief_is_idle_by_default
 test_backlog_handoff_aborts_safely
 test_backlog_handoff_refuses_done_items_and_non_secondmate_homes
 test_secondmate_force_teardown_releases_child_task_resources
+test_force_teardown_keeps_child_records_when_process_event_cleanup_fails
 test_secondmate_force_teardown_releases_child_record_without_meta
 test_secondmate_force_teardown_names_unreleasable_child_container
 test_secondmate_force_teardown_proceeds_when_daemon_unreachable

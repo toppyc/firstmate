@@ -54,6 +54,8 @@ set -u
 # shellcheck source=tests/lib.sh disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 fm_git_identity fmtest fmtest@example.invalid
+# shellcheck source=bin/fm-timeout-lib.sh disable=SC1091
+. "$ROOT/bin/fm-timeout-lib.sh"  # fm_run_timed: bounds the runs that must not hang
 
 TEARDOWN="$ROOT/bin/fm-teardown.sh"
 PR_CHECK="$ROOT/bin/fm-pr-check.sh"
@@ -2621,9 +2623,16 @@ add_fake_docker() {
 #   stop-fails   containers whose `docker stop` reports a daemon error
 #   unreachable  when present, every invocation fails the way the real CLI does
 #                when it cannot connect to the daemon at all
+#   hang         when present, every invocation accepts the request and never
+#                answers, the way a wedged daemon does - the socket is up, so
+#                nothing fails fast and only a deadline ends the call
 dir=${FM_FAKE_DOCKER_DIR:-}
 [ -n "$dir" ] || { echo "fake docker: FM_FAKE_DOCKER_DIR unset" >&2; exit 125; }
 printf '%s\n' "$*" >> "$dir/calls.log"
+if [ -e "$dir/hang" ]; then
+  sleep 300
+  exit 0
+fi
 if [ -e "$dir/unreachable" ]; then
   printf 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?\n' >&2
   exit 1
@@ -2728,6 +2737,67 @@ test_stale_resource_lock_does_not_outlive_its_task() {
   assert_absent "$lock" \
     "resource-stale-lock: the record lock outlived the task it belonged to"
   pass "a stale record lock is removed with the rest of the task's volatile state"
+}
+
+test_wedged_daemon_does_not_hang_teardown() {
+  local case_dir rc
+  case_dir=$(make_landed_case resource-wedged)
+  add_fake_docker "$case_dir" sf-x1-pg
+  record_container "$case_dir" sf-x1-pg
+  # A wedged daemon, not a downed one: the socket accepts the request and never
+  # answers, so nothing fails fast and only a deadline can end the call.
+  : > "$case_dir/docker/hang"
+
+  # The whole run is itself bounded, so an unbounded docker call fails this test
+  # loudly instead of hanging the suite forever.
+  set +e
+  FM_ROOT_OVERRIDE="$ROOT" \
+  FM_STATE_OVERRIDE="$case_dir/state" \
+  FM_CONFIG_OVERRIDE="$case_dir/config" \
+  FM_RESOURCE_DOCKER_TIMEOUT=2 \
+  PATH="$case_dir/fakebin:${FM_TEARDOWN_TEST_PATH:-$PATH}" \
+    fm_run_timed 60 "$TEARDOWN" task-x1 > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  [ "$rc" -ne 124 ] || fail "resource-wedged: teardown never returned against a wedged daemon"
+  expect_code 0 "$rc" "resource-wedged: a wedged daemon must not abort cleanup"
+  assert_grep "teardown task-x1 complete" "$case_dir/stdout" "resource-wedged: cleanup did not complete"
+  assert_grep "container sf-x1-pg" "$case_dir/state/task-x1.resources" \
+    "resource-wedged: the record was deleted although nothing could be checked"
+  assert_grep "docker could not be asked about container sf-x1-pg" "$case_dir/stderr" \
+    "resource-wedged: a call that hit its deadline was not reported as unreachable"
+  docker_is_running "$case_dir" sf-x1-pg \
+    || fail "resource-wedged: a container the daemon never answered about was recorded as stopped"
+  pass "a wedged docker daemon is reported unreachable instead of hanging teardown"
+}
+
+test_unusable_timeout_bound_never_asks_docker() {
+  local case_dir rc
+  case_dir=$(make_landed_case resource-no-bound)
+  add_fake_docker "$case_dir" sf-x1-pg
+  record_container "$case_dir" sf-x1-pg
+  : > "$case_dir/docker/calls.log"
+
+  # A bound of zero is not a bound - it disables the deadline outright - so no
+  # usable bound can be established and the release must refuse to ask at all
+  # rather than degrade into the unbounded call this exists to prevent.
+  set +e
+  FM_RESOURCE_DOCKER_TIMEOUT=0 run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "resource-no-bound: cleanup should still complete"
+  assert_grep "teardown task-x1 complete" "$case_dir/stdout" "resource-no-bound: cleanup did not complete"
+  [ ! -s "$case_dir/docker/calls.log" ] \
+    || fail "resource-no-bound: docker was asked without a usable bound"$'\n'"$(cat "$case_dir/docker/calls.log")"
+  assert_grep "container sf-x1-pg" "$case_dir/state/task-x1.resources" \
+    "resource-no-bound: the record was deleted although nothing could be checked"
+  assert_grep "docker could not be asked about container sf-x1-pg" "$case_dir/stderr" \
+    "resource-no-bound: the entry was not reported as unreachable"
+  docker_is_running "$case_dir" sf-x1-pg \
+    || fail "resource-no-bound: a container was stopped without a usable bound"
+  pass "no usable bound classifies the entry unreachable and never asks docker"
 }
 
 test_unrecorded_containers_survive_teardown() {
@@ -3101,6 +3171,8 @@ test_process_exit_during_identity_lookup_does_not_refuse
 test_run_abort_precedes_process_reap_precedes_worktree_removal
 test_recorded_container_is_stopped_by_teardown
 test_stale_resource_lock_does_not_outlive_its_task
+test_wedged_daemon_does_not_hang_teardown
+test_unusable_timeout_bound_never_asks_docker
 test_unrecorded_containers_survive_teardown
 test_recorded_container_already_gone_is_reported_not_an_error
 test_unreachable_daemon_is_not_mistaken_for_a_missing_container
