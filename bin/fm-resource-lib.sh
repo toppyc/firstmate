@@ -279,10 +279,15 @@ fm_resource_release_container() {  # <name>
     printf 'released\n'
     return 0
   fi
-  if [ "$rc" -eq 124 ]; then
-    printf 'unreachable\n'
-    return 1
-  fi
+  # A stop that hits the bound is RETAINED, not unreachable. The inspect above
+  # already answered, so this container is proven to exist and is proven not to
+  # have been stopped - which is exactly what `retained` asserts. Calling it
+  # `unreachable` would claim nothing was established about it, and would hand a
+  # non-forced secondmate retirement the one outcome that does not refuse,
+  # letting it delete the only durable pointer to a container still running.
+  # `unreachable` stays for the cases where nothing WAS established: no docker
+  # binary, a daemon that refuses the socket or cannot be proven to answer, and
+  # an inspect that times out before anything is known.
   printf 'retained\n'
   return 1
 }

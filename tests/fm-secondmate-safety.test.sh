@@ -2964,8 +2964,11 @@ install_fake_docker() {  # <fake-bin-dir> <docker-state-dir>
   : > "$dir/running"
   : > "$dir/stopped.log"
   : > "$dir/unstoppable"
+  : > "$dir/stop-hangs"
   cat > "$fakebin/docker" <<'SH'
 #!/usr/bin/env bash
+# stop-hangs: containers whose `docker stop` never answers, the way a daemon
+# that wedges after answering the inspect does. Only a deadline ends the call.
 dir=$FM_FAKE_DOCKER_DIR
 if [ -e "$dir/unreachable" ]; then
   printf 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?\n' >&2
@@ -2976,6 +2979,10 @@ case "${1:-} ${2:-}" in
   "version --format") printf '27.0.0\n'; exit 0 ;;
 esac
 if [ "${1:-}" = stop ]; then
+  if grep -Fxq "${2:-}" "$dir/stop-hangs" 2>/dev/null; then
+    sleep 300
+    exit 0
+  fi
   grep -Fxq "${2:-}" "$dir/running" || exit 1
   ! grep -Fxq "${2:-}" "$dir/unstoppable" || exit 1
   grep -Fxv "${2:-}" "$dir/running" > "$dir/running.next" 2>/dev/null || :
@@ -2986,6 +2993,51 @@ fi
 exit 125
 SH
   chmod +x "$fakebin/docker"
+}
+
+test_nonforced_retirement_refuses_when_a_proven_container_stop_times_out() {
+  local home subhome fakebin dockerdir err
+  home="$TMP_ROOT/stophang-home"
+  subhome="$TMP_ROOT/stophang-subhome"
+  dockerdir="$TMP_ROOT/stophang-docker"
+  err="$TMP_ROOT/stophang.err"
+  mkdir -p "$home/state" "$home/data" "$subhome/state" "$dockerdir"
+  mark_firstmate_home "$subhome"
+  printf 'domain\n' > "$subhome/.fm-secondmate-home"
+  fm_write_secondmate_meta "$home/state/domain.meta" "$subhome"
+  printf -- '- domain - design domain (home: %s; scope: design domain; projects: alpha; added 2026-09-19)\n' \
+    "$subhome" > "$home/data/secondmates.md"
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$subhome/state" \
+    "$ROOT/bin/fm-resource.sh" record child-h1 container sf-childh1-pg >/dev/null \
+    || fail "recording the child task's container failed"
+
+  fakebin=$(make_fake_tmux "$TMP_ROOT/stophang-fake")
+  install_fake_docker "$fakebin" "$dockerdir"
+  # The daemon ANSWERS the inspect - the container is proven to exist - and then
+  # never answers the stop.
+  printf 'sf-childh1-pg\n' >> "$dockerdir/running"
+  printf 'sf-childh1-pg\n' > "$dockerdir/stop-hangs"
+
+  if PATH="$fakebin:$PATH" FM_HOME="$home" \
+    FM_RESOURCE_DOCKER_TIMEOUT=2 \
+    FM_FAKE_TMUX_LOG="$TMP_ROOT/stophang-fake/tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/stophang-fake/pane.txt" \
+    FM_FAKE_DOCKER_DIR="$dockerdir" \
+    "$ROOT/bin/fm-teardown.sh" domain >/dev/null 2>"$err"; then
+    fail "the retirement proceeded over a container proven to exist and not stopped"$'\n'"$(cat "$err")"
+  fi
+
+  [ -d "$subhome" ] || fail "the refusal still removed the home"
+  [ -e "$subhome/state/child-h1.resources" ] \
+    || fail "the refusal destroyed the only durable pointer to a running container"$'\n'"$(cat "$err")"
+  grep -Fxq sf-childh1-pg "$dockerdir/running" \
+    || fail "the fixture lost the container the stop never answered for"
+  grep -Fq 'is still holding resources' "$err" \
+    || fail "a proven container whose stop timed out was not reported as still holding resources"$'\n'"$(cat "$err")"
+  if grep -Fq 'docker could not be asked about' "$err"; then
+    fail "a daemon that answered the inspect was reported as unreachable"$'\n'"$(cat "$err")"
+  fi
+  pass "a stop that times out after a successful inspect refuses the ordinary retirement"
 }
 
 test_nonforced_process_event_refusal_keeps_full_promise_when_nothing_was_retired() {
@@ -3724,6 +3776,7 @@ test_secondmate_force_teardown_releases_child_task_resources
 test_force_teardown_keeps_child_records_when_process_event_cleanup_fails
 test_nonforced_process_event_refusal_states_what_the_guard_sweep_already_retired
 test_nonforced_process_event_refusal_keeps_full_promise_when_nothing_was_retired
+test_nonforced_retirement_refuses_when_a_proven_container_stop_times_out
 test_secondmate_force_teardown_releases_child_record_without_meta
 test_secondmate_force_teardown_names_unreleasable_child_container
 test_secondmate_force_teardown_proceeds_when_daemon_unreachable

@@ -2878,9 +2878,16 @@ if [ "$KIND" = secondmate ]; then
 fi
 
 # Fix 4 (see script header): stop the external resources this task recorded.
-# Placed HERE, after every verification and every refusal in the run and
-# immediately before this task's durable records are removed, deliberately. Each
-# refusal above means the task is still alive and still owes the captain its
+# Placed HERE deliberately: every gate that could still preserve this task's
+# unlanded work has passed, and what remains below is the retirement of the
+# task's own records. Steps below can still abort the run - remove_pr_poll_
+# artifacts re-validates the PR-check quarantine and refuses "preserving task
+# state" - but by then the isolated copy has already been returned, so none of
+# them is protecting work a worker could come back to, and the resource record
+# itself survives until further down. The standing requirement on anything added
+# below this line is the same one the home sweep carries: do not claim to
+# preserve what this release may already have stopped. Each refusal above means
+# the task is still alive and still owes the captain its
 # work, and several of them promise the worktree, the endpoint or the records are
 # intact - a promise that cannot hold if its database is already stopped. The
 # landed/discard-work verifications that run after the old pre-teardown position

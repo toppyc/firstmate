@@ -2612,6 +2612,7 @@ add_fake_docker() {
   : > "$dir/calls.log"
   : > "$dir/stopped.log"
   : > "$dir/stop-fails"
+  : > "$dir/stop-hangs"
   local name
   for name in "$@"; do printf '%s\n' "$name" >> "$dir/running"; done
   cat > "$case_dir/fakebin/docker" <<'SH'
@@ -2626,10 +2627,16 @@ add_fake_docker() {
 #   hang         when present, every invocation accepts the request and never
 #                answers, the way a wedged daemon does - the socket is up, so
 #                nothing fails fast and only a deadline ends the call
+#   stop-hangs   containers whose `docker stop` alone never answers, the way a
+#                daemon that wedges AFTER answering the inspect does
 dir=${FM_FAKE_DOCKER_DIR:-}
 [ -n "$dir" ] || { echo "fake docker: FM_FAKE_DOCKER_DIR unset" >&2; exit 125; }
 printf '%s\n' "$*" >> "$dir/calls.log"
 if [ -e "$dir/hang" ]; then
+  sleep 300
+  exit 0
+fi
+if [ "${1:-}" = stop ] && grep -Fxq "${2:-}" "$dir/stop-hangs" 2>/dev/null; then
   sleep 300
   exit 0
 fi
@@ -2770,6 +2777,40 @@ test_wedged_daemon_does_not_hang_teardown() {
   docker_is_running "$case_dir" sf-x1-pg \
     || fail "resource-wedged: a container the daemon never answered about was recorded as stopped"
   pass "a wedged docker daemon is reported unreachable instead of hanging teardown"
+}
+
+test_stop_that_times_out_after_a_proven_inspect_is_not_called_unreachable() {
+  local case_dir rc out
+  case_dir=$(make_landed_case resource-stop-hangs)
+  add_fake_docker "$case_dir" sf-x1-pg
+  record_container "$case_dir" sf-x1-pg
+  # The daemon answers the inspect and then wedges on the stop, so the container
+  # is PROVEN to exist and proven not to have been stopped.
+  printf 'sf-x1-pg\n' > "$case_dir/docker/stop-hangs"
+
+  set +e
+  FM_ROOT_OVERRIDE="$ROOT" \
+  FM_STATE_OVERRIDE="$case_dir/state" \
+  FM_CONFIG_OVERRIDE="$case_dir/config" \
+  FM_RESOURCE_DOCKER_TIMEOUT=2 \
+  PATH="$case_dir/fakebin:${FM_TEARDOWN_TEST_PATH:-$PATH}" \
+    fm_run_timed 60 "$TEARDOWN" task-x1 > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  [ "$rc" -ne 124 ] || fail "resource-stop-hangs: teardown never returned against a wedged stop"
+  expect_code 0 "$rc" "resource-stop-hangs: an unreleasable container must not abort cleanup"
+  assert_grep "teardown task-x1 complete" "$case_dir/stdout" "resource-stop-hangs: cleanup did not complete"
+  assert_grep "container sf-x1-pg" "$case_dir/state/task-x1.resources" \
+    "resource-stop-hangs: the record of a container proven to be running was deleted"
+  out=$(cat "$case_dir/stderr")
+  assert_contains "$out" "container sf-x1-pg could not be stopped; release by hand, then delete the record" \
+    "resource-stop-hangs: a proven container whose stop timed out was not reported as unreleasable"
+  assert_not_contains "$out" "docker could not be asked about" \
+    "resource-stop-hangs: a daemon that answered the inspect was reported as unreachable"
+  docker_is_running "$case_dir" sf-x1-pg \
+    || fail "resource-stop-hangs: the fixture recorded a stop the daemon never answered"
+  pass "a stop that times out after a proven inspect is reported unreleasable, not unreachable"
 }
 
 test_unusable_timeout_bound_never_asks_docker() {
@@ -3173,6 +3214,7 @@ test_recorded_container_is_stopped_by_teardown
 test_stale_resource_lock_does_not_outlive_its_task
 test_wedged_daemon_does_not_hang_teardown
 test_unusable_timeout_bound_never_asks_docker
+test_stop_that_times_out_after_a_proven_inspect_is_not_called_unreachable
 test_unrecorded_containers_survive_teardown
 test_recorded_container_already_gone_is_reported_not_an_error
 test_unreachable_daemon_is_not_mistaken_for_a_missing_container
