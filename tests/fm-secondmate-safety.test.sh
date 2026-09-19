@@ -2956,6 +2956,8 @@ EOF
 # A file-driven docker stand-in: $dir/running is the daemon's container list,
 # $dir/stopped.log records every successful stop, and a name in
 # $dir/unstoppable exists but refuses to stop, standing in for a daemon error.
+# Creating $dir/unreachable makes every invocation fail the way the real CLI
+# does when it cannot connect to the daemon at all.
 install_fake_docker() {  # <fake-bin-dir> <docker-state-dir>
   local fakebin=$1 dir=$2
   mkdir -p "$dir"
@@ -2965,6 +2967,10 @@ install_fake_docker() {  # <fake-bin-dir> <docker-state-dir>
   cat > "$fakebin/docker" <<'SH'
 #!/usr/bin/env bash
 dir=$FM_FAKE_DOCKER_DIR
+if [ -e "$dir/unreachable" ]; then
+  printf 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?\n' >&2
+  exit 1
+fi
 case "${1:-} ${2:-}" in
   "container inspect") grep -Fxq "${3:-}" "$dir/running" && exit 0; exit 1 ;;
   "version --format") printf '27.0.0\n'; exit 0 ;;
@@ -3189,7 +3195,83 @@ test_secondmate_retirement_without_force_refuses_unreleasable_child_container() 
     || fail "the refusal destroyed the record that is the only pointer to the container"
   grep -Fxq sf-childx5-pg "$dockerdir/running" \
     || fail "the fixture container was stopped after all; the test proves nothing"
+  ! grep -q kill-window "$TMP_ROOT/plain-stuck-fake/tmux.log" 2>/dev/null \
+    || fail "the refusal fired only after the secondmate's endpoint was already killed"
   pass "secondmate retirement without --force refuses a child container it could not release"
+}
+
+# An unreachable daemon is not evidence that anything is running, so it must not
+# block the retirement - on the machine this whole change exists for, Docker
+# Desktop is exactly what memory pressure kills. The name still has to escape
+# before the record dies with the home.
+test_secondmate_retirement_without_force_proceeds_when_daemon_unreachable() {
+  local home subhome fakebin dockerdir err
+  home="$TMP_ROOT/plain-daemon-down-home"
+  subhome="$TMP_ROOT/plain-daemon-down-subhome"
+  dockerdir="$TMP_ROOT/plain-daemon-down-docker"
+  err="$TMP_ROOT/plain-daemon-down-teardown.err"
+  mkdir -p "$home/state" "$home/data" "$subhome/state"
+  mark_firstmate_home "$subhome"
+  printf 'plaindown\n' > "$subhome/.fm-secondmate-home"
+  fm_write_secondmate_meta "$home/state/plaindown.meta" "$subhome"
+  printf -- '- plaindown - design domain (home: %s; scope: design domain; projects: alpha; added 2026-09-19)\n' \
+    "$subhome" > "$home/data/secondmates.md"
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$subhome/state" \
+    "$ROOT/bin/fm-resource.sh" record child-x6 container sf-childx6-pg >/dev/null \
+    || fail "recording the child container failed"
+
+  fakebin=$(make_fake_tmux "$TMP_ROOT/plain-daemon-down-fake")
+  install_fake_docker "$fakebin" "$dockerdir"
+  printf 'sf-childx6-pg\n' >> "$dockerdir/running"
+  : > "$dockerdir/unreachable"
+
+  PATH="$fakebin:$PATH" FM_HOME="$home" \
+    FM_FAKE_TMUX_LOG="$TMP_ROOT/plain-daemon-down-fake/tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/plain-daemon-down-fake/pane.txt" \
+    FM_FAKE_DOCKER_DIR="$dockerdir" \
+    "$ROOT/bin/fm-teardown.sh" plaindown >/dev/null 2>"$err" \
+    || fail "an unreachable docker daemon blocked an ordinary secondmate retirement"
+
+  [ ! -d "$subhome" ] || fail "the retirement did not retire the home"
+  grep -Fq sf-childx6-pg "$err" \
+    || fail "the container docker could not be asked about was never named before its record died"
+  pass "an unreachable daemon does not refuse an ordinary secondmate retirement"
+}
+
+# Forced retirement never refuses over a resource, whatever the reason it could
+# not be released; the name is the only thing that can survive the home.
+test_secondmate_force_teardown_proceeds_when_daemon_unreachable() {
+  local home subhome fakebin dockerdir err
+  home="$TMP_ROOT/force-daemon-down-home"
+  subhome="$TMP_ROOT/force-daemon-down-subhome"
+  dockerdir="$TMP_ROOT/force-daemon-down-docker"
+  err="$TMP_ROOT/force-daemon-down-teardown.err"
+  mkdir -p "$home/state" "$home/data" "$subhome/state"
+  mark_firstmate_home "$subhome"
+  printf 'forcedown\n' > "$subhome/.fm-secondmate-home"
+  fm_write_secondmate_meta "$home/state/forcedown.meta" "$subhome"
+  printf -- '- forcedown - design domain (home: %s; scope: design domain; projects: alpha; added 2026-09-19)\n' \
+    "$subhome" > "$home/data/secondmates.md"
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$subhome/state" \
+    "$ROOT/bin/fm-resource.sh" record child-x7 container sf-childx7-pg >/dev/null \
+    || fail "recording the child container failed"
+
+  fakebin=$(make_fake_tmux "$TMP_ROOT/force-daemon-down-fake")
+  install_fake_docker "$fakebin" "$dockerdir"
+  printf 'sf-childx7-pg\n' >> "$dockerdir/running"
+  : > "$dockerdir/unreachable"
+
+  PATH="$fakebin:$PATH" FM_HOME="$home" \
+    FM_FAKE_TMUX_LOG="$TMP_ROOT/force-daemon-down-fake/tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/force-daemon-down-fake/pane.txt" \
+    FM_FAKE_DOCKER_DIR="$dockerdir" \
+    "$ROOT/bin/fm-teardown.sh" forcedown --force >/dev/null 2>"$err" \
+    || fail "an unreachable docker daemon blocked forced secondmate retirement"
+
+  [ ! -d "$subhome" ] || fail "forced retirement retained the home"
+  grep -Fq sf-childx7-pg "$err" \
+    || fail "forced retirement destroyed the record without naming the container it could not check"
+  pass "an unreachable daemon does not refuse forced secondmate retirement"
 }
 
 test_fm_home_parameterization
@@ -3272,5 +3354,7 @@ test_backlog_handoff_refuses_done_items_and_non_secondmate_homes
 test_secondmate_force_teardown_releases_child_task_resources
 test_secondmate_force_teardown_releases_child_record_without_meta
 test_secondmate_force_teardown_names_unreleasable_child_container
+test_secondmate_force_teardown_proceeds_when_daemon_unreachable
 test_secondmate_retirement_without_force_releases_child_records
 test_secondmate_retirement_without_force_refuses_unreleasable_child_container
+test_secondmate_retirement_without_force_proceeds_when_daemon_unreachable

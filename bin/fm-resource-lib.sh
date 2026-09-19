@@ -33,6 +33,7 @@ FM_RESOURCE_RECORD_VERSION=fm-task-resources-v1
 FM_RESOURCE_RELEASED=()
 FM_RESOURCE_ABSENT=()
 FM_RESOURCE_RETAINED=()
+FM_RESOURCE_UNREACHABLE=()
 # shellcheck disable=SC2034 # Read by callers of fm_resource_release_all (bin/fm-teardown.sh), not this lib.
 FM_RESOURCE_RECORD_UNUSABLE=0
 
@@ -151,27 +152,33 @@ fm_resource_record_remove() {  # <state> <task-id> <kind> <name>
 }
 
 # Stop one recorded container. Echoes a short outcome word:
-#   released  - the container was running and is now stopped
-#   absent    - the daemon answered and has no such container; nothing to stop
-#   retained  - could not be released (no docker, an unreachable daemon, or the
-#               stop failed)
+#   released     - the container was running and is now stopped
+#   absent       - the daemon answered and has no such container; nothing to stop
+#   retained     - the daemon answered and the stop failed; the container is
+#                  known to be there and could not be released
+#   unreachable  - docker could not be asked at all (no binary, or the daemon did
+#                  not answer); nothing about the container is proven either way
 #
 # Absence is a positive finding, never a default: `docker container inspect`
 # exits non-zero both for "no such container" and for "cannot connect to the
 # daemon", and only the first may be reported as absent - the caller retires the
 # record on `absent`, so mistaking a downed daemon for a stopped container
 # destroys the operator's only pointer to a container that is still running.
-# Anything that cannot PROVE absence is retained. The daemon probe costs a
-# second docker call only after inspect has already failed.
+# `unreachable` and `retained` are kept apart for the mirror-image reason: not
+# being able to ask is no more evidence that a container is running than that it
+# is gone, so a caller that refuses over a live container must not refuse over a
+# daemon it could not reach. Both keep the record; only `retained` proves the
+# container is there. The daemon probe costs a second docker call only after
+# inspect has already failed.
 fm_resource_release_container() {  # <name>
   local name=$1
-  command -v docker >/dev/null 2>&1 || { printf 'retained\n'; return 1; }
+  command -v docker >/dev/null 2>&1 || { printf 'unreachable\n'; return 1; }
   if ! docker container inspect "$name" >/dev/null 2>&1; then
     if docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
       printf 'absent\n'
       return 0
     fi
-    printf 'retained\n'
+    printf 'unreachable\n'
     return 1
   fi
   if docker stop "$name" >/dev/null 2>&1; then
@@ -183,16 +190,19 @@ fm_resource_release_container() {  # <name>
 }
 
 # Release every resource recorded for the task, filling FM_RESOURCE_RELEASED,
-# FM_RESOURCE_ABSENT and FM_RESOURCE_RETAINED with "<kind> <name>" entries.
-# Returns 0 when nothing is left holding resources (including "record absent"
-# and "every recorded resource already gone"), 1 when at least one entry could
-# not be released or the record itself was unusable - which the caller tells
-# apart through FM_RESOURCE_RECORD_UNUSABLE.
+# FM_RESOURCE_ABSENT, FM_RESOURCE_RETAINED and FM_RESOURCE_UNREACHABLE with
+# "<kind> <name>" entries. Returns 0 when nothing is left holding resources
+# (including "record absent" and "every recorded resource already gone"), 1 when
+# at least one entry could not be released or the record itself was unusable -
+# which the caller tells apart through FM_RESOURCE_RECORD_UNUSABLE. A caller
+# deciding whether to REFUSE over an entry must read FM_RESOURCE_RETAINED alone:
+# FM_RESOURCE_UNREACHABLE proves nothing about the resource, only about docker.
 fm_resource_release_all() {  # <state> <task-id>
   local entries line kind name outcome rc=0
   FM_RESOURCE_RELEASED=()
   FM_RESOURCE_ABSENT=()
   FM_RESOURCE_RETAINED=()
+  FM_RESOURCE_UNREACHABLE=()
   FM_RESOURCE_RECORD_UNUSABLE=0
   # shellcheck disable=SC2034 # Read by bin/fm-teardown.sh.
   entries=$(fm_resource_entries "$1" "$2") || { FM_RESOURCE_RECORD_UNUSABLE=1; return 1; }
@@ -208,6 +218,7 @@ fm_resource_release_all() {  # <state> <task-id>
     case "$outcome" in
       released) FM_RESOURCE_RELEASED+=("$kind $name") ;;
       absent) FM_RESOURCE_ABSENT+=("$kind $name") ;;
+      unreachable) FM_RESOURCE_UNREACHABLE+=("$kind $name") ;;
       *) FM_RESOURCE_RETAINED+=("$kind $name") ;;
     esac
   done <<< "$entries"

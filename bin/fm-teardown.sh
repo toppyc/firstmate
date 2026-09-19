@@ -174,10 +174,18 @@
 #     keyed on the records themselves, so one whose task meta is already gone -
 #     left by that child's own earlier failed teardown - is released too.
 #     Whatever could not be released is NAMED together with what actually became
-#     of its record on the path taken. A retirement WITHOUT --force refuses at
-#     that point, leaving the home and its records intact; forced retirement
-#     never refuses, because forced retirement exists for when normal cleanup
-#     cannot run - it names what it could not release and proceeds.
+#     of its record on the path taken. A retirement WITHOUT --force sweeps
+#     EARLIER, at the in-flight-work guard, before the secondmate's endpoint is
+#     killed and before anything else is touched, and refuses there when the
+#     daemon answered and a container could not be stopped - a refusal reached
+#     after the endpoint is gone cannot preserve what it refuses to protect. A
+#     home is swept once however many call sites it passes through: the removal
+#     path reuses what that guard already released. An UNREACHABLE daemon never
+#     refuses on either path, because "I could not ask" is no more evidence that
+#     a container is running than that it is gone - the record is kept, the name
+#     is printed, and the retirement proceeds. Forced retirement never refuses at
+#     all, because forced retirement exists for when normal cleanup cannot run -
+#     it names what it could not release and proceeds.
 #     bin/fm-resource-lib.sh owns the record format and the release contract.
 set -eu
 
@@ -1355,6 +1363,9 @@ release_task_resources() {  # <state-dir> <task-id>
   for entry in "${FM_RESOURCE_RETAINED[@]+"${FM_RESOURCE_RETAINED[@]}"}"; do
     echo "warning: could not release $entry recorded by $id; it is still holding resources" >&2
   done
+  for entry in "${FM_RESOURCE_UNREACHABLE[@]+"${FM_RESOURCE_UNREACHABLE[@]}"}"; do
+    echo "warning: could not ask docker about $entry recorded by $id; it was left alone and its record kept" >&2
+  done
   return "$rc"
 }
 
@@ -1365,14 +1376,28 @@ release_task_resources() {  # <state-dir> <task-id>
 # likely to be orphaned. What could not be released is collected rather than
 # announced here: whether its record survives depends on what the removal does
 # next, and a message that overclaims in the reassuring direction is no better
-# than one that overclaims in the alarming direction.
+# than one that overclaims in the alarming direction. A proven-unreleasable
+# entry - the daemon answered and the stop failed - is kept apart from one
+# docker could not be asked about at all, because only the first is evidence of
+# a container still holding anything and so only the first may refuse.
+# Sweeping the same home twice releases and reports nothing new: the ordinary
+# retirement sweeps at its early guard and the removal path then reuses that
+# result, so one home is swept once however many call sites it passes through.
 FM_RETIRING_HOME_UNRELEASED=()
+FM_RETIRING_HOME_UNCHECKED=()
 FM_RETIRING_HOME_HAS_UNRELEASED=0
+FM_RETIRING_HOME_SWEPT=
 release_retiring_home_resources() {  # <state-dir>
-  local state=$1 record child_id entry
+  local state=$1 record child_id entry resolved
+  resolved=$(cd "$state" 2>/dev/null && pwd -P) || resolved=
+  if [ -n "$resolved" ] && [ "$resolved" = "$FM_RETIRING_HOME_SWEPT" ]; then
+    return 0
+  fi
   FM_RETIRING_HOME_UNRELEASED=()
+  FM_RETIRING_HOME_UNCHECKED=()
   FM_RETIRING_HOME_HAS_UNRELEASED=0
   [ -d "$state" ] || return 0
+  FM_RETIRING_HOME_SWEPT=$resolved
   for record in "$state"/*.resources; do
     [ -e "$record" ] || continue
     child_id=$(basename "$record" .resources)
@@ -1384,13 +1409,17 @@ release_retiring_home_resources() {  # <state-dir>
       rm -f "$record"
       continue
     fi
-    FM_RETIRING_HOME_HAS_UNRELEASED=1
     if [ "$FM_RESOURCE_RECORD_UNUSABLE" = 1 ]; then
+      FM_RETIRING_HOME_HAS_UNRELEASED=1
       FM_RETIRING_HOME_UNRELEASED+=("the unusable resource record of $child_id released nothing")
       continue
     fi
     for entry in "${FM_RESOURCE_RETAINED[@]+"${FM_RESOURCE_RETAINED[@]}"}"; do
+      FM_RETIRING_HOME_HAS_UNRELEASED=1
       FM_RETIRING_HOME_UNRELEASED+=("$entry recorded by $child_id is still holding resources")
+    done
+    for entry in "${FM_RESOURCE_UNREACHABLE[@]+"${FM_RESOURCE_UNREACHABLE[@]}"}"; do
+      FM_RETIRING_HOME_UNCHECKED+=("$entry recorded by $child_id was left alone because docker could not be asked about it")
     done
   done
 }
@@ -1398,6 +1427,9 @@ release_retiring_home_resources() {  # <state-dir>
 report_retiring_home_unreleased() {  # <what-became-of-the-record>
   local entry
   for entry in "${FM_RETIRING_HOME_UNRELEASED[@]+"${FM_RETIRING_HOME_UNRELEASED[@]}"}"; do
+    echo "warning: $entry; $1" >&2
+  done
+  for entry in "${FM_RETIRING_HOME_UNCHECKED[@]+"${FM_RETIRING_HOME_UNCHECKED[@]}"}"; do
     echo "warning: $entry; $1" >&2
   done
 }
@@ -1849,7 +1881,10 @@ EOF
 # Removing the home is what destroys its resource records, so the sweep is tied
 # to this function rather than to any one caller or to --force: every present and
 # future removal path is covered by construction. It runs once the removal target
-# is validated and before anything is deleted.
+# is validated and before anything is deleted. The ordinary retirement's refusal
+# does NOT live here - it fires at the early in-flight guard, before the
+# secondmate's endpoint is killed, because a refusal reached after the endpoint
+# is gone cannot preserve what it refuses to protect.
 remove_firstmate_home() {
   local home=$1 label=$2 expected_id=${3:-} abs_home_path rc=0
   [ -n "$home" ] || return 0
@@ -1857,12 +1892,6 @@ remove_firstmate_home() {
   abs_home_path=$(validate_firstmate_home_for_removal "$home" "$label" "$expected_id") || return 1
   [ -n "$abs_home_path" ] || return 0
   release_retiring_home_resources "$abs_home_path/state"
-  if [ "$FM_RETIRING_HOME_HAS_UNRELEASED" = 1 ] && [ "$FORCE" != "--force" ]; then
-    echo "REFUSED: $label $abs_home_path records a resource cleanup could not release." >&2
-    report_retiring_home_unreleased "its record is kept in $abs_home_path/state, which was not removed"
-    echo "Release it by hand and rerun, or discard with --force to retire the home regardless." >&2
-    return 1
-  fi
   remove_validated_firstmate_home "$abs_home_path" "$label" || rc=$?
   if [ "$rc" -eq 0 ]; then
     report_retiring_home_unreleased "its record was destroyed with $abs_home_path"
@@ -2442,6 +2471,22 @@ if [ "$KIND" = secondmate ] && [ "$FORCE" != "--force" ]; then
       echo "Found $(basename "$child_meta"). Let that home finish or explicitly discard with --force." >&2
       exit 1
     done
+    # Retiring the home destroys its resource records, so release them while
+    # refusing is still worth something: nothing has been killed yet. Every
+    # record still here belongs to a task already torn down - the loop above
+    # refused on any surviving meta - so releasing one takes nothing from a live
+    # worker. A container the daemon confirmed it could not stop refuses the
+    # retirement outright; one docker could not be asked about does not, because
+    # that is not evidence of anything running, and stalling cleanup on a downed
+    # daemon strands the operator exactly when the machine is under the pressure
+    # this fix exists for.
+    release_retiring_home_resources "$SUB_STATE"
+    if [ "$FM_RETIRING_HOME_HAS_UNRELEASED" = 1 ]; then
+      echo "REFUSED: secondmate home $HOME_PATH records a resource cleanup could not release." >&2
+      report_retiring_home_unreleased "its record is kept in $SUB_STATE, which was not removed"
+      echo "Release it by hand and rerun, or discard with --force to retire the home regardless." >&2
+      exit 1
+    fi
   fi
 fi
 
