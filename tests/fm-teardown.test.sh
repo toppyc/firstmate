@@ -2808,6 +2808,81 @@ test_dirty_worktree_refusal_survives_a_recorded_container() {
   pass "the dirty-worktree refusal is unchanged by a recorded container"
 }
 
+# treehouse return fails with the index.lock signature while the lock is present,
+# and its first failure leaves a modified file behind - the crew process that
+# owned the lock finishing its write. That is precisely the race the
+# post-stale-lock safety re-check exists for: the worktree was clean at the first
+# safety pass and is dirty by the time the return runs.
+add_lock_aware_treehouse_that_dirties() {
+  local case_dir=$1
+  cat > "$case_dir/fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = return ]; then
+  shift
+  wt=""
+  for a in "$@"; do
+    case "$a" in
+      --force) ;;
+      *) wt=$a ;;
+    esac
+  done
+  lock=$(git -C "$wt" rev-parse --git-path index.lock 2>/dev/null || true)
+  case "$lock" in
+    /*|'') ;;
+    *) lock="$wt/$lock" ;;
+  esac
+  if [ -n "$lock" ] && [ -e "$lock" ]; then
+    printf '%s\n' "crew write still in flight" > "$wt/feature.txt"
+    echo "fatal: Unable to create '$lock': File exists." >&2
+    exit 128
+  fi
+  exit 0
+fi
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+}
+
+# The authoritative dirty-work re-check teardown_treehouse_return performs after
+# clearing a provably stale index.lock fires late - past the isolated copy's
+# return, and far past where the release used to sit. A task that survives that
+# refusal is resumable and must still have its database.
+test_post_stale_lock_refusal_leaves_the_recorded_container_running() {
+  local case_dir rc lock
+  case_dir=$(make_case resource-stale-lock-recheck)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" feature.txt landed "landed work"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+  git -C "$case_dir/project" fetch -q origin
+
+  add_fake_docker "$case_dir" sf-x1-pg
+  record_container "$case_dir" sf-x1-pg
+  add_lock_aware_treehouse_that_dirties "$case_dir"
+  add_lsof_no_holder "$case_dir"
+
+  lock=$(git_index_lock_path "$case_dir/wt")
+  mkdir -p "$(dirname "$lock")"
+  : > "$lock"
+  touch -t 200001010000 "$lock"
+
+  set +e
+  FM_STALE_WORKTREE_LOCK_RETRY_WAIT_SECS=0 FM_STALE_WORKTREE_LOCK_AGE_SECS=1 \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "resource-stale-lock-recheck: teardown should abort on dirty work found after the stale-lock cleanup"
+  assert_grep "aborted after stale-lock cleanup because safety checks failed" "$case_dir/stderr" \
+    "resource-stale-lock-recheck: the post-stale-lock safety re-check did not refuse"
+  docker_is_running "$case_dir" sf-x1-pg \
+    || fail "resource-stale-lock-recheck: a refusal raised after the return stopped the surviving task's container"
+  [ ! -s "$case_dir/docker/calls.log" ] \
+    || fail "resource-stale-lock-recheck: a refused teardown still reached for docker"$'\n'"$(cat "$case_dir/docker/calls.log")"
+  assert_grep "container sf-x1-pg" "$case_dir/state/task-x1.resources" \
+    "resource-stale-lock-recheck: the refusal dropped the task's resource record"
+  pass "a refusal raised after the isolated copy is returned leaves the recorded container running"
+}
+
 test_container_that_cannot_be_stopped_is_reported_and_its_record_retained() {
   local case_dir rc
   case_dir=$(make_landed_case resource-stop-fails)
@@ -2918,5 +2993,6 @@ test_recorded_container_already_gone_is_reported_not_an_error
 test_task_without_a_resource_record_is_torn_down_unchanged
 test_unlanded_work_still_refuses_and_leaves_the_container_running
 test_dirty_worktree_refusal_survives_a_recorded_container
+test_post_stale_lock_refusal_leaves_the_recorded_container_running
 test_container_that_cannot_be_stopped_is_reported_and_its_record_retained
 test_unusable_resource_record_releases_nothing_and_completes

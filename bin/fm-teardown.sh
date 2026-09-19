@@ -155,12 +155,29 @@
 #     is reported, not an error. Never fatal - on the ordinary task path anything
 #     that cannot be released is reported and its record RETAINED as the
 #     operator's durable pointer to it, while the rest of cleanup still runs.
-#     Forced secondmate retirement CANNOT retain anything: it erases the whole
-#     home, records and all. So it sweeps every <home>/state/*.resources record
-#     instead - keyed on the records themselves, so one whose task meta is
-#     already gone is released too - and NAMES each entry it could not release in
-#     its output before the home and its records are destroyed. The name escaping
-#     into the run's output is all that survives there.
+#     POSITION: the release runs LAST, after the herdr endpoint-confirmed-gone
+#     gate and immediately before this task's durable records are removed - NOT
+#     with the pre-teardown cleanup above. Every landed/discard-work
+#     verification in the run has passed by then: the pre-return safety pass, the
+#     post-stale-lock re-check teardown_treehouse_return performs, and the Orca
+#     worktree path-match. So no refusal can claim an intact task while its
+#     database is already stopped, and a refused teardown leaves the container
+#     running for the worker who will resume. The tradeoff, taken deliberately:
+#     the release now happens AFTER the isolated copy is returned, so a container
+#     bind-mounting that copy is no longer stopped ahead of the return. A failed
+#     return aborts having stopped nothing and the operator reruns, and the
+#     leaked-process reap that protects the return is unaffected - it runs far
+#     earlier and targets worktree-cwd processes.
+#     Retiring a secondmate home erases the whole home, records and all, so the
+#     sweep is tied to remove_firstmate_home itself rather than to any one caller
+#     or to --force: every <home>/state/*.resources record is released there,
+#     keyed on the records themselves, so one whose task meta is already gone -
+#     left by that child's own earlier failed teardown - is released too.
+#     Whatever could not be released is NAMED together with what actually became
+#     of its record on the path taken. A retirement WITHOUT --force refuses at
+#     that point, leaving the home and its records intact; forced retirement
+#     never refuses, because forced retirement exists for when normal cleanup
+#     cannot run - it names what it could not release and proceeds.
 #     bin/fm-resource-lib.sh owns the record format and the release contract.
 set -eu
 
@@ -1322,11 +1339,11 @@ conclude_task_no_mistakes_run() {  # <worktree>
 # that cannot be released is reported and its record retained, and cleanup
 # continues.
 TASK_RESOURCES_RETAINED=0
-release_task_resources() {  # <state-dir> <task-id> [what-becomes-of-the-record]
-  local state=$1 id=$2 note=${3-} entry rc=0
+release_task_resources() {  # <state-dir> <task-id>
+  local state=$1 id=$2 entry rc=0
   fm_resource_release_all "$state" "$id" || rc=1
   if [ "$FM_RESOURCE_RECORD_UNUSABLE" = 1 ]; then
-    echo "warning: task $id has an unusable resource record at $(fm_resource_record_path "$state" "$id"); released nothing from it${note:+; $note}" >&2
+    echo "warning: task $id has an unusable resource record at $(fm_resource_record_path "$state" "$id"); released nothing from it" >&2
     return "$rc"
   fi
   for entry in "${FM_RESOURCE_RELEASED[@]+"${FM_RESOURCE_RELEASED[@]}"}"; do
@@ -1336,7 +1353,7 @@ release_task_resources() {  # <state-dir> <task-id> [what-becomes-of-the-record]
     echo "resource: $entry recorded by $id no longer exists; nothing to stop"
   done
   for entry in "${FM_RESOURCE_RETAINED[@]+"${FM_RESOURCE_RETAINED[@]}"}"; do
-    echo "warning: could not release $entry recorded by $id; it is still holding resources${note:+; $note}" >&2
+    echo "warning: could not release $entry recorded by $id; it is still holding resources" >&2
   done
   return "$rc"
 }
@@ -1345,12 +1362,16 @@ release_task_resources() {  # <state-dir> <task-id> [what-becomes-of-the-record]
 # outright (Fix 4 in the script header). Keyed on the records themselves rather
 # than on the task metas beside them, because a record left by a child's OWN
 # earlier failed teardown has no meta any more and is exactly the one most
-# likely to be orphaned. Nothing here can be retained - the home and every
-# record in it are erased moments later - so an entry that could not be released
-# is NAMED, not pointed at through a file that will not exist.
+# likely to be orphaned. What could not be released is collected rather than
+# announced here: whether its record survives depends on what the removal does
+# next, and a message that overclaims in the reassuring direction is no better
+# than one that overclaims in the alarming direction.
+FM_RETIRING_HOME_UNRELEASED=()
+FM_RETIRING_HOME_HAS_UNRELEASED=0
 release_retiring_home_resources() {  # <state-dir>
-  local state=$1 record child_id
-  local note="the record naming it is being destroyed with the retiring home"
+  local state=$1 record child_id entry
+  FM_RETIRING_HOME_UNRELEASED=()
+  FM_RETIRING_HOME_HAS_UNRELEASED=0
   [ -d "$state" ] || return 0
   for record in "$state"/*.resources; do
     [ -e "$record" ] || continue
@@ -1359,9 +1380,25 @@ release_retiring_home_resources() {  # <state-dir>
       echo "warning: ignoring resource record $record in the retiring home; $child_id is not a usable task id" >&2
       continue
     fi
-    if release_task_resources "$state" "$child_id" "$note"; then
+    if release_task_resources "$state" "$child_id"; then
       rm -f "$record"
+      continue
     fi
+    FM_RETIRING_HOME_HAS_UNRELEASED=1
+    if [ "$FM_RESOURCE_RECORD_UNUSABLE" = 1 ]; then
+      FM_RETIRING_HOME_UNRELEASED+=("the unusable resource record of $child_id released nothing")
+      continue
+    fi
+    for entry in "${FM_RESOURCE_RETAINED[@]+"${FM_RESOURCE_RETAINED[@]}"}"; do
+      FM_RETIRING_HOME_UNRELEASED+=("$entry recorded by $child_id is still holding resources")
+    done
+  done
+}
+
+report_retiring_home_unreleased() {  # <what-became-of-the-record>
+  local entry
+  for entry in "${FM_RETIRING_HOME_UNRELEASED[@]+"${FM_RETIRING_HOME_UNRELEASED[@]}"}"; do
+    echo "warning: $entry; $1" >&2
   done
 }
 
@@ -1809,12 +1846,34 @@ EOF
   printf '%s\n' "$abs_home_path"
 }
 
+# Removing the home is what destroys its resource records, so the sweep is tied
+# to this function rather than to any one caller or to --force: every present and
+# future removal path is covered by construction. It runs once the removal target
+# is validated and before anything is deleted.
 remove_firstmate_home() {
-  local home=$1 label=$2 expected_id=${3:-} abs_home_path process_event_backup
+  local home=$1 label=$2 expected_id=${3:-} abs_home_path rc=0
   [ -n "$home" ] || return 0
   [ -e "$home" ] || return 0
   abs_home_path=$(validate_firstmate_home_for_removal "$home" "$label" "$expected_id") || return 1
   [ -n "$abs_home_path" ] || return 0
+  release_retiring_home_resources "$abs_home_path/state"
+  if [ "$FM_RETIRING_HOME_HAS_UNRELEASED" = 1 ] && [ "$FORCE" != "--force" ]; then
+    echo "REFUSED: $label $abs_home_path records a resource cleanup could not release." >&2
+    report_retiring_home_unreleased "its record is kept in $abs_home_path/state, which was not removed"
+    echo "Release it by hand and rerun, or discard with --force to retire the home regardless." >&2
+    return 1
+  fi
+  remove_validated_firstmate_home "$abs_home_path" "$label" || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    report_retiring_home_unreleased "its record was destroyed with $abs_home_path"
+  else
+    report_retiring_home_unreleased "its record survives in $abs_home_path/state, which was not removed"
+  fi
+  return "$rc"
+}
+
+remove_validated_firstmate_home() {  # <validated-abs-home> <label>
+  local abs_home_path=$1 label=$2 process_event_backup
   process_event_backup=$(snapshot_firstmate_home_process_events "$abs_home_path" "$label") || return 1
   if ! cleanup_firstmate_home_process_events "$abs_home_path" "$label"; then
     restore_firstmate_home_process_events "$abs_home_path" "$label" "$process_event_backup" || return $?
@@ -2344,12 +2403,6 @@ cleanup_firstmate_home_children() {
       "$sub_state/$child_id.muse-session" "$sub_state/$child_id.muse-session-current" \
       "$sub_state/$child_id.cursor-session"
   done
-  # Only once every child above was retired without a refusal: a refusal leaves
-  # this home standing with its durable records intact, and a container stopped
-  # under a child that is about to be resumed would destroy live work. Runs on
-  # the way out of each recursion level, so a nested home is swept before the
-  # `remove_firstmate_home` call above erases it.
-  release_retiring_home_resources "$sub_state"
 }
 
 remove_secondmate_registry_entry() {
@@ -2489,20 +2542,6 @@ if [ "$BACKEND" = herdr ]; then
   TEARDOWN_HERDR_PANE=$FM_BACKEND_HERDR_PANE
 fi
 
-# Fix 4 (see script header): stop the external resources this task recorded.
-# Placed here, with the other pre-teardown cleanup, deliberately. It runs
-# AFTER every landed/discard-work refusal AND after the herdr presentation-lock
-# preflight, because each of those means this task is still alive and still owes
-# the captain its work - and the preflight's refusal promises that nothing was
-# changed, so a contended lock must be found before any container is stopped.
-# Taking a database out from under a worker that is about to resume would be a
-# fresh way to destroy work, and no refusal is weakened to make a container stop
-# happen. It runs after the process reap, so nothing is left running that could
-# restart what was just stopped. Every kind is covered: the record, not the task
-# shape, is what says whether there is anything to release.
-TASK_RESOURCES_RETAINED=0
-release_task_resources "$STATE" "$ID" || TASK_RESOURCES_RETAINED=1
-
 # Fix 3 (see script header): sweep remote job workers abandoned by an already
 # pruned code root. Best effort - a sweep failure never blocks this teardown.
 "$SCRIPT_DIR/fm-remote-job-reap-orphans.sh" >&2 || true
@@ -2629,6 +2668,26 @@ if [ "$KIND" = secondmate ]; then
   remove_firstmate_home "$HOME_PATH" "secondmate home" "$ID" || exit $?
   remove_secondmate_registry_entry "$ID"
 fi
+
+# Fix 4 (see script header): stop the external resources this task recorded.
+# Placed HERE, after every verification and every refusal in the run and
+# immediately before this task's durable records are removed, deliberately. Each
+# refusal above means the task is still alive and still owes the captain its
+# work, and several of them promise the worktree, the endpoint or the records are
+# intact - a promise that cannot hold if its database is already stopped. The
+# landed/discard-work verifications that run after the old pre-teardown position
+# are the post-stale-lock safety re-check inside teardown_treehouse_return and
+# the Orca worktree path-match; reaching this line means both have passed. An
+# early exit anywhere above leaves the container running for the worker who will
+# resume. The tradeoff: the release is now after the isolated copy is returned,
+# so a container bind-mounting that copy is not stopped ahead of the return - a
+# failed return aborts having stopped nothing, the operator reruns, and the
+# leaked-process reap that protects the return is unaffected because it runs far
+# earlier and targets worktree-cwd processes. Every kind is covered: the record,
+# not the task shape, is what says whether there is anything to release.
+TASK_RESOURCES_RETAINED=0
+release_task_resources "$STATE" "$ID" || TASK_RESOURCES_RETAINED=1
+
 remove_grok_turnend_auth "$STATE" "$ID" || exit 1
 remove_kimi_turnend_auth "$STATE" "$ID" || exit 1
 fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true

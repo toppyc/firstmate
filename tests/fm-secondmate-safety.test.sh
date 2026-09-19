@@ -3110,6 +3110,87 @@ test_secondmate_force_teardown_names_unreleasable_child_container() {
   pass "forced secondmate retirement names a child container it could not release"
 }
 
+# Retiring a home destroys its records whether or not --force was given, so an
+# ordinary retirement has to sweep them too. The record left behind by a child's
+# own failed teardown - record kept, meta already gone - is the one that reaches
+# this path in practice.
+test_secondmate_retirement_without_force_releases_child_records() {
+  local home subhome fakebin dockerdir
+  home="$TMP_ROOT/plain-retire-home"
+  subhome="$TMP_ROOT/plain-retire-subhome"
+  dockerdir="$TMP_ROOT/plain-retire-docker"
+  mkdir -p "$home/state" "$home/data" "$subhome/state"
+  mark_firstmate_home "$subhome"
+  printf 'plainretire\n' > "$subhome/.fm-secondmate-home"
+  fm_write_secondmate_meta "$home/state/plainretire.meta" "$subhome"
+  printf -- '- plainretire - design domain (home: %s; scope: design domain; projects: alpha; added 2026-09-19)\n' \
+    "$subhome" > "$home/data/secondmates.md"
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$subhome/state" \
+    "$ROOT/bin/fm-resource.sh" record child-x4 container sf-childx4-pg >/dev/null \
+    || fail "recording the orphaned child container failed"
+  [ ! -e "$subhome/state/child-x4.meta" ] || fail "fixture left a meta beside the metaless record"
+
+  fakebin=$(make_fake_tmux "$TMP_ROOT/plain-retire-fake")
+  install_fake_docker "$fakebin" "$dockerdir"
+  printf 'sf-childx4-pg\n' >> "$dockerdir/running"
+  printf 'stoneflow-dev-postgres\n' >> "$dockerdir/running"
+
+  PATH="$fakebin:$PATH" FM_HOME="$home" \
+    FM_FAKE_TMUX_LOG="$TMP_ROOT/plain-retire-fake/tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/plain-retire-fake/pane.txt" \
+    FM_FAKE_DOCKER_DIR="$dockerdir" \
+    "$ROOT/bin/fm-teardown.sh" plainretire >/dev/null 2>/dev/null \
+    || fail "ordinary secondmate retirement failed"
+
+  grep -Fxq sf-childx4-pg "$dockerdir/stopped.log" \
+    || fail "an ordinary retirement erased the home's resource records without releasing them"
+  grep -Fxq stoneflow-dev-postgres "$dockerdir/running" \
+    || fail "an ordinary retirement stopped a container no record named"
+  [ ! -d "$subhome" ] || fail "ordinary retirement retained the home"
+  pass "secondmate retirement without --force releases the home's recorded resources"
+}
+
+# Without discard authority there is no reason to destroy the one durable pointer
+# to a container still running, so the ordinary path refuses instead.
+test_secondmate_retirement_without_force_refuses_unreleasable_child_container() {
+  local home subhome fakebin dockerdir err
+  home="$TMP_ROOT/plain-stuck-home"
+  subhome="$TMP_ROOT/plain-stuck-subhome"
+  dockerdir="$TMP_ROOT/plain-stuck-docker"
+  err="$TMP_ROOT/plain-stuck-teardown.err"
+  mkdir -p "$home/state" "$home/data" "$subhome/state"
+  mark_firstmate_home "$subhome"
+  printf 'plainstuck\n' > "$subhome/.fm-secondmate-home"
+  fm_write_secondmate_meta "$home/state/plainstuck.meta" "$subhome"
+  printf -- '- plainstuck - design domain (home: %s; scope: design domain; projects: alpha; added 2026-09-19)\n' \
+    "$subhome" > "$home/data/secondmates.md"
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$subhome/state" \
+    "$ROOT/bin/fm-resource.sh" record child-x5 container sf-childx5-pg >/dev/null \
+    || fail "recording the stuck child container failed"
+
+  fakebin=$(make_fake_tmux "$TMP_ROOT/plain-stuck-fake")
+  install_fake_docker "$fakebin" "$dockerdir"
+  printf 'sf-childx5-pg\n' >> "$dockerdir/running"
+  printf 'sf-childx5-pg\n' >> "$dockerdir/unstoppable"
+
+  if PATH="$fakebin:$PATH" FM_HOME="$home" \
+    FM_FAKE_TMUX_LOG="$TMP_ROOT/plain-stuck-fake/tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/plain-stuck-fake/pane.txt" \
+    FM_FAKE_DOCKER_DIR="$dockerdir" \
+    "$ROOT/bin/fm-teardown.sh" plainstuck >/dev/null 2>"$err"; then
+    fail "an ordinary retirement destroyed a home holding a container it could not release"
+  fi
+
+  grep -Fq sf-childx5-pg "$err" || fail "the refusal did not name the container it could not release"
+  grep -Fq REFUSED "$err" || fail "the retirement stopped without a refusal line"
+  [ -d "$subhome" ] || fail "the refusal removed the home anyway"
+  [ -e "$subhome/state/child-x5.resources" ] \
+    || fail "the refusal destroyed the record that is the only pointer to the container"
+  grep -Fxq sf-childx5-pg "$dockerdir/running" \
+    || fail "the fixture container was stopped after all; the test proves nothing"
+  pass "secondmate retirement without --force refuses a child container it could not release"
+}
+
 test_fm_home_parameterization
 test_lock_status_is_per_home
 test_seed_allows_overlapping_clones_and_drops_owner
@@ -3190,3 +3271,5 @@ test_backlog_handoff_refuses_done_items_and_non_secondmate_homes
 test_secondmate_force_teardown_releases_child_task_resources
 test_secondmate_force_teardown_releases_child_record_without_meta
 test_secondmate_force_teardown_names_unreleasable_child_container
+test_secondmate_retirement_without_force_releases_child_records
+test_secondmate_retirement_without_force_refuses_unreleasable_child_container
