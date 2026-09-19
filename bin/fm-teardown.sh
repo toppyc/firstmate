@@ -197,10 +197,13 @@
 #     gates stops containers and deletes their records for a retirement one of
 #     them then refuses. Two refusals still follow that earlier sweep, both
 #     reachable only after the close is attempted or the home removal is under
-#     way: the herdr endpoint-confirmed-gone gate, which therefore names what it
-#     actually retains instead of claiming every record, and the process-event
-#     cleanup inside the removal, whose own sweep position is what keeps it
-#     honest on the forced path. A home is swept once however many call sites it passes
+#     way: the herdr endpoint-confirmed-gone gate and the process-event cleanup
+#     inside the removal. Neither can be moved ahead of a sweep that must itself
+#     precede the endpoint kill, so both name what they actually retain instead
+#     of claiming every record. On the forced path, where no earlier sweep has
+#     run, the process-event cleanup's own sweep position keeps the records
+#     genuinely intact at its refusal and it says so.
+#     A home is swept once however many call sites it passes
 #     through: the removal path reuses what that sweep already released. An
 #     UNREACHABLE daemon never refuses on either path, because "I could not ask"
 #     is no more evidence that a container is running than that it is gone - the
@@ -2122,6 +2125,28 @@ restore_firstmate_home_process_events() {
   rm -rf -- "$backup"
 }
 
+# What a process-event cleanup refusal can honestly promise, which depends on
+# whether this home's records have already been swept when it fires.
+#
+# Forced retirement sweeps below this cleanup, so its records are untouched here
+# and the refusal says so. The ordinary retirement sweeps EARLIER, at the
+# in-flight guard, because its own refusal has to land before the endpoint is
+# killed - nothing can be both before that kill and after a step that only runs
+# during removal, so on that path the claim is narrowed rather than the order.
+# Narrowing is safe here and only here: that earlier sweep refuses the whole
+# retirement unless every record released cleanly, so a record it retired names
+# a container it verifiably stopped and printed. The home and the lease are
+# genuinely preserved either way.
+firstmate_home_retry_preserves() {  # <home>
+  local state
+  state=$(cd "$1/state" 2>/dev/null && pwd -P) || state=
+  if [ -n "$state" ] && [ "$state" = "$FM_RETIRING_HOME_SWEPT" ]; then
+    printf 'preserving the home and its lease for retry; the resource records of children that released cleanly were already retired by the sweep above, each stop printed, so nothing they named is orphaned'
+    return 0
+  fi
+  printf 'preserving the home, lease, and retirement records for retry'
+}
+
 cleanup_firstmate_home_process_events() {
   local home=$1 label=$2 runner="$1/bin/fm-procevent.sh"
   firstmate_home_has_process_events "$home" || return 0
@@ -2130,11 +2155,11 @@ cleanup_firstmate_home_process_events() {
     return 1
   fi
   if ! FM_HOME="$home" FM_ROOT_OVERRIDE="$home" "$runner" sweep-home; then
-    echo "REFUSED: process-event cleanup is incomplete for $label $home; preserving the home, lease, and retirement records for retry" >&2
+    echo "REFUSED: process-event cleanup is incomplete for $label $home; $(firstmate_home_retry_preserves "$home")" >&2
     return 1
   fi
   if firstmate_home_has_process_events "$home"; then
-    echo "REFUSED: process-event state remains for $label $home after its bounded sweep; preserving the home, lease, and retirement records for retry" >&2
+    echo "REFUSED: process-event state remains for $label $home after its bounded sweep; $(firstmate_home_retry_preserves "$home")" >&2
     return 1
   fi
 }
@@ -2688,13 +2713,17 @@ if [ "$BACKEND" = herdr ]; then
 fi
 
 # Retiring the home destroys its resource records, so release them at the last
-# point where refusing is still worth something: every refusal that can abort
-# this retirement has now passed - the in-flight-work guard, the process-event
-# preflight, both public-followup gates and the herdr presentation-lock
-# preflight - and nothing of this home has been killed or removed yet. Sweeping
-# ahead of any of them would stop containers and delete their records for a
-# retirement that a later gate then refuses, which is the same defect as
-# refusing after the endpoint is already gone. Every record here belongs to a
+# point where refusing still preserves what this refusal protects: every refusal
+# that precedes the endpoint kill has now passed - the in-flight-work guard, the
+# process-event preflight, both public-followup gates and the herdr
+# presentation-lock preflight - and nothing of this home has been killed or
+# removed yet. Sweeping ahead of any of them would stop containers and delete
+# their records for a retirement that a later gate then refuses, which is the
+# same defect as refusing after the endpoint is already gone. Two gates do still
+# follow, neither reachable before the kill: the herdr endpoint-confirmed-gone
+# check and the process-event cleanup inside the removal. Both say what they
+# actually retain once this sweep has run rather than claiming every record.
+# Every record here belongs to a
 # task already torn down - the guard above refused on any surviving meta - so
 # releasing one takes nothing from a live worker. A container the daemon
 # confirmed it could not stop refuses the retirement outright; one docker could
