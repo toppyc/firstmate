@@ -89,10 +89,12 @@
 # checks before any destructive return. Teardown output notes every wait, retry, and
 # removal so the operator can see what happened.
 #
-# Pre-teardown cleanup sequence (runs once every landed/discard-work safety
-# refusal above has already passed, and BEFORE any worktree return, branch
-# delete, or backend kill below - a still-active run or a leaked process may
-# own live work in that worktree):
+# Cleanup fixes, numbered as the code refers to them. Fix 1 to Fix 3 are the
+# pre-teardown sequence: they run once every landed/discard-work safety refusal
+# above has already passed, and BEFORE any worktree return, branch delete, or
+# backend kill below - a still-active run or a leaked process may own live work
+# in that worktree. Fix 4 is described here with them but deliberately runs
+# LAST, after every verification in the run; its own POSITION note owns why.
 #   Fix 1 - conclude the task's own no-mistakes run. A ship task's worktree can
 #     be torn down while its no-mistakes pipeline run is still PARKED at a gate
 #     (awaiting_approval/fix_review/any awaiting_agent field), with no worker
