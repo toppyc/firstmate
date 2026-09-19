@@ -1406,28 +1406,44 @@ FM_RETIRING_HOME_UNRELEASED=()
 FM_RETIRING_HOME_UNCHECKED=()
 FM_RETIRING_HOME_HAS_UNRELEASED=0
 FM_RETIRING_HOME_SWEPT=
-# Echo a short, sanitized rendering of a resource record whose own reader
-# refused it, so the container names inside still reach the operator before the
-# record is destroyed with its home. The record failed validation, so its bytes
-# are UNTRUSTED input, never a parsed entry: control characters are stripped,
-# the line count and each line's length are bounded, and the result is clearly
-# labelled as the unreadable record's raw content rather than as a resource
-# firstmate recognises. Prints nothing when there is nothing readable to show.
+FM_RETIRING_HOME_QUOTED_PATHS=()
+FM_RETIRING_HOME_QUOTED_TEXT=()
+# Render an untrusted name or path so it can sit inside one of firstmate's own
+# sentences. A record's basename and a state directory's path are as
+# attacker-shaped as the record's bytes, and a sentence firstmate asserts must
+# be a complete line that nothing in it can end, extend or restart: every
+# control character goes, INCLUDING the line feed that is deliberately kept
+# inside a quoted record body, and the length is bounded.
+resource_display_text() {  # <untrusted-text>
+  printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177' | head -c 512
+}
+
+# Capture a short, sanitized copy of a resource record whose own reader refused
+# it, so the container names inside still reach the operator before the record
+# is destroyed with its home. Captured at sweep time, not at report time,
+# because the removal path reports after the home is already gone.
+#
+# The record failed validation, so its bytes are UNTRUSTED input, never a parsed
+# entry. They never enter one of firstmate's sentences: the report fences them
+# in their own block below every assertion firstmate makes, each line indented,
+# so the operator can see exactly where the record's own bytes begin and end.
 #
 # The tr set is every byte 0-31 plus DEL EXCEPT decimal 9 (TAB) and 10 (LF):
 # \000-\010 is 0-8, \013-\037 is 11-31, \177 is DEL. LF survives because the
 # rendering is line-oriented and that line structure is what makes the contents
 # readable; TAB survives because it cannot move the cursor off its own line.
 # Carriage return does NOT survive - it returns the cursor to column 0, so a
-# crafted record could overwrite the indent and the preceding output and forge
-# what this function reports.
-resource_record_contents_note() {  # <record-path>
+# crafted record could erase the indent that marks its bytes as quoted. The line
+# count and the total length stay bounded. Captures nothing when there is
+# nothing readable to show.
+capture_resource_record_contents() {  # <record-path>
   local record=$1 raw
   [ -f "$record" ] && [ ! -L "$record" ] || return 0
   raw=$(LC_ALL=C tr -d '\000-\010\013-\037\177' < "$record" 2>/dev/null \
     | head -c 2000 | head -n 20 | sed 's/^/    /' ) || return 0
   [ -n "$raw" ] || return 0
-  printf '; its unreadable contents were:\n%s' "$raw"
+  FM_RETIRING_HOME_QUOTED_PATHS+=("$(resource_display_text "$record")")
+  FM_RETIRING_HOME_QUOTED_TEXT+=("$raw")
 }
 
 release_retiring_home_resources() {  # <state-dir>
@@ -1439,6 +1455,8 @@ release_retiring_home_resources() {  # <state-dir>
   FM_RETIRING_HOME_UNRELEASED=()
   FM_RETIRING_HOME_UNCHECKED=()
   FM_RETIRING_HOME_HAS_UNRELEASED=0
+  FM_RETIRING_HOME_QUOTED_PATHS=()
+  FM_RETIRING_HOME_QUOTED_TEXT=()
   [ -d "$state" ] || return 0
   FM_RETIRING_HOME_SWEPT=$resolved
   # Both globs: a plain shell glob skips dot-prefixed names, and a record the
@@ -1456,8 +1474,9 @@ release_retiring_home_resources() {  # <state-dir>
       # would let a non-forced retirement destroy a record naming a live
       # container. Name its contents too: the record dies with the home.
       FM_RETIRING_HOME_HAS_UNRELEASED=1
-      FM_RETIRING_HOME_UNRELEASED+=("the resource record $record could not be read \
-because $child_id is not a usable task id$(resource_record_contents_note "$record")")
+      FM_RETIRING_HOME_UNRELEASED+=("the resource record $(resource_display_text "$record") could not be read \
+because $(resource_display_text "$child_id") is not a usable task id")
+      capture_resource_record_contents "$record"
       continue
     fi
     if release_task_resources "$state" "$child_id"; then
@@ -1466,7 +1485,8 @@ because $child_id is not a usable task id$(resource_record_contents_note "$recor
     fi
     if [ "$FM_RESOURCE_RECORD_UNUSABLE" = 1 ]; then
       FM_RETIRING_HOME_HAS_UNRELEASED=1
-      FM_RETIRING_HOME_UNRELEASED+=("the unusable resource record of $child_id released nothing$(resource_record_contents_note "$record")")
+      FM_RETIRING_HOME_UNRELEASED+=("the unusable resource record of $child_id released nothing")
+      capture_resource_record_contents "$record"
       continue
     fi
     for entry in "${FM_RESOURCE_RETAINED[@]+"${FM_RESOURCE_RETAINED[@]}"}"; do
@@ -1479,13 +1499,26 @@ because $child_id is not a usable task id$(resource_record_contents_note "$recor
   done
 }
 
+# Every sentence firstmate asserts is printed first, each one a complete line
+# carrying no record bytes. Only then are the captured contents of unreadable
+# records replayed, each fenced between its own begin and end marker: a marker
+# starts at column 0 and a quoted line never does, so nothing a record contains
+# can pass itself off as firstmate speaking.
 report_retiring_home_unreleased() {  # <what-became-of-the-record>
-  local entry
+  local entry fate i=0 count
+  fate=$(resource_display_text "$1")
   for entry in "${FM_RETIRING_HOME_UNRELEASED[@]+"${FM_RETIRING_HOME_UNRELEASED[@]}"}"; do
-    echo "warning: $entry; $1" >&2
+    echo "warning: $entry; $fate" >&2
   done
   for entry in "${FM_RETIRING_HOME_UNCHECKED[@]+"${FM_RETIRING_HOME_UNCHECKED[@]}"}"; do
-    echo "warning: $entry; $1" >&2
+    echo "warning: $entry; $fate" >&2
+  done
+  count=${#FM_RETIRING_HOME_QUOTED_PATHS[@]}
+  while [ "$i" -lt "$count" ]; do
+    echo "warning: begin quoted contents of the unreadable record ${FM_RETIRING_HOME_QUOTED_PATHS[$i]}; every indented line below is that record's own bytes, which firstmate did not interpret" >&2
+    printf '%s\n' "${FM_RETIRING_HOME_QUOTED_TEXT[$i]}" >&2
+    echo "warning: end quoted contents of the unreadable record ${FM_RETIRING_HOME_QUOTED_PATHS[$i]}" >&2
+    i=$((i + 1))
   done
 }
 

@@ -3137,8 +3137,11 @@ test_secondmate_retirement_refuses_unreadable_record_name_and_names_its_contents
   fm_write_secondmate_meta "$home/state/badname.meta" "$subhome"
   printf -- '- badname - design domain (home: %s; scope: design domain; projects: alpha; added 2026-09-19)\n' \
     "$subhome" > "$home/data/secondmates.md"
-  # A record left under a name the task-id validator refuses.
-  printf 'fm-task-resources-v1\ncontainer sf-orphan-pg\n' > "$subhome/state/.stale.resources"
+  # A record left under a name the task-id validator refuses, whose last line
+  # tries to pass itself off as firstmate's own statement about the record's
+  # fate so the operator cannot tell the two apart.
+  printf 'fm-task-resources-v1\ncontainer sf-orphan-pg; its record was destroyed with %s\n' \
+    "$subhome" > "$subhome/state/.stale.resources"
 
   fakebin=$(make_fake_tmux "$TMP_ROOT/badname-fake")
   install_fake_docker "$fakebin" "$dockerdir"
@@ -3159,7 +3162,27 @@ test_secondmate_retirement_refuses_unreadable_record_name_and_names_its_contents
   # The record dies with the home, so its contents must escape into the output.
   grep -F 'sf-orphan-pg' "$err" >/dev/null \
     || fail "the unreadable record's contents were never named"$'\n'"$(cat "$err")"
-  pass "an unreadable record name refuses the ordinary retirement and its contents are named"
+  # Firstmate's own statement about the record's fate is one complete line at
+  # column 0 that carries none of the record's bytes.
+  if ! grep -Fq "warning: the resource record $subhome/state/.stale.resources could not be read because .stale is not a usable task id; its record is kept in $subhome/state, which was not removed" "$err"; then
+    fail "firstmate's fate clause was not printed as its own complete line"$'\n'"$(cat "$err")"
+  fi
+  # ... and it is not buried inside the indented quote of the record's bytes.
+  if grep -q '^[[:space:]].*which was not removed' "$err"; then
+    fail "firstmate's fate clause was printed inside the quoted record contents"$'\n'"$(cat "$err")"
+  fi
+  # The record's bytes appear only between fence markers, indented, so the
+  # forged fate clause inside them cannot be read as firstmate speaking.
+  if ! grep -Fq "begin quoted contents of the unreadable record $subhome/state/.stale.resources" "$err"; then
+    fail "the quoted record contents had no opening fence"$'\n'"$(cat "$err")"
+  fi
+  if ! grep -Fq "end quoted contents of the unreadable record $subhome/state/.stale.resources" "$err"; then
+    fail "the quoted record contents had no closing fence"$'\n'"$(cat "$err")"
+  fi
+  if grep -F 'sf-orphan-pg; its record was destroyed with' "$err" | grep -qv '^[[:space:]]'; then
+    fail "the record's forged fate clause escaped the quoted block"$'\n'"$(cat "$err")"
+  fi
+  pass "an unreadable record name refuses the ordinary retirement and its contents are fenced"
 }
 
 test_secondmate_retirement_without_force_releases_child_records() {
