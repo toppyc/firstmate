@@ -786,6 +786,117 @@ test_scout_and_secondmate_load_decision_hold_policy() {
   pass "fm-brief.sh: investigation and visual-review completions load the shared decision policy"
 }
 
+# assert_line <exact-line> <file> <msg>: the brief must carry this whole line
+# verbatim, so a reworded or dropped contract line cannot pass on a substring.
+assert_line() {
+  grep -Fx -- "$1" "$2" >/dev/null || fail "$3"
+}
+
+# The four instructions firstmate used to hand-write into every brief: declare a
+# long wait with a copyable line shape, anchor firstmate's relative paths to the
+# absolute home, and (ship only) the pipeline hazards, gated per delivery mode.
+test_briefs_teach_long_wait_paths_and_hazards() {
+  local home id kind brief path_line scoped_line green_line local_line
+  home="$TMP_ROOT/lessons-home"
+  scoped_line="   - Run only the tests your change touches; leave the full suite to CI, which shards it."
+  green_line="   - A green PR describes the head the forge last saw, not what you intend to ship."
+  local_line="   - Nothing else runs the tests for this branch: run the relevant suites yourself before reporting ready in branch."
+  mkdir -p "$home/data"
+  path_line="Firstmate's paths do not resolve from this worktree: a \`data/...\` or \`state/...\` path in the task above means \`$home/data/...\` or \`$home/state/...\`, and every path this scaffold writes below is already absolute."
+  for kind in no-mistakes direct-PR local-only scout; do
+    id="brief-lessons-$kind"
+    if [ "$kind" = scout ]; then
+      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --scout >/dev/null 2>&1
+    else
+      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --mode "$kind" >/dev/null 2>&1
+    fi
+    brief="$home/data/$id/brief.md"
+    assert_present "$brief" "$kind: brief was not scaffolded"
+    # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
+    assert_grep 'append a line shaped like `paused: integration tests running, duration unknown`' "$brief" \
+      "$kind: brief does not show the shape of a declared long wait"
+    # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
+    assert_grep 'then `resolved: {what finished}` when it ends, so a quiet pane never reads as a wedge.' "$brief" \
+      "$kind: brief does not close a declared long wait"
+    assert_line "$path_line" "$brief" \
+      "$kind: brief does not anchor firstmate's relative paths to the absolute home"
+    if [ "$kind" = scout ]; then
+      assert_no_grep "Pipeline hazards" "$brief" "scout brief must not carry ship-only pipeline hazards"
+      continue
+    fi
+    assert_line "9. Pipeline hazards:" "$brief" "$kind: brief missing the pipeline hazards rule"
+    assert_line "   - Before any rebase, compare your branch with its PR head, if it has one, in BOTH directions" "$brief" \
+      "$kind: brief missing the two-way rebase comparison hazard"
+    assert_line "     by commit subject, not sha (the pipeline rewrites shas); a branch behind its own PR silently" "$brief" \
+      "$kind: rebase hazard does not say to compare by subject rather than sha"
+    if [ "$kind" = local-only ]; then
+      assert_line "$local_line" "$brief" "local-only: brief does not tell the worker to run the suites itself"
+      assert_no_grep "$scoped_line" "$brief" "local-only: brief defers the full suite to a CI that never runs"
+      assert_no_grep "$green_line" "$brief" "local-only: brief carries the green-PR hazard with no PR"
+    else
+      assert_line "$scoped_line" "$brief" "$kind: brief missing the scoped-tests hazard"
+      assert_line "$green_line" "$brief" "$kind: brief missing the green-PR hazard"
+      assert_no_grep "$local_line" "$brief" "$kind: brief carries the local-only test line"
+    fi
+  done
+
+  FM_HOME="$home" FM_CLASSIFY_PAUSED_VERB=awaiting \
+    "$ROOT/bin/fm-brief.sh" brief-lessons-verb some-proj --mode no-mistakes >/dev/null 2>&1
+  # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
+  assert_grep '`awaiting: integration tests running, duration unknown`' "$home/data/brief-lessons-verb/brief.md" \
+    "long-wait shape did not follow the configured pause verb"
+  pass "fm-brief.sh: briefs teach the long-wait shape, absolute firstmate paths, and ship pipeline hazards"
+}
+
+# Regression guard for the existing safety contract: every ship mode must still
+# render the worktree-isolation assertion ahead of the branch step and the full
+# status protocol, line for line.
+test_existing_ship_contract_is_unchanged() {
+  local home id mode brief isolation_at branch_at line
+  home="$TMP_ROOT/contract-home"
+  mkdir -p "$home/data"
+  for mode in no-mistakes direct-PR local-only; do
+    id="brief-contract-$mode"
+    FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --mode "$mode" >/dev/null 2>&1
+    brief="$home/data/$id/brief.md"
+    assert_present "$brief" "$mode: brief was not scaffolded"
+    while IFS= read -r line; do
+      assert_line "$line" "$brief" "$mode: existing contract line was dropped or reworded: $line"
+    done <<EOF
+You are in a disposable git worktree of some-proj, at a detached HEAD on a clean default branch.
+**Verify isolation before anything else.** Run \`pwd -P\` and \`git rev-parse --show-toplevel\`; both must resolve to the disposable task worktree you were launched in, such as a treehouse pool path or an Orca-managed worktree, not the primary checkout firstmate operates from.
+The path check is authoritative: \`git rev-parse --git-dir\` and \`git rev-parse --git-common-dir\` can help inspect the repo, but they do not prove you are outside the primary checkout.
+If the top-level path is the primary checkout or not the worktree you were launched in, STOP - do not branch or commit here - append \`blocked: launched in primary checkout, not an isolated worktree\` to the status file and stop.
+2. Stay inside this worktree; modify nothing outside it except the status file and the resource record below.
+4. Report status by appending one line:
+   \`echo "{state}: {one short line}" >> '$home/state/$id.status'\`
+   States: working, needs-decision, blocked, paused, done, failed.
+   Each append wakes firstmate, so report sparingly: only phase changes a supervisor
+   would act on (setup done, bug reproduced, fix implemented, validation passed) and the
+   needs-decision/blocked/paused/done/failed states. No step-by-step FYI progress lines;
+   firstmate reads your pane for that.
+   A mid-task \`working:\` line (including setup complete) is nonterminal: do not end the
+   turn after it; continue the same stage until a defined \`done:\` gate under Definition of done.
+   Use \`paused: {why}\` - distinct from \`blocked:\` - ONLY when you are deliberately idling on a
+   known external wait you expect to clear on its own (an upstream release, a rate-limit reset,
+   a scheduled window): firstmate then leaves your idle pane alone and rechecks it on a long
+   cadence instead of treating it as a possible wedge. Use \`blocked:\` when you are stuck and need help.
+5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.
+   A decision or blocker you opened stays open until a \`resolved\` line carrying its exact key lands; a later \`done:\` or \`working:\` line never closes it, even when the answer is what started that work.
+   Firstmate's reply normally writes that closing line at answer time; when a blocker or wait clears WITHOUT a firstmate reply, append \`resolved: {how it cleared}\` yourself (same \`[key=<slug>]\` if you opened it with one) as you resume.
+7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
+   daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
+8. If you start anything that keeps running outside this worktree - a database or
+Delivery contract: mode=$mode
+EOF
+    isolation_at=$(grep -nF -- '**Verify isolation before anything else.**' "$brief" | cut -d: -f1)
+    branch_at=$(grep -nF -- "1. First action: create your branch: \`git checkout -b fm/$id\`" "$brief" | cut -d: -f1)
+    [ -n "$isolation_at" ] && [ -n "$branch_at" ] && [ "$isolation_at" -lt "$branch_at" ] \
+      || fail "$mode: worktree-isolation assertion no longer precedes the branch step"
+  done
+  pass "fm-brief.sh: the worktree-isolation assertion and status protocol survive in every ship mode"
+}
+
 # Scout and secondmate paths still scaffold well-formed briefs.
 test_scout_and_secondmate_scaffold() {
   local brief
@@ -828,3 +939,5 @@ test_secondmate_directory_paths_are_absolute_and_output_is_stable
 test_pause_verb_override_renders_all_brief_scaffolds
 test_scout_and_secondmate_load_decision_hold_policy
 test_scout_and_secondmate_scaffold
+test_briefs_teach_long_wait_paths_and_hazards
+test_existing_ship_contract_is_unchanged

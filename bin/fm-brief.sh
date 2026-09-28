@@ -49,6 +49,20 @@
 # declared-external-wait verb (FM_CLASSIFY_PAUSED_VERB, default "paused") from
 # "blocked:": pause for a known external wait expected to clear on its own,
 # blocked when firstmate must act.
+# Crewmate ship and scout briefs also tell the worker to declare a long run it
+# starts and waits on with that verb ("<verb>: <what>, duration unknown") and to
+# resolve it when the run ends, so a quiet pane never reads as a wedge.
+# Crewmate ship and scout briefs anchor firstmate's relative data/ and state/
+# paths to the absolute directories: the {TASK} text is filled after scaffolding,
+# so the scaffold cannot rewrite paths in it, and a crewmate's working directory is
+# a project worktree where those relative paths do not resolve. Every path the
+# scaffold itself writes is absolute.
+# Ship briefs carry a rule 9 of pipeline hazards built per delivery mode. Every
+# mode compares a branch with its PR head, if it has one, both ways by commit
+# subject before rebasing. no-mistakes and direct-PR also test only what the
+# change touches (CI runs the full suite) and never treat a green PR as proof of
+# the head the worker intends to ship; local-only, where nothing else runs the
+# tests, instead runs the relevant suites before reporting ready in branch.
 # Crewmate ship and scout briefs both carry the external-resource rule: a worker
 # that starts a service container records it with bin/fm-resource.sh, because
 # cleanup can only stop what is recorded and never guesses a name. A charter does
@@ -315,6 +329,7 @@ $HERDR_SECTION
 # Setup
 You are in a disposable git worktree of $REPO, at a detached HEAD on a clean default branch.
 This is a SCOUT task: the deliverable is a written report, not a PR.
+Firstmate's paths do not resolve from this worktree: a \`data/...\` or \`state/...\` path in the task above means \`$DATA/...\` or \`$STATE/...\`, and every path this scaffold writes below is already absolute.
 The worktree is your laboratory - install, run, edit, and make scratch commits freely; all of it is discarded at teardown.
 The report is the only thing that survives, so anything worth keeping must be in it.
 
@@ -332,6 +347,9 @@ The report is the only thing that survives, so anything worth keeping must be in
    known external wait you expect to clear on its own (an upstream release, a rate-limit reset):
    firstmate then leaves your idle pane alone and rechecks it on a long cadence instead of
    treating it as a possible wedge. Use \`blocked:\` when you are stuck and need help.
+   A long run you start and then wait on counts: the moment you start one (a CI wait, a slow suite,
+   a long build), append a line shaped like \`$PAUSED_VERB: integration tests running, duration unknown\`,
+   then \`resolved: {what finished}\` when it ends, so a quiet pane never reads as a wedge.
 5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.
 6. If a decision belongs to a human (product choices, destructive actions),
    append \`needs-decision: {summary of options}\` and stop. Firstmate will reply with the decision.
@@ -364,10 +382,14 @@ fi
 # delivery mode, validated above. The generated DOD opens with the fixed
 # "Delivery contract: mode=<mode>" line that bin/fm-spawn.sh checks against its own
 # explicit --mode before launching.
+CI_HAZARD_TESTS='   - Run only the tests your change touches; leave the full suite to CI, which shards it.'
+CI_HAZARD_PR=$'\n   - A green PR describes the head the forge last saw, not what you intend to ship.'
 case "$MODE" in
   direct-PR)
     SETUP2=""
     RULE1='1. Never push to the default branch (push only your `fm/'"$ID"'` branch). Never merge a PR.'
+    HAZARD_TESTS=$CI_HAZARD_TESTS
+    HAZARD_PR=$CI_HAZARD_PR
     IFS= read -r -d '' DOD <<EOF || true
 # Definition of done
 Delivery contract: mode=direct-PR
@@ -380,6 +402,8 @@ EOF
   local-only)
     SETUP2=""
     RULE1="1. Never push to any remote and never open a PR. Work only on your \`fm/$ID\` branch; firstmate handles the merge into local \`main\`."
+    HAZARD_TESTS='   - Nothing else runs the tests for this branch: run the relevant suites yourself before reporting ready in branch.'
+    HAZARD_PR=
     IFS= read -r -d '' DOD <<EOF || true
 # Definition of done
 Delivery contract: mode=local-only
@@ -394,6 +418,8 @@ EOF
     SETUP2="
 2. Run \`no-mistakes doctor\`; if it reports the repo is not initialized here, run \`no-mistakes init\`."
     RULE1='1. Never push to the default branch. Never merge a PR.'
+    HAZARD_TESTS=$CI_HAZARD_TESTS
+    HAZARD_PR=$CI_HAZARD_PR
     IFS= read -r -d '' DOD <<EOF || true
 # Definition of done
 Delivery contract: mode=no-mistakes
@@ -433,6 +459,7 @@ $HERDR_SECTION
 
 # Setup
 You are in a disposable git worktree of $REPO, at a detached HEAD on a clean default branch.
+Firstmate's paths do not resolve from this worktree: a \`data/...\` or \`state/...\` path in the task above means \`$DATA/...\` or \`$STATE/...\`, and every path this scaffold writes below is already absolute.
 
 **Verify isolation before anything else.** Run \`pwd -P\` and \`git rev-parse --show-toplevel\`; both must resolve to the disposable task worktree you were launched in, such as a treehouse pool path or an Orca-managed worktree, not the primary checkout firstmate operates from.
 The path check is authoritative: \`git rev-parse --git-dir\` and \`git rev-parse --git-common-dir\` can help inspect the repo, but they do not prove you are outside the primary checkout.
@@ -457,6 +484,9 @@ $RULE1
    known external wait you expect to clear on its own (an upstream release, a rate-limit reset,
    a scheduled window): firstmate then leaves your idle pane alone and rechecks it on a long
    cadence instead of treating it as a possible wedge. Use \`blocked:\` when you are stuck and need help.
+   A long run you start and then wait on counts: the moment you start one (a CI wait, a slow suite,
+   a long build), append a line shaped like \`$PAUSED_VERB: integration tests running, duration unknown\`,
+   then \`resolved: {what finished}\` when it ends, so a quiet pane never reads as a wedge.
 5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.
 6. If a decision belongs above the implementation worker (product choices, destructive actions, ask-user findings),
    append \`needs-decision: {summary of options}\` and stop. Firstmate will apply the configured authority and reply with the decision.
@@ -473,6 +503,11 @@ $RULE1
    containers share that daemon. Anything you leave unrecorded outlives this task and
    holds its memory forever. If you stop one yourself, drop it again with
    \`FM_HOME=$FM_HOME_Q $FM_ROOT/bin/fm-resource.sh forget $ID container {name}\`.
+9. Pipeline hazards:
+$HAZARD_TESTS
+   - Before any rebase, compare your branch with its PR head, if it has one, in BOTH directions
+     by commit subject, not sha (the pipeline rewrites shas); a branch behind its own PR silently
+     drops the missing commit when rebased.$HAZARD_PR
 
 # Project memory
 If \`AGENTS.md\` or \`CLAUDE.md\` already exists, or if this task produced durable project-intrinsic knowledge, run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree.
