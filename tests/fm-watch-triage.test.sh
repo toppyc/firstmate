@@ -2127,6 +2127,7 @@ test_heartbeat_backstop_surfaces_unsurfaced_status() {
   # per-poll signal scan stays quiet) but which was never surfaced (no
   # .hb-surfaced-* marker). This stands in for a per-wake-path miss; the heartbeat
   # fleet-scan backstop must catch it and wake firstmate.
+  printf 'kind=ship\n' > "$state/miss.meta"
   printf 'done: PR https://example.test/pr/5\n' > "$state/miss.status"
   sig=$(seen_sig "$state/miss.status"); printf '%s' "$sig" > "$state/.seen-miss_status"
   PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 \
@@ -2139,6 +2140,26 @@ test_heartbeat_backstop_surfaces_unsurfaced_status() {
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the backstop heartbeat failed"
   grep "$(printf '\theartbeat\t')" "$drain_out" >/dev/null || fail "backstop heartbeat was not queued"
   pass "heartbeat backstop fail-safe surfaces a captain-relevant status the per-wake path missed"
+}
+
+test_heartbeat_backstop_skips_unowned_status() {
+  local dir state fakebin out pid
+  dir=$(make_case heartbeat-backstop-unowned); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  # A captain-relevant status for a task this home no longer supervises: no
+  # .meta and no other gone.* record. The per-poll scan already skips it; the
+  # heartbeat backstop must not surface it either.
+  printf 'blocked: leaked writer\n' > "$state/gone.status"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=1 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "heartbeat backstop woke for an unowned status: $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || fail "unowned status printed a wake reason: $(cat "$out")"
+  [ ! -s "$state/.wake-queue" ] || fail "unowned status enqueued a durable wake record"
+  [ ! -e "$state/.hb-surfaced-gone" ] || fail "heartbeat backstop wrote a surfaced marker for an unowned status"
+  reap "$pid"
+  pass "heartbeat backstop skips a captain-relevant status no task owns"
 }
 
 # --- beacon stays fresh while absorbing -------------------------------------
@@ -2283,6 +2304,7 @@ test_procevent_surface_crash_boundaries
 test_procevent_marker_failure_exits_and_replays
 test_heartbeat_no_change_absorbed
 test_heartbeat_backstop_surfaces_unsurfaced_status
+test_heartbeat_backstop_skips_unowned_status
 test_beacon_stays_fresh_while_absorbing
 test_afk_present_reverts_watcher_to_one_shot
 test_afk_paused_changed_pane_hands_off_plain_stale
