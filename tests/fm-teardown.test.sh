@@ -1400,6 +1400,39 @@ test_teardown_retires_supervision_bookkeeping() {
   pass "teardown retires every supervision marker for its task and endpoint, and no other task's"
 }
 
+# A remote secondmate is retired on its host by a teardown whose state is the
+# home's own parent-route directory (bin/fm-remote-secondmate-control.sh retire),
+# so removing the home also removes the .meta before the bookkeeping retire.
+test_secondmate_teardown_with_state_inside_its_home_completes() {
+  local case_dir home state rc
+  case_dir=$(make_case secondmate-state-in-home)
+  home="$case_dir/secondmate-home"
+  state="$home/state/parent-route"
+  mkdir -p "$state" "$home/data" "$home/config" "$home/projects"
+  printf '%s\n' task-x1 > "$home/.fm-secondmate-home"
+  fm_write_meta "$state/task-x1.meta" \
+    "window=firstmate:fm-task-x1" \
+    "endpoint_task_id=task-x1" \
+    "worktree=$home" \
+    "project=$case_dir/project" \
+    "kind=secondmate" \
+    "mode=local-only" \
+    "home=$home"
+
+  set +e
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$home/data/.parent-route" \
+    FM_CONFIG_OVERRIDE="$home/config" PATH="$case_dir/fakebin:$PATH" \
+    "$TEARDOWN" task-x1 > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "secondmate-state-in-home: teardown should succeed"
+  assert_grep "teardown task-x1 complete" "$case_dir/stdout" \
+    "secondmate-state-in-home: cleanup did not complete"
+  [ ! -e "$home" ] || fail "secondmate-state-in-home: teardown did not remove the secondmate home"
+  pass "secondmate teardown completes when its state lives inside the home it removes"
+}
+
 # Flat (non-projected) Herdr endpoint whose fake pane exists until a locked
 # close removes it. The socket path is case-local so the derived presentation
 # lock never collides with another test or a real fleet session.
@@ -3202,6 +3235,7 @@ test_local_only_force_overrides_unpushed
 test_teardown_missing_busy_sidecar_completes
 test_herdr_teardown_clears_escalation_marker
 test_teardown_retires_supervision_bookkeeping
+test_secondmate_teardown_with_state_inside_its_home_completes
 test_herdr_flat_teardown_refuses_orphaning_records_then_retry_completes
 test_herdr_flat_teardown_refuses_records_on_unparseable_presence
 test_herdr_flat_teardown_preflight_refuses_before_changes

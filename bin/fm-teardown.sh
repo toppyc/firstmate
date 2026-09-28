@@ -524,6 +524,10 @@ BACKEND=$FM_BACKEND_VALIDATED_BACKEND
 T=$FM_BACKEND_VALIDATED_TARGET
 WT=$(fm_meta_get "$META" worktree)
 PROJ=$(fm_meta_get "$META" project)
+# The endpoint the watcher keys its bookkeeping on, read while the .meta is
+# certainly present: a secondmate retired through its own parent-route state
+# loses this .meta with the home before the bookkeeping retire runs.
+TASK_ENDPOINT=$(fm_backend_target_of_meta "$META")
 T_ORCA=
 [ "$BACKEND" != orca ] || T_ORCA=$T
 if [ "${FM_TEARDOWN_GUARD_DONE:-0}" != 1 ]; then
@@ -2953,7 +2957,6 @@ fi
 fm_lock_remove_path "$(fm_resource_lock_path "$STATE" "$ID")" || true
 # The watcher's own per-task and per-endpoint bookkeeping goes last, after the
 # .meta that makes the task visible to the watcher, so no later cycle re-creates it.
-TASK_ENDPOINT=$(fm_backend_target_of_meta "$META")
 rm -f "$STATE/$ID.turn-ended" "$STATE/$ID.meta" \
   "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" \
   "$STATE/$ID.kimi-turnend-token" "$STATE/$ID.muse-session" \
