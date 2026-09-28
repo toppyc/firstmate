@@ -531,11 +531,14 @@ age_of() {  # seconds since file mtime; "due immediately" if missing
 # strict -nt comparison. Pure read: prints one "<seen-file>\t<sig>\t<file>"
 # line per changed file. .seen-* is updated only after the wake is either
 # surfaced or intentionally absorbed, so a watcher killed mid-cycle never
-# swallows a signal.
+# swallows a signal. A signal no task in this home owns (fm_wake_signal_unowned
+# in bin/fm-wake-lib.sh) is skipped here, the one place both signal kinds enter
+# the queue, and leaves no bookkeeping behind.
 scan_signals() {
   local f sig sf
   for f in "$STATE"/*.status "$STATE"/*.turn-ended; do
     [ -e "$f" ] || continue
+    ! fm_wake_signal_unowned "$STATE" "$f" || continue
     sig=$(fm_wake_signal_sig "$f") || continue
     [ -n "$sig" ] || continue
     sf=$(fm_wake_signal_seen_path "$STATE" "$f")

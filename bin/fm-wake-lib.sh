@@ -1037,6 +1037,70 @@ fm_wake_signal_seen_path() {  # <state> <file>
   printf '%s/.seen-%s' "$1" "$(basename "$2" | tr '.' '_')"
 }
 
+# Signal ownership - the one test of whether a state/<id>.status or
+# state/<id>.turn-ended file belongs to a task this home supervises.
+# Returns 0 (unowned: queue nothing) only when <id> has no <id>.meta AND the
+# signal file is the only state/<id>.* record left in this home. That is the
+# shape of a torn-down task whose marker was re-created by a writer outside
+# this home's control (a leaked turn-end hook), because teardown retires every
+# per-task record. A task whose .meta was removed wrongly still holds its other
+# records (its status log beside a turn-end marker, busy state, hook tokens,
+# PR poll, and similar), so it stays owned and keeps waking: that is a fault the
+# supervisor must see. Anything else, including an unrecognized filename,
+# returns 1 so uncertainty reads as owned.
+fm_wake_signal_unowned() {  # <state> <signal-file>
+  local state=$1 base id rec
+  base=${2##*/}
+  case "$base" in
+    *.status) id=${base%.status} ;;
+    *.turn-ended) id=${base%.turn-ended} ;;
+    *) return 1 ;;
+  esac
+  [ -n "$id" ] || return 1
+  if [ -e "$state/$id.meta" ] || [ -L "$state/$id.meta" ]; then
+    return 1
+  fi
+  for rec in "$state/$id".*; do
+    [ -e "$rec" ] || [ -L "$rec" ] || continue
+    [ "${rec##*/}" = "$base" ] || return 1
+  done
+  return 0
+}
+
+# Per-task supervision bookkeeping - the one list of the dot-files the watcher
+# (bin/fm-watch.sh), its heartbeat backstop (bin/fm-push-transition-lib.sh),
+# and the away-mode daemon (bin/fm-supervise-daemon.sh) key on a task id or on
+# its recorded endpoint (bin/fm-backend.sh fm_backend_target_of_meta). Both key
+# forms map ':', '/', and '.' to '_' exactly as those writers do. Teardown
+# retires every path printed here; a writer that adds a new per-task or
+# per-endpoint marker adds it here too.
+fm_wake_task_bookkeeping_paths() {  # <state> <task-id> [<endpoint>]
+  local state=$1 id=$2 endpoint=${3:-} key name
+  fm_wake_signal_seen_path "$state" "$state/$id.status"; printf '\n'
+  fm_wake_signal_seen_path "$state" "$state/$id.turn-ended"; printf '\n'
+  key=$(printf '%s' "$id" | tr ':/.' '___')
+  for name in hb-surfaced subsuper-seen-status subsuper-stale subsuper-paused; do
+    printf '%s/.%s-%s\n' "$state" "$name" "$key"
+  done
+  [ -n "$endpoint" ] || return 0
+  key=$(printf '%s' "$endpoint" | tr ':/.' '___')
+  for name in hash count stale stale-since wedge-escalations \
+    paused paused-rechecked paused-resurfaced; do
+    printf '%s/.%s-%s\n' "$state" "$name" "$key"
+  done
+}
+
+fm_wake_task_bookkeeping_retire() {  # <state> <task-id> [<endpoint>]
+  local path rc=0
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    rm -f -- "$path" || rc=1
+  done <<EOF
+$(fm_wake_task_bookkeeping_paths "$@")
+EOF
+  return "$rc"
+}
+
 # 0 when <file>'s current signature exactly matches its recorded seen marker,
 # meaning every byte in it was already surfaced or deliberately absorbed.
 # A missing marker or unreadable signature is NOT a match, so uncertainty reads

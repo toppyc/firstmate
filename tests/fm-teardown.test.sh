@@ -1361,6 +1361,45 @@ SH
   pass "herdr teardown removes pane-owned escalation dedupe state"
 }
 
+# Every per-task and per-endpoint marker the supervision layer writes, named
+# here the way each writer names it: the watcher's signal seen markers
+# (bin/fm-wake-lib.sh fm_wake_signal_seen_path), the heartbeat backstop's
+# surfaced marker (bin/fm-push-transition-lib.sh), the away-mode daemon's
+# task-keyed markers (bin/fm-supervise-daemon.sh), and the watcher's
+# endpoint-keyed pane and pause markers (bin/fm-watch.sh pause_key). A torn-down
+# task must leave none of them, while a neighbouring task's markers, including
+# one whose id shares this id as a prefix, must survive.
+test_teardown_retires_supervision_bookkeeping() {
+  local case_dir state rc name ep other left
+  case_dir=$(make_landed_case bookkeeping-retire)
+  state="$case_dir/state"
+  ep=firstmate_fm-task-x1
+  other=firstmate_fm-task-x10
+  : > "$state/task-x1.turn-ended"
+  for name in .seen-task-x1_status .seen-task-x1_turn-ended .hb-surfaced-task-x1 \
+    .subsuper-seen-status-task-x1 .subsuper-stale-task-x1 .subsuper-paused-task-x1 \
+    ".hash-$ep" ".count-$ep" ".stale-$ep" ".stale-since-$ep" ".wedge-escalations-$ep" \
+    ".paused-$ep" ".paused-rechecked-$ep" ".paused-resurfaced-$ep" \
+    .seen-task-x10_status .hb-surfaced-task-x10 ".hash-$other" ".paused-$other"; do
+    printf 'x\n' > "$state/$name"
+  done
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "bookkeeping-retire: teardown should succeed"
+  assert_grep "teardown task-x1 complete" "$case_dir/stdout" "bookkeeping-retire: cleanup did not complete"
+  left=$(find "$state" -mindepth 1 -maxdepth 1 -exec basename {} \; \
+    | grep -E '(^|[._-])task-x1([._]|$)|firstmate_fm-task-x1$' || true)
+  [ -z "$left" ] || fail "bookkeeping-retire: teardown left per-task records behind:"$'\n'"$left"
+  for name in .seen-task-x10_status .hb-surfaced-task-x10 ".hash-$other" ".paused-$other"; do
+    [ -e "$state/$name" ] || fail "bookkeeping-retire: teardown removed another task's marker $name"
+  done
+  pass "teardown retires every supervision marker for its task and endpoint, and no other task's"
+}
+
 # Flat (non-projected) Herdr endpoint whose fake pane exists until a locked
 # close removes it. The socket path is case-local so the derived presentation
 # lock never collides with another test or a real fleet session.
@@ -3162,6 +3201,7 @@ test_no_mistakes_truly_unpushed_refuses
 test_local_only_force_overrides_unpushed
 test_teardown_missing_busy_sidecar_completes
 test_herdr_teardown_clears_escalation_marker
+test_teardown_retires_supervision_bookkeeping
 test_herdr_flat_teardown_refuses_orphaning_records_then_retry_completes
 test_herdr_flat_teardown_refuses_records_on_unparseable_presence
 test_herdr_flat_teardown_preflight_refuses_before_changes

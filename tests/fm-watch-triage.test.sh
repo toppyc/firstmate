@@ -386,6 +386,7 @@ test_secondmate_status_signal_never_absorbed_classifier() {
 test_provably_working_signal_absorbed() {
   local dir state fakebin out status_file pid
   dir=$(make_case provably-working-signal); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  printf 'kind=ship\n' > "$state/task.meta"
   status_file="$state/task.status"
   printf 'working: compiling step 2\n' > "$status_file"
   # The crew's pipeline is in an actively-running step: positive evidence it is
@@ -408,6 +409,7 @@ test_provably_working_signal_absorbed() {
 test_turn_ended_provably_working_absorbed() {
   local dir state fakebin out pid
   dir=$(make_case turn-ended-working); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  printf 'kind=ship\n' > "$state/task.meta"
   : > "$state/task.turn-ended"
   # A busy pane is the second form of positive evidence (covers a queued
   # continuation right after the turn-end).
@@ -431,6 +433,7 @@ test_turn_ended_provably_working_absorbed() {
 test_turn_ended_not_working_surfaced() {
   local dir state fakebin out drain_out pid
   dir=$(make_case turn-ended-stopped); state="$dir/state"; fakebin="$dir/fakebin"
+  printf 'kind=ship\n' > "$state/task.meta"
   out="$dir/watch.out"; drain_out="$dir/drain.out"
   : > "$state/task.turn-ended"
   # No running pipeline, no busy pane: the crew has stopped (e.g. it finished via
@@ -448,6 +451,7 @@ test_turn_ended_not_working_surfaced() {
 test_working_note_not_working_surfaced() {
   local dir state fakebin out drain_out status_file pid
   dir=$(make_case working-note-stopped); state="$dir/state"; fakebin="$dir/fakebin"
+  printf 'kind=ship\n' > "$state/task.meta"
   out="$dir/watch.out"; drain_out="$dir/drain.out"
   status_file="$state/task.status"
   printf 'working: compiling step 2\n' > "$status_file"
@@ -488,6 +492,7 @@ test_secondmate_status_note_surfaced_despite_busy_agent() {
 test_self_announced_close_does_not_rewake_but_next_note_does() {
   local dir state fakebin out status_file pid rc
   dir=$(make_case self-close-quiet); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  printf 'kind=ship\n' > "$state/task.meta"
   status_file="$state/task.status"
   printf 'needs-decision [key=k1]: pick one\n' > "$status_file"
   prime_status_seen "$state" "$status_file" || fail "could not prime the announced baseline"
@@ -521,6 +526,7 @@ test_self_announced_close_does_not_rewake_but_next_note_does() {
 test_actionable_signal_surfaced() {
   local dir state fakebin out drain_out status_file pid
   dir=$(make_case actionable-signal); state="$dir/state"; fakebin="$dir/fakebin"
+  printf 'kind=ship\n' > "$state/task.meta"
   out="$dir/watch.out"; drain_out="$dir/drain.out"
   status_file="$state/task.status"
   printf 'working: setup\nneeds-decision: pick A or B\n' > "$status_file"
@@ -532,6 +538,80 @@ test_actionable_signal_surfaced() {
   grep "$(printf '\tsignal\t')" "$drain_out" | grep -F "$status_file" >/dev/null || fail "actionable signal was not queued"
   [ -s "$state/.hb-surfaced-task" ] || fail "actionable signal did not record the surfaced marker"
   pass "captain-relevant signal is surfaced (queue + exit) and marked surfaced"
+}
+
+# --- signal ownership: an id no task in this home owns queues nothing --------
+# A torn-down task's .turn-ended or .status re-created by a writer outside this
+# home (a leaked turn-end hook) is noise; a task whose .meta vanished while its
+# other records remain is a fault and must keep waking. bin/fm-wake-lib.sh
+# fm_wake_signal_unowned owns the distinction.
+
+test_unowned_signal_not_queued() {
+  local dir state fakebin out pid kind
+  for kind in turn-ended status; do
+    dir=$(make_case "unowned-$kind"); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+    if [ "$kind" = status ]; then
+      # A captain-relevant verb, so only ownership can keep it off the queue.
+      printf 'blocked: still here after teardown\n' > "$state/gone.status"
+    else
+      : > "$state/gone.turn-ended"
+    fi
+    # A stopped crew, so an owned signal would surface.
+    export FM_FAKE_CREW_STATE='state: unknown · source: none · no current-state source available'
+    watch_bg "$state" "$fakebin" "$out"
+    pid=$!
+    if ! wait_live "$pid" 30; then
+      reap "$pid"; fail "watcher surfaced a .$kind for a task id with no .meta: $(cat "$out")"
+    fi
+    reap "$pid"
+    [ ! -s "$out" ] || fail "unowned .$kind printed a wake reason: $(cat "$out")"
+    [ ! -s "$state/.wake-queue" ] || fail "unowned .$kind enqueued a durable wake record"
+    [ ! -e "$state/.seen-gone_$(printf '%s' "$kind" | tr '.' '_')" ] \
+      || fail "unowned .$kind left watcher bookkeeping behind"
+  done
+  pass "a .turn-ended or .status for a task id with no .meta and no other record queues no wake"
+}
+
+test_signal_with_lost_meta_still_surfaces() {
+  local dir state fakebin out drain_out pid
+  dir=$(make_case lost-meta); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"
+  # The .meta is gone but the task's busy-state generation survives: teardown
+  # never ran, so this is a wrongly deleted record, not a retired task.
+  printf 'g1.1.1\n' > "$state/lost.busy-gen"
+  : > "$state/lost.turn-ended"
+  export FM_FAKE_CREW_STATE='state: unknown · source: none · no current-state source available'
+  watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "watcher did not surface a turn-end whose task lost its .meta but kept its records"
+  grep -F "signal: $state/lost.turn-ended" "$out" >/dev/null || fail "lost-meta turn-end signal was not printed"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the lost-meta signal failed"
+  grep "$(printf '\tsignal\t')" "$drain_out" | grep -F "$state/lost.turn-ended" >/dev/null \
+    || fail "lost-meta turn-end was not queued"
+  pass "a signal whose task lost its .meta but kept its other records still surfaces"
+}
+
+test_owned_signals_unaffected() {
+  local dir state fakebin out drain_out pid kind
+  for kind in turn-ended status; do
+    dir=$(make_case "owned-$kind"); state="$dir/state"; fakebin="$dir/fakebin"
+    out="$dir/watch.out"; drain_out="$dir/drain.out"
+    printf 'kind=ship\n' > "$state/live.meta"
+    if [ "$kind" = status ]; then
+      printf 'needs-decision: pick A or B\n' > "$state/live.status"
+    else
+      : > "$state/live.turn-ended"
+    fi
+    export FM_FAKE_CREW_STATE='state: unknown · source: none · no current-state source available'
+    watch_bg "$state" "$fakebin" "$out"
+    pid=$!
+    wait_for_exit "$pid" 40 || fail "watcher did not surface a live task's .$kind"
+    grep -F "signal: $state/live.$kind" "$out" >/dev/null || fail "live .$kind signal was not printed"
+    FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the live .$kind failed"
+    grep "$(printf '\tsignal\t')" "$drain_out" | grep -F "$state/live.$kind" >/dev/null \
+      || fail "live .$kind was not queued"
+  done
+  pass "a live task's .turn-ended and .status still surface and queue"
 }
 
 test_terminal_stale_surfaced() {
@@ -1713,6 +1793,7 @@ test_nonterminal_stale_repairs_missing_or_corrupt_timer() {
 test_triage_log_size_cap_accepts_spaced_wc_counts() {
   local dir state fakebin out status_file pid lines i
   dir=$(make_case triage-log-spaced-wc); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  printf 'kind=ship\n' > "$state/task.meta"
   i=1
   while [ "$i" -le 3000 ]; do
     printf 'old line %04d\n' "$i" >> "$state/.watch-triage.log"
@@ -2065,6 +2146,7 @@ test_heartbeat_backstop_surfaces_unsurfaced_status() {
 test_beacon_stays_fresh_while_absorbing() {
   local dir state fakebin out status_file pid m1 m2 now
   dir=$(make_case beacon-fresh); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  printf 'kind=ship\n' > "$state/task.meta"
   status_file="$state/task.status"
   printf 'working: a\n' > "$status_file"
   # Provably working so the working: notes are absorbed (the path that must keep the
@@ -2095,6 +2177,7 @@ test_beacon_stays_fresh_while_absorbing() {
 test_afk_present_reverts_watcher_to_one_shot() {
   local dir state fakebin out drain_out status_file pid
   dir=$(make_case afk-coherence); state="$dir/state"; fakebin="$dir/fakebin"
+  printf 'kind=ship\n' > "$state/task.meta"
   out="$dir/watch.out"; drain_out="$dir/drain.out"
   status_file="$state/task.status"
   printf 'working: routine note\n' > "$status_file"
@@ -2163,6 +2246,9 @@ test_working_note_not_working_surfaced
 test_secondmate_status_note_surfaced_despite_busy_agent
 test_self_announced_close_does_not_rewake_but_next_note_does
 test_actionable_signal_surfaced
+test_unowned_signal_not_queued
+test_signal_with_lost_meta_still_surfaces
+test_owned_signals_unaffected
 test_terminal_stale_surfaced
 test_stale_terminal_status_overridden_by_active_run
 test_nonterminal_stale_provably_working_absorbed_then_escalated

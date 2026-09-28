@@ -415,7 +415,7 @@ remote_outbox_cleanup() {
 }
 
 remote_secondmate_teardown() {
-  local remote_host remote_root remote_home kind route_host route_root route_home out rc tmp rec phase task_id
+  local remote_host remote_root remote_home kind route_host route_root route_home out rc tmp rec phase task_id endpoint
   remote_host=$(fm_meta_get "$META" remote_host)
   [ -n "$remote_host" ] || return 3
   kind=$(fm_meta_get "$META" kind)
@@ -484,7 +484,9 @@ remote_secondmate_teardown() {
   grep -vE "^- $ID( |$)" "$SECONDMATE_REG" > "$tmp" || true
   mv -f -- "$tmp" "$SECONDMATE_REG"
   status_retire_presentation_task "$STATE" "$ID" || return 1
+  endpoint=$(fm_backend_target_of_meta "$META")
   rm -f -- "$STATE/$ID.meta" "$STATE/$ID.turn-ended"
+  fm_wake_task_bookkeeping_retire "$STATE" "$ID" "$endpoint" || return 1
   printf 'teardown %s complete (remote %s:%s)\n' "$ID" "$remote_host" "$remote_home"
   return 0
 }
@@ -2583,6 +2585,7 @@ cleanup_firstmate_home_children() {
       "$sub_state/$child_id.grok-turnend-token" "$sub_state/$child_id.kimi-turnend-token" \
       "$sub_state/$child_id.muse-session" "$sub_state/$child_id.muse-session-current" \
       "$sub_state/$child_id.cursor-session"
+    fm_wake_task_bookkeeping_retire "$sub_state" "$child_id" "$child_t" || return 1
   done
 }
 
@@ -2950,12 +2953,16 @@ fi
 # fail against a hold nothing owns. fm_resource_lock_path keeps its location in
 # one place, and fm_lock_remove_path takes the owner directory with it.
 fm_lock_remove_path "$(fm_resource_lock_path "$STATE" "$ID")" || true
+# The watcher's own per-task and per-endpoint bookkeeping goes last, after the
+# .meta that makes the task visible to the watcher, so no later cycle re-creates it.
+TASK_ENDPOINT=$(fm_backend_target_of_meta "$META")
 rm -f "$STATE/$ID.turn-ended" "$STATE/$ID.meta" \
   "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" \
   "$STATE/$ID.kimi-turnend-token" "$STATE/$ID.muse-session" \
   "$STATE/$ID.muse-session-current" "$STATE/$ID.cursor-session" \
   "$STATE/$ID.control-relaunch" "$STATE/$ID.control-relaunch.meta-prior" \
   "$STATE/$ID.control-relaunch.brief-prior" "$STATE/$ID.control-relaunch.note"
+fm_wake_task_bookkeeping_retire "$STATE" "$ID" "$TASK_ENDPOINT" || exit 1
 fm_lock_release "$META_LOCK"
 META_LOCK_HELD=0
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
