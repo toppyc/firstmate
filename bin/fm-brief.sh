@@ -57,9 +57,12 @@
 # so the scaffold cannot rewrite paths in it, and a crewmate's working directory is
 # a project worktree where those relative paths do not resolve. Every path the
 # scaffold itself writes is absolute.
-# Ship briefs carry three pipeline hazards: test only what the change touches,
-# compare a branch with its PR head both ways by commit subject before rebasing,
-# and never treat a green PR as proof of the head the worker intends to ship.
+# Ship briefs carry a rule 9 of pipeline hazards built per delivery mode. Every
+# mode compares a branch with its PR head, if it has one, both ways by commit
+# subject before rebasing. no-mistakes and direct-PR also test only what the
+# change touches (CI runs the full suite) and never treat a green PR as proof of
+# the head the worker intends to ship; local-only, where nothing else runs the
+# tests, instead runs the relevant suites before reporting ready in branch.
 # Crewmate ship and scout briefs both carry the external-resource rule: a worker
 # that starts a service container records it with bin/fm-resource.sh, because
 # cleanup can only stop what is recorded and never guesses a name. A charter does
@@ -379,10 +382,14 @@ fi
 # delivery mode, validated above. The generated DOD opens with the fixed
 # "Delivery contract: mode=<mode>" line that bin/fm-spawn.sh checks against its own
 # explicit --mode before launching.
+CI_HAZARD_TESTS='   - Run only the tests your change touches; leave the full suite to CI, which shards it.'
+CI_HAZARD_PR=$'\n   - A green PR describes the head the forge last saw, not what you intend to ship.'
 case "$MODE" in
   direct-PR)
     SETUP2=""
     RULE1='1. Never push to the default branch (push only your `fm/'"$ID"'` branch). Never merge a PR.'
+    HAZARD_TESTS=$CI_HAZARD_TESTS
+    HAZARD_PR=$CI_HAZARD_PR
     IFS= read -r -d '' DOD <<EOF || true
 # Definition of done
 Delivery contract: mode=direct-PR
@@ -395,6 +402,8 @@ EOF
   local-only)
     SETUP2=""
     RULE1="1. Never push to any remote and never open a PR. Work only on your \`fm/$ID\` branch; firstmate handles the merge into local \`main\`."
+    HAZARD_TESTS='   - Nothing else runs the tests for this branch: run the relevant suites yourself before reporting ready in branch.'
+    HAZARD_PR=
     IFS= read -r -d '' DOD <<EOF || true
 # Definition of done
 Delivery contract: mode=local-only
@@ -409,6 +418,8 @@ EOF
     SETUP2="
 2. Run \`no-mistakes doctor\`; if it reports the repo is not initialized here, run \`no-mistakes init\`."
     RULE1='1. Never push to the default branch. Never merge a PR.'
+    HAZARD_TESTS=$CI_HAZARD_TESTS
+    HAZARD_PR=$CI_HAZARD_PR
     IFS= read -r -d '' DOD <<EOF || true
 # Definition of done
 Delivery contract: mode=no-mistakes
@@ -493,11 +504,10 @@ $RULE1
    holds its memory forever. If you stop one yourself, drop it again with
    \`FM_HOME=$FM_HOME_Q $FM_ROOT/bin/fm-resource.sh forget $ID container {name}\`.
 9. Pipeline hazards:
-   - Run only the tests your change touches; leave the full suite to CI, which shards it.
-   - Before any rebase, compare your branch with its PR head in BOTH directions by commit
-     subject, not sha (the pipeline rewrites shas); a branch behind its own PR silently drops
-     the missing commit when rebased.
-   - A green PR describes the head the forge last saw, not what you intend to ship.
+$HAZARD_TESTS
+   - Before any rebase, compare your branch with its PR head, if it has one, in BOTH directions
+     by commit subject, not sha (the pipeline rewrites shas); a branch behind its own PR silently
+     drops the missing commit when rebased.$HAZARD_PR
 
 # Project memory
 If \`AGENTS.md\` or \`CLAUDE.md\` already exists, or if this task produced durable project-intrinsic knowledge, run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree.

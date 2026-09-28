@@ -786,7 +786,6 @@ test_scout_and_secondmate_load_decision_hold_policy() {
   pass "fm-brief.sh: investigation and visual-review completions load the shared decision policy"
 }
 
-# Scout and secondmate paths still scaffold well-formed briefs.
 # assert_line <exact-line> <file> <msg>: the brief must carry this whole line
 # verbatim, so a reworded or dropped contract line cannot pass on a substring.
 assert_line() {
@@ -795,10 +794,13 @@ assert_line() {
 
 # The four instructions firstmate used to hand-write into every brief: declare a
 # long wait with a copyable line shape, anchor firstmate's relative paths to the
-# absolute home, and (ship only) the three pipeline hazards.
+# absolute home, and (ship only) the pipeline hazards, gated per delivery mode.
 test_briefs_teach_long_wait_paths_and_hazards() {
-  local home id kind brief path_line
+  local home id kind brief path_line scoped_line green_line local_line
   home="$TMP_ROOT/lessons-home"
+  scoped_line="   - Run only the tests your change touches; leave the full suite to CI, which shards it."
+  green_line="   - A green PR describes the head the forge last saw, not what you intend to ship."
+  local_line="   - Nothing else runs the tests for this branch: run the relevant suites yourself before reporting ready in branch."
   mkdir -p "$home/data"
   path_line="Firstmate's paths do not resolve from this worktree: a \`data/...\` or \`state/...\` path in the task above means \`$home/data/...\` or \`$home/state/...\`, and every path this scaffold writes below is already absolute."
   for kind in no-mistakes direct-PR local-only scout; do
@@ -823,14 +825,19 @@ test_briefs_teach_long_wait_paths_and_hazards() {
       continue
     fi
     assert_line "9. Pipeline hazards:" "$brief" "$kind: brief missing the pipeline hazards rule"
-    assert_line "   - Run only the tests your change touches; leave the full suite to CI, which shards it." "$brief" \
-      "$kind: brief missing the scoped-tests hazard"
-    assert_line "   - Before any rebase, compare your branch with its PR head in BOTH directions by commit" "$brief" \
+    assert_line "   - Before any rebase, compare your branch with its PR head, if it has one, in BOTH directions" "$brief" \
       "$kind: brief missing the two-way rebase comparison hazard"
-    assert_line "     subject, not sha (the pipeline rewrites shas); a branch behind its own PR silently drops" "$brief" \
+    assert_line "     by commit subject, not sha (the pipeline rewrites shas); a branch behind its own PR silently" "$brief" \
       "$kind: rebase hazard does not say to compare by subject rather than sha"
-    assert_line "   - A green PR describes the head the forge last saw, not what you intend to ship." "$brief" \
-      "$kind: brief missing the green-PR hazard"
+    if [ "$kind" = local-only ]; then
+      assert_line "$local_line" "$brief" "local-only: brief does not tell the worker to run the suites itself"
+      assert_no_grep "$scoped_line" "$brief" "local-only: brief defers the full suite to a CI that never runs"
+      assert_no_grep "$green_line" "$brief" "local-only: brief carries the green-PR hazard with no PR"
+    else
+      assert_line "$scoped_line" "$brief" "$kind: brief missing the scoped-tests hazard"
+      assert_line "$green_line" "$brief" "$kind: brief missing the green-PR hazard"
+      assert_no_grep "$local_line" "$brief" "$kind: brief carries the local-only test line"
+    fi
   done
 
   FM_HOME="$home" FM_CLASSIFY_PAUSED_VERB=awaiting \
@@ -890,6 +897,7 @@ EOF
   pass "fm-brief.sh: the worktree-isolation assertion and status protocol survive in every ship mode"
 }
 
+# Scout and secondmate paths still scaffold well-formed briefs.
 test_scout_and_secondmate_scaffold() {
   local brief
   FM_HOME="$BRIEF_HOME" "$ROOT/bin/fm-brief.sh" brief-scout-q6 alpha --scout >/dev/null 2>&1 \
