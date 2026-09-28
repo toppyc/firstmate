@@ -31,7 +31,7 @@ In each home the scan considers only that home's long-inactive direct ordinary c
 A secondmate retains a durable receipt for its idempotent report through the established parent route, and main-home captain presentation retains a separate receipt; neither path performs a forge or PR check.
 Absorbed wakes advance their suppression markers, log to `state/.watch-triage.log`, and keep the watcher blocking without a queue record or LLM turn.
 A `.status` or `.turn-ended` file whose task has no `.meta` and no other `state/<id>.*` record belongs to no task this home supervises, so the watcher skips it, in its signal scan and its heartbeat backstop alike, without a queue record or marker; a task whose `.meta` vanished while its other records remain keeps waking, because that is a fault to surface (`bin/fm-wake-lib.sh` `fm_wake_signal_unowned`).
-Teardown retires the watcher's and the away-mode daemon's per-task and per-endpoint markers with the task's own records (`fm_wake_task_bookkeeping_paths`).
+Teardown of a task in this home retires the watcher's and the away-mode daemon's per-task and per-endpoint markers with the task's own records (`fm_wake_task_bookkeeping_paths`); retiring a remote secondmate does not yet.
 Each `fm-wake-drain.sh` presentation runs the same liveness guard as the supervision scripts, so a lapsed watcher chain surfaces even on a turn that only handles queued wakes.
 Routine watcher polling, supervision no-ops, elapsed waiting time, and absorbed benign wakes stay silent.
 A declared external wait trades that silence for one bounded recheck per pause window, so a forgotten pause cannot remain invisible indefinitely.
