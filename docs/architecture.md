@@ -30,6 +30,8 @@ Separately from heartbeat backoff and wedge handling, the watcher poll runs `bin
 In each home the scan considers only that home's long-inactive direct ordinary crewmates, excludes captain-held work, and accepts only `done` or `failed` from `bin/fm-crew-state.sh`.
 A secondmate retains a durable receipt for its idempotent report through the established parent route, and main-home captain presentation retains a separate receipt; neither path performs a forge or PR check.
 Absorbed wakes advance their suppression markers, log to `state/.watch-triage.log`, and keep the watcher blocking without a queue record or LLM turn.
+A `.status` or `.turn-ended` file whose task has no `.meta` and no other `state/<id>.*` record belongs to no task this home supervises, so the watcher skips it, in its signal scan and its heartbeat backstop alike, without a queue record or marker; a task whose `.meta` vanished while its other records remain keeps waking, because that is a fault to surface (`bin/fm-wake-lib.sh` `fm_wake_signal_unowned`).
+Teardown of a task in this home retires the watcher's and the away-mode daemon's per-task and per-endpoint markers with the task's own records (`fm_wake_task_bookkeeping_paths`); retiring a remote secondmate does not yet.
 Each `fm-wake-drain.sh` presentation runs the same liveness guard as the supervision scripts, so a lapsed watcher chain surfaces even on a turn that only handles queued wakes.
 Routine watcher polling, supervision no-ops, elapsed waiting time, and absorbed benign wakes stay silent.
 A declared external wait trades that silence for one bounded recheck per pause window, so a forgotten pause cannot remain invisible indefinitely.
@@ -158,7 +160,8 @@ Codex App support is recorded in `docs/codex-app-backend.md`; it is not selectab
 ## Worktrees, not branches in your checkout
 
 Crewmates never intentionally touch your project clone; [treehouse](https://github.com/kunchenguid/treehouse) pools clean worktrees for tmux, herdr, zellij, and cmux tasks, while Orca creates its own worktrees for `backend=orca`.
-For ship and scout work, `fm-spawn.sh` refuses to launch unless the resolved task path is a real git worktree root that is distinct from the project primary checkout.
+For ship and scout work, `fm-spawn.sh` refuses to launch unless the resolved task path is a real git worktree root that is distinct from the project primary checkout and is not the main worktree of the project's repository.
+It compares directories by file identity rather than spelling, because a case-insensitive filesystem gives one directory two spellings, and a Claude hook left in a primary checkout's `.claude/settings.local.json` fires for every Claude session in every linked worktree of that repository.
 `fm-spawn.sh` also owns the base-freshness boundary for every fresh ship and scout: no worker starts until its clean task worktree matches the fetched tip of origin's resolved default branch, and any unsafe or unverifiable base stops the spawn.
 Its header owns the exact refusal mechanics, while `tests/fm-spawn-pool-base-freshen.test.sh` owns the portable regression coverage.
 

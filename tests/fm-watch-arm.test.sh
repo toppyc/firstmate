@@ -167,6 +167,7 @@ test_attached_arm_reports_the_delivered_wake() {
 
   # A real captain-relevant status change: the watcher records it in the durable
   # queue, prints its one reason line to its own stdout, and exits.
+  printf 'kind=ship\n' > "$state/demo.meta"
   printf 'done: fixture finished\n' > "$state/demo.status"
   wait_for_exit "$SEED_PID" 120
   grep -q '^signal:' "$out" || fail "seed watcher did not surface the signal wake: $(cat "$out")"
@@ -197,6 +198,7 @@ test_attached_arm_reports_the_delivered_wake_after_drain() {
   # handling turn drains, which is the ordering this case exists to cover.
   start_attached_arm "$state" "$fakebin" "$armout" 5
 
+  printf 'kind=ship\n' > "$state/demo.meta"
   printf 'done: fixture finished\n' > "$state/demo.status"
   wait_for_exit "$SEED_PID" 120
   # The handling turn consumes the records before the attached arm closes: the
@@ -291,6 +293,7 @@ test_rearm_resurfaces_durable_queue_and_remote_open_decision() {
   if is_live_non_zombie "$ARM_PID"; then
     # End the fixture through an ordinary actionable status transition so this
     # failing pre-fix path leaves no child behind.
+    printf 'kind=ship\n' > "$state/cleanup.meta"
     printf 'done: fixture cleanup\n' > "$state/cleanup.status"
     wait_for_exit "$ARM_PID" 80 || true
     fail "re-arm stayed live instead of surfacing durable wakes and the still-open remote decision"
@@ -410,6 +413,7 @@ test_delivery_gap_wake_is_recovered_once() {
   start_rearm_arm "$home" "$state" "$fakebin" "$dir/first-arm.out"
   first_arm=$ARM_PID
   is_live_non_zombie "$first_arm" || fail "delivery-gap fixture watcher did not stay live"
+  printf 'kind=ship\n' > "$state/first.meta"
   printf 'done: first delivered wake\n' > "$state/first.status"
   wait_for_exit "$first_arm" 120 || fail "first watcher did not deliver its status wake"
   grep -q '^signal:' "$dir/first-arm.out" \
@@ -449,6 +453,7 @@ test_interrupted_handling_is_redrained_on_rearm() {
   start_rearm_arm "$home" "$state" "$fakebin" "$dir/first-arm.out"
   first_arm=$ARM_PID
   is_live_non_zombie "$first_arm" || fail "interrupted-handling fixture watcher did not stay live"
+  printf 'kind=ship\n' > "$state/interrupted.meta"
   printf 'done: wake whose handling is interrupted\n' > "$state/interrupted.status"
   wait_for_exit "$first_arm" 120 || fail "fixture watcher did not deliver its wake"
   grep "$(printf '\tsignal\tinterrupted.status\t')" "$state/.wake-queue" >/dev/null \
@@ -643,6 +648,7 @@ test_handling_window_close_keeps_the_acknowledgement_valid() {
 
   start_rearm_arm "$home" "$state" "$fakebin" "$dir/first-arm.out"
   is_live_non_zombie "$ARM_PID" || fail "handling-window fixture watcher did not stay live"
+  printf 'kind=ship\n' > "$state/handled.meta"
   printf 'done: wake handled while a watcher cycle closes\n' > "$state/handled.status"
   wait_for_exit "$ARM_PID" 120 || fail "fixture watcher did not deliver its wake"
   grep "$(printf '\tsignal\thandled.status\t')" "$state/.wake-queue" >/dev/null \
@@ -658,6 +664,7 @@ test_handling_window_close_keeps_the_acknowledgement_valid() {
   # One full watcher cycle appends a wake and then closes inside the handling window.
   start_rearm_arm "$home" "$state" "$fakebin" "$dir/handling-window-arm.out"
   is_live_non_zombie "$ARM_PID" || fail "handling-window watcher did not stay live"
+  printf 'kind=ship\n' > "$state/during-handling.meta"
   printf 'done: wake published during handling\n' > "$state/during-handling.status"
   wait_for_exit "$ARM_PID" 120 || fail "handling-window watcher did not deliver its wake"
   grep "$(printf '\tsignal\tduring-handling.status\t')" "$state/.wake-queue" >/dev/null \
@@ -692,6 +699,7 @@ test_handling_window_close_keeps_the_acknowledgement_valid() {
     || fail "the watcher armed after acknowledgement died inside its first cycle"
   ! grep -F 'check: rearm-resurface' "$dir/next-arm.out" >/dev/null \
     || fail "the watcher armed after acknowledgement re-announced a retired recovery"
+  printf 'kind=ship\n' > "$state/later.meta"
   printf 'blocked: a later wake the live watcher must still surface\n' > "$state/later.status"
   wait_for_exit "$ARM_PID" 120 || fail "the live watcher did not surface a later wake"
   grep -q '^signal:' "$dir/next-arm.out" \
@@ -711,6 +719,7 @@ test_moved_generation_acknowledgement_is_self_healing() {
 
   start_rearm_arm "$home" "$state" "$fakebin" "$dir/first-arm.out"
   is_live_non_zombie "$ARM_PID" || fail "moved-generation fixture watcher did not stay live"
+  printf 'kind=ship\n' > "$state/first.meta"
   printf 'done: first handled wake\n' > "$state/first.status"
   wait_for_exit "$ARM_PID" 120 || fail "fixture watcher did not deliver its first wake"
   FM_HOME="$home" FM_STATE_OVERRIDE="$state" "$DRAIN" > "$dir/first-drain.out" \
@@ -726,6 +735,7 @@ test_moved_generation_acknowledgement_is_self_healing() {
   # A retired episode does not freeze the generation: the next one is its own.
   start_rearm_arm "$home" "$state" "$fakebin" "$dir/second-arm.out"
   is_live_non_zombie "$ARM_PID" || fail "second fixture watcher did not stay live"
+  printf 'kind=ship\n' > "$state/second.meta"
   printf 'done: second wake in a newer recovery episode\n' > "$state/second.status"
   wait_for_exit "$ARM_PID" 120 || fail "second fixture watcher did not deliver its wake"
   second_generation=$(sed -n 's/^pending:downtime:\(.*\)$/\1/p' "$state/.watcher-down")

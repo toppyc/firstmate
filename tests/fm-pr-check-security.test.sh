@@ -2159,6 +2159,7 @@ SH
   write_v1_x_shim "$shim" "$dir/home" "$dir/root"
   chmod 0755 "$shim"
   touch "$state/.last-check"
+  printf 'kind=ship\n' > "$state/transition.meta"
   printf 'done: synthetic transition wake\n' > "$state/transition.status"
   set +e
   FM_TEST_CHECK_INTERVAL=999999 FM_TEST_WATCH_ROOT="$dir/root" \

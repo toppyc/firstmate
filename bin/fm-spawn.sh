@@ -133,7 +133,10 @@
 #   Before a secondmate launch, the home is locally fast-forwarded to the primary
 #   default-branch commit when safe; skipped syncs warn and launch unchanged.
 #   Ship/scout spawns refuse to launch unless the resolved task path is a real
-#   git worktree root distinct from the primary project checkout.
+#   git worktree root distinct, by file identity, from the primary project
+#   checkout and is not the main worktree of the project's repository.
+#   FM_SPAWN_WORKTREE_SETTLE_POLLS (default 60, one per second) bounds the wait
+#   for the pane to settle in a worktree after `treehouse get`.
 #   Before a fresh ship or scout worker starts, its clean task worktree fetches
 #   origin, resolves the current remote default branch, and resets to its tip.
 #   An unreachable origin, unresolved default branch, or non-clean worktree
@@ -1721,10 +1724,42 @@ validate_spawn_worktree() {  # <source> <inspect-target>
   if ! wt_top_real=$(cd "$wt_top" 2>/dev/null && pwd -P); then
     wt_top_real=
   fi
-  if [ -z "$wt_real" ] || [ -z "$wt_top_real" ] || [ "$wt_real" != "$wt_top_real" ] || [ "$wt_real" = "$proj_real" ]; then
+  if [ -z "$wt_real" ] || [ -z "$wt_top_real" ] || [ "$wt_real" != "$wt_top_real" ] || [ "$wt_real" -ef "$proj_real" ]; then
     echo "error: $source did not yield an isolated worktree (resolved '$WT'; worktree root '${wt_top:-none}'; primary '$PROJ_ABS'); refusing to launch to avoid tangling the primary checkout. Inspect target $inspect_target" >&2
     exit 1
   fi
+  # Identity (-ef), not string equality: on a case-insensitive filesystem pwd -P
+  # keeps the caller's spelling, so "projects/StoneFlow" and the pane's
+  # "projects/stoneflow" are one directory under two strings.
+  # The comparison above still trusts PROJ_ABS to name the primary checkout.
+  # When the project argument is itself a linked worktree, the repository's
+  # real primary checkout passes it, and the base refresh and the harness
+  # turn-end wiring would land there; a Claude hook in a primary checkout's
+  # .claude/settings.local.json fires for every Claude session in every linked
+  # worktree of that repository. So also refuse any worktree that is the main
+  # worktree of the project's own repository.
+  if spawn_is_main_worktree_of_project "$WT"; then
+    echo "error: $source yielded '$WT', the primary checkout of the project repository, not an isolated worktree; refusing to launch to avoid tangling the primary checkout. Inspect target $inspect_target" >&2
+    exit 1
+  fi
+}
+
+# 0 when <dir> is the main (non-linked) worktree of the same repository as
+# PROJ_ABS: its git dir is the repository's common dir, shared with PROJ_ABS.
+spawn_is_main_worktree_of_project() {  # <dir>
+  local git_dir common_dir proj_common
+  git_dir=$(spawn_git_dir_real "$1" --git-dir) || return 1
+  common_dir=$(spawn_git_dir_real "$1" --git-common-dir) || return 1
+  proj_common=$(spawn_git_dir_real "$PROJ_ABS" --git-common-dir) || return 1
+  [ "$git_dir" -ef "$common_dir" ] && [ "$common_dir" -ef "$proj_common" ]
+}
+
+spawn_git_dir_real() {  # <dir> <--git-dir|--git-common-dir>
+  local dir=$1 out
+  out=$(git -C "$dir" rev-parse "$2" 2>/dev/null) || return 1
+  [ -n "$out" ] || return 1
+  case "$out" in /*) ;; *) out="$dir/$out" ;; esac
+  (cd "$out" 2>/dev/null && pwd -P)
 }
 
 freshen_spawn_worktree_base() {  # <worktree>
@@ -2221,7 +2256,9 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   # worktree and tangle a hook into the primary checkout. The window id never lies.
   # Compare against PROJ_ABS_REAL (physical), not PROJ_ABS: a symlinked project
   # prefix would otherwise make the pane's OS-level cwd read differ from
-  # PROJ_ABS on the very first poll, before the pane has actually moved.
+  # PROJ_ABS on the very first poll, before the pane has actually moved. Compare
+  # by identity (-ef), since a case-insensitive filesystem spells one directory
+  # two ways (see validate_spawn_worktree).
   #
   # A single read that already differs from PROJ_ABS_REAL is not proof the pane
   # settled there: on some tmux/WSL setups a brand-new window's pane_current_path
@@ -2235,11 +2272,11 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   # pane that is already settled by the first real read only costs the one existing
   # inter-poll sleep as confirmation, not a whole extra cycle on top.
   candidate=""
-  for _ in $(seq 1 60); do
+  for _ in $(seq 1 "${FM_SPAWN_WORKTREE_SETTLE_POLLS:-60}"); do
     p=$(spawn_current_path "$WT_TARGET" || true)
     if [ -n "$p" ]; then
       p_real=$(real_path_or_raw "$p")
-      if [ "$p_real" != "$PROJ_ABS_REAL" ]; then
+      if ! [ "$p_real" -ef "$PROJ_ABS_REAL" ]; then
         if [ -n "$candidate" ] && [ "$p_real" = "$candidate" ]; then
           WT="$p"
           break
@@ -2254,7 +2291,7 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
     sleep 1
   done
   if [ -z "$WT" ]; then
-    echo "error: treehouse get did not enter a worktree within 60s; inspect window $T" >&2
+    echo "error: treehouse get did not enter a worktree within ${FM_SPAWN_WORKTREE_SETTLE_POLLS:-60}s; inspect window $T" >&2
     exit 1
   fi
 

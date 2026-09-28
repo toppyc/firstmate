@@ -531,11 +531,14 @@ age_of() {  # seconds since file mtime; "due immediately" if missing
 # strict -nt comparison. Pure read: prints one "<seen-file>\t<sig>\t<file>"
 # line per changed file. .seen-* is updated only after the wake is either
 # surfaced or intentionally absorbed, so a watcher killed mid-cycle never
-# swallows a signal.
+# swallows a signal. A signal no task in this home owns (fm_wake_signal_unowned
+# in bin/fm-wake-lib.sh) is skipped here and in the heartbeat backstop
+# (scan_owned_captain_relevant_statuses), and leaves no bookkeeping behind.
 scan_signals() {
   local f sig sf
   for f in "$STATE"/*.status "$STATE"/*.turn-ended; do
     [ -e "$f" ] || continue
+    ! fm_wake_signal_unowned "$STATE" "$f" || continue
     sig=$(fm_wake_signal_sig "$f") || continue
     [ -n "$sig" ] || continue
     sf=$(fm_wake_signal_seen_path "$STATE" "$f")
@@ -677,6 +680,18 @@ run_check_capture() {
   fm_check_output_cleanup
 }
 
+# The heartbeat backstop's view of scan_captain_relevant_statuses: a status no
+# task in this home owns is skipped, as scan_signals skips it.
+scan_owned_captain_relevant_statuses() {
+  local f task last
+  while IFS=$(printf '\t') read -r f task last; do
+    [ -n "$f" ] || continue
+    ! fm_wake_signal_unowned "$STATE" "$f" || continue
+    printf '%s\t%s\t%s\n' "$f" "$task" "$last"
+  done < <(scan_captain_relevant_statuses "$STATE")
+  return 0
+}
+
 # Surfaced-marker bookkeeping for the heartbeat backstop is owned by
 # fm-push-transition-lib.sh because push and poll paths must write one format.
 # Mark every current captain-relevant status as surfaced. Called after the
@@ -687,7 +702,7 @@ mark_all_captain_relevant_surfaced() {
   while IFS=$(printf '\t') read -r f task last; do
     [ -n "$f" ] || continue
     printf '%s' "$last" > "$(_hb_surfaced_path "$task")"
-  done < <(scan_captain_relevant_statuses "$STATE")
+  done < <(scan_owned_captain_relevant_statuses)
 }
 
 # Cheap heartbeat fleet-scan (the always-on twin of the daemon's catch-all). 0 if
@@ -705,7 +720,7 @@ heartbeat_scan_finds_actionable() {
     surfaced=$(cat "$(_hb_surfaced_path "$task")" 2>/dev/null || true)
     [ "$surfaced" = "$last" ] && continue
     return 0
-  done < <(scan_captain_relevant_statuses "$STATE")
+  done < <(scan_owned_captain_relevant_statuses)
   return 1
 }
 

@@ -141,7 +141,73 @@ test_already_settled_pane_costs_one_confirm_sleep() {
   pass "an already-settled pane confirms via the existing inter-poll sleep, not an extra full cycle"
 }
 
+# When the project argument is itself a linked worktree, the repository's real
+# primary checkout differs from that argument and is a real top-level, so the
+# path checks alone accept it. Spawn must still refuse it before refreshing its
+# base or writing any harness turn-end wiring there: a Claude hook left in a
+# primary checkout's .claude/settings.local.json fires for every Claude session
+# in every linked worktree of that repository.
+test_primary_checkout_behind_a_linked_project_arg_is_refused() {
+  local rec id out status primary head_before
+  id=settle-primary-behind-linked-z3
+  rec=$(make_settle_case settle-primary-behind-linked "$id" 0)
+  read_settle_record "$rec"
+  primary=$PROJ_DIR
+  head_before=$(git -C "$primary" rev-parse HEAD)
+  printf 'claude\n' > "$HOME_DIR/config/crew-harness"
+  # The linked worktree stands in as the project argument; the pane settles in
+  # the primary checkout.
+  PROJ_DIR=$WT_DIR
+  WT_DIR=$primary
+
+  out=$(run_settle_spawn "$id")
+  status=$?
+  [ "$status" -ne 0 ] || fail "spawn accepted the primary checkout behind a linked-worktree project argument: $out"
+  assert_contains "$out" "primary checkout of the project repository" \
+    "spawn did not name the primary-checkout refusal"
+  [ ! -e "$primary/.claude/settings.local.json" ] \
+    || fail "spawn wrote harness turn-end wiring into the primary checkout"
+  [ "$(git -C "$primary" rev-parse HEAD)" = "$head_before" ] \
+    || fail "spawn moved the primary checkout's HEAD"
+  [ ! -e "$HOME_DIR/state/$id.meta" ] || fail "spawn recorded a task in the primary checkout"
+  pass "a primary checkout reached through a linked-worktree project argument is refused before any wiring"
+}
+
+# On a case-insensitive filesystem a project argument spelled with different
+# case names the same primary checkout, but pwd -P keeps the caller's spelling
+# while the pane reports the on-disk one. Spawn must recognize the pane still
+# sitting in the primary checkout as the primary checkout, not as a worktree.
+test_case_variant_project_arg_does_not_accept_the_primary() {
+  local rec id out status primary variant head_before
+  id=settle-case-variant-z4
+  rec=$(make_settle_case settle-case-variant "$id" 0)
+  read_settle_record "$rec"
+  primary=$PROJ_DIR
+  variant="${primary%/*}/PROJECT"
+  if ! [ -d "$variant" ] || ! [ "$variant" -ef "$primary" ]; then
+    printf 'ok - SKIP case-variant project argument: this filesystem is case-sensitive\n'
+    return 0
+  fi
+  head_before=$(git -C "$primary" rev-parse HEAD)
+  printf 'claude\n' > "$HOME_DIR/config/crew-harness"
+  PROJ_DIR=$variant
+  WT_DIR=$primary
+
+  # The pane never leaves the primary checkout, so the settle wait runs out.
+  out=$(FM_SPAWN_WORKTREE_SETTLE_POLLS=3 run_settle_spawn "$id")
+  status=$?
+  [ "$status" -ne 0 ] || fail "spawn accepted the primary checkout under a case-variant project argument: $out"
+  [ ! -e "$primary/.claude/settings.local.json" ] \
+    || fail "spawn wrote harness turn-end wiring into the primary checkout"
+  [ "$(git -C "$primary" rev-parse HEAD)" = "$head_before" ] \
+    || fail "spawn moved the primary checkout's HEAD"
+  [ ! -e "$HOME_DIR/state/$id.meta" ] || fail "spawn recorded a task in the primary checkout"
+  pass "a case-variant project argument never makes the primary checkout look like a worktree"
+}
+
 test_single_stale_first_read_is_not_accepted
 test_already_settled_pane_costs_one_confirm_sleep
+test_primary_checkout_behind_a_linked_project_arg_is_refused
+test_case_variant_project_arg_does_not_accept_the_primary
 
 echo "# all fm-spawn-worktree-settle tests passed"

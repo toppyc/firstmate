@@ -524,6 +524,10 @@ BACKEND=$FM_BACKEND_VALIDATED_BACKEND
 T=$FM_BACKEND_VALIDATED_TARGET
 WT=$(fm_meta_get "$META" worktree)
 PROJ=$(fm_meta_get "$META" project)
+# The endpoint the watcher keys its bookkeeping on, read while the .meta is
+# certainly present: a secondmate retired through its own parent-route state
+# loses this .meta with the home before the bookkeeping retire runs.
+TASK_ENDPOINT=$(fm_backend_target_of_meta "$META")
 T_ORCA=
 [ "$BACKEND" != orca ] || T_ORCA=$T
 if [ "${FM_TEARDOWN_GUARD_DONE:-0}" != 1 ]; then
@@ -2583,6 +2587,7 @@ cleanup_firstmate_home_children() {
       "$sub_state/$child_id.grok-turnend-token" "$sub_state/$child_id.kimi-turnend-token" \
       "$sub_state/$child_id.muse-session" "$sub_state/$child_id.muse-session-current" \
       "$sub_state/$child_id.cursor-session"
+    fm_wake_task_bookkeeping_retire "$sub_state" "$child_id" "$child_t" || return 1
   done
 }
 
@@ -2950,12 +2955,15 @@ fi
 # fail against a hold nothing owns. fm_resource_lock_path keeps its location in
 # one place, and fm_lock_remove_path takes the owner directory with it.
 fm_lock_remove_path "$(fm_resource_lock_path "$STATE" "$ID")" || true
+# The watcher's own per-task and per-endpoint bookkeeping goes last, after the
+# .meta that makes the task visible to the watcher, so no later cycle re-creates it.
 rm -f "$STATE/$ID.turn-ended" "$STATE/$ID.meta" \
   "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" \
   "$STATE/$ID.kimi-turnend-token" "$STATE/$ID.muse-session" \
   "$STATE/$ID.muse-session-current" "$STATE/$ID.cursor-session" \
   "$STATE/$ID.control-relaunch" "$STATE/$ID.control-relaunch.meta-prior" \
   "$STATE/$ID.control-relaunch.brief-prior" "$STATE/$ID.control-relaunch.note"
+fm_wake_task_bookkeeping_retire "$STATE" "$ID" "$TASK_ENDPOINT" || exit 1
 fm_lock_release "$META_LOCK"
 META_LOCK_HELD=0
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
