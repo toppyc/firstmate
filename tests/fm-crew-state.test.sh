@@ -837,6 +837,69 @@ test_terminal_failed() {
   pass "terminal failed run is authoritative"
 }
 
+# A terminal `passed` run is the pipeline's verdict on the RUN, never on the pull
+# request: the ci gate can be approved with the PR still open. These cases give
+# the task a recorded pr= and a forge that answers (or fails) in a known way, and
+# pin that the verdict line never claims a PR state it did not read.
+# <case-dir> <open|merged|fail>: fake gh and gh-axi.
+make_fake_forge() {
+  local d=$1 mode=$2 tool
+  for tool in gh gh-axi; do
+    cat > "$d/fakebin/$tool" <<SH
+#!/usr/bin/env bash
+case "$mode" in
+  open)   printf '{"state":"OPEN","merged":false,"mergedAt":null,"closedAt":null}\n' ;;
+  merged) printf '{"state":"MERGED","merged":true,"mergedAt":"2026-09-28T00:00:00Z"}\n' ;;
+  *)      echo "error connecting to api.github.com" >&2; exit 1 ;;
+esac
+SH
+    chmod +x "$d/fakebin/$tool"
+  done
+}
+
+passed_run_with_forge() {  # <case-name> <id> <open|merged|fail> [meta-pr] -> echoes verdict line
+  local d; d=$(new_case "$1")
+  make_repo_on_branch "$d/wt" "fm/$2"
+  make_fakebin "$d" >/dev/null
+  make_fake_forge "$d" "$3"
+  if [ -n "${4:-}" ]; then
+    fm_write_meta "$d/state/$2.meta" "window=fm:fm-$2" "worktree=$d/wt" "kind=ship" "pr=$4"
+  else
+    fm_write_meta "$d/state/$2.meta" "window=fm:fm-$2" "worktree=$d/wt" "kind=ship"
+  fi
+  FM_FAKE_AXI_STATUS="$(run_passed "fm/$2")"
+  run_crew_state "$d" "$2"
+}
+
+test_passed_run_open_pr_never_reported_merged() {
+  reset_fakes
+  local out lower
+  out=$(passed_run_with_forge passed-open pr-open open "https://github.com/o/r/pull/459")
+  lower=$(printf '%s' "$out" | tr '[:upper:]' '[:lower:]')
+  assert_contains "$out" "state: done" "passed run on an open PR still reports the run done"
+  assert_contains "$out" "source: run-step" "passed run on an open PR -> run-step source"
+  assert_not_contains "$lower" "merged" "an open, unmerged PR must never be described as merged"
+  assert_not_contains "$lower" "closed" "an open PR must never be described as closed"
+  pass "passed run on an open PR is never described as merged"
+}
+
+# The could-not-read path: no forge answer (API error) and no pr= at all. The
+# line must name that the PR state was not read, and must be distinguishable
+# from both a merged claim and an open/not-merged claim.
+test_passed_run_unread_pr_state_is_distinct() {
+  reset_fakes
+  local out lower label
+  for label in fail:https://github.com/o/r/pull/486 fail: open: merged:https://github.com/o/r/pull/1; do
+    out=$(passed_run_with_forge "passed-unread-${label%%:*}-${#label}" pr-unread "${label%%:*}" "${label#*:}")
+    lower=$(printf '%s' "$out" | tr '[:upper:]' '[:lower:]')
+    assert_contains "$out" "state: done" "passed run -> done ($label)"
+    assert_contains "$out" "PR state not read" "an unread PR state must be named as not read ($label)"
+    assert_not_contains "$lower" "merged" "an unread PR state must not read as merged ($label)"
+    assert_not_contains "$lower" "open" "an unread PR state must not read as open ($label)"
+  done
+  pass "passed run with an unread PR state is distinct from merged and open"
+}
+
 # (e) cross-branch attribution: `axi status` returns ANOTHER branch's run (the
 # routine case once more than one crew validates the same underlying repo
 # concurrently - they share ONE no-mistakes repo registration), so the helper
@@ -1745,6 +1808,8 @@ test_top_level_fixing_ci_running_after_green_stays_working
 test_top_level_fixing_done_log_stays_working
 test_terminal_passed
 test_terminal_failed
+test_passed_run_open_pr_never_reported_merged
+test_passed_run_unread_pr_state_is_distinct
 test_cross_branch_attribution_via_runs_list
 test_cross_branch_attribution_picks_most_recent_row
 test_coarse_run_does_not_probe_other_branch_ci_log_for_ready_status

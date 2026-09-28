@@ -285,8 +285,9 @@ nm_effective_ci_step_status() {
 # Root cause of the PR #252 incident (2026-07): for a repo where merge is left
 # to the captain, no-mistakes' ci step (and therefore top-level status/outcome)
 # stays "running" for the ENTIRE CI-monitor phase, including long after GitHub
-# reports every check green - it only reaches outcome=passed once the PR is
-# actually merged (or failed/cancelled if closed). `axi status`'s steps[] table
+# reports every check green, until the ci gate resolves. outcome=passed is not
+# evidence of a merge: it is also reached when that gate is approved with the
+# PR still open (observed 2026-09 on two open PRs). `axi status`'s steps[] table
 # never distinguishes "still waiting on checks" from "checks green, waiting on
 # merge": both read as plain `ci,running,...`. The only place that transition is
 # recorded is the ci step's own log text, e.g. "all CI checks passed - still
@@ -478,7 +479,11 @@ if [ "$HAVE_RUN" = 1 ]; then
 
     if [ -n "$outcome" ]; then
       case "$outcome" in
-        passed)        RUN_STATE="done"; RUN_DETAIL="run passed: PR merged/closed" ;;
+        # `passed` is the run's terminal verdict, not the pull request's: it is
+        # also reached when the ci gate is approved with the PR still open.
+        # This reader never queries the forge, so it states only that; merge
+        # truth belongs to the PR merge poll (fm-pr-check.sh) and teardown.
+        passed)        RUN_STATE="done"; RUN_DETAIL="run passed; PR state not read" ;;
         checks-passed) RUN_STATE="done"; RUN_DETAIL="checks green: PR ready for review" ;;
         failed)        RUN_STATE=failed; RUN_DETAIL="run failed" ;;
         cancelled)     RUN_STATE=failed; RUN_DETAIL="run cancelled" ;;
