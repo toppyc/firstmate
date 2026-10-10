@@ -47,11 +47,22 @@
 # a spawn-time and firstmate-side input only (AGENTS.md section 7).
 # Every scaffold's status protocol distinguishes the configured
 # declared-external-wait verb (FM_CLASSIFY_PAUSED_VERB, default "paused") from
-# "blocked:": pause for a known external wait expected to clear on its own,
+# "blocked:": pause for a wait expected to clear without firstmate acting,
 # blocked when firstmate must act.
-# Crewmate ship and scout briefs also tell the worker to declare a long run it
-# starts and waits on with that verb ("<verb>: <what>, duration unknown") and to
-# resolve it when the run ends, so a quiet pane never reads as a wedge.
+# Crewmate ship and scout briefs also tell the worker that the watcher reads only
+# the verb: working:, however long the sentence, leaves an idle pane on the
+# ~4-minute wedge check (fm-watch.sh STALE_ESCALATE_SECS). So any wait of more than
+# about four minutes that the worker ends its turn on - its own test run, a
+# pipeline gate, CI, a long build - is declared with the verb ("<verb>: <what>,
+# duration unknown"), declared again after any later line such as a gate answer's
+# resolved line (which ends the pause), and resolved when the wait ends.
+# The secondmate charter keeps its narrower external-wait wording: the watcher
+# never wedge-checks a secondmate pane, and every secondmate status line wakes the
+# parent.
+# Every scaffold that teaches decision keys requires exactly one [key=<slug>] at
+# the start of the line, right after the verb: fm-classify-lib.sh reads a later
+# token as prose (the shared "default" key) and ignores a second one, and
+# fm-send.sh refuses a whole answer whose --resolve-key names a key never opened.
 # Crewmate ship and scout briefs anchor firstmate's relative data/ and state/
 # paths to the absolute directories: the {TASK} text is filled after scaffolding,
 # so the scaffold cannot rewrite paths in it, and a crewmate's working directory is
@@ -59,10 +70,12 @@
 # scaffold itself writes is absolute.
 # Ship briefs carry a rule 9 of pipeline hazards built per delivery mode. Every
 # mode compares a branch with its PR head, if it has one, both ways by commit
-# subject before rebasing. no-mistakes and direct-PR also test only what the
-# change touches (CI runs the full suite) and never treat a green PR as proof of
-# the head the worker intends to ship; local-only, where nothing else runs the
-# tests, instead runs the relevant suites before reporting ready in branch.
+# subject before rebasing. no-mistakes and direct-PR also run only focused tests
+# when the project's CI shards its suite (a serial local pass takes far longer
+# and proves nothing extra), run the suite themselves when CI runs none, say
+# which for the PR, and never treat a green PR as proof of the head the worker
+# intends to ship; local-only, where nothing else runs the tests, instead runs
+# the relevant suites before reporting ready in branch.
 # Crewmate ship and scout briefs both carry the external-resource rule: a worker
 # that starts a service container records it with bin/fm-resource.sh, because
 # cleanup can only stop what is recorded and never guesses a name. A charter does
@@ -263,6 +276,7 @@ A marked request requires one correlated answer after the work; it does not requ
 Never append \`working:\` merely to acknowledge receipt or announce that a marked request has started.
 When a routed-work phase has a supervisor-actionable material change worth reporting under the rule above, give that reported phase a stable key.
 If its first reportable event is \`working [key=<work-slug>]: {material phase}\`, use the same key on its later \`$PAUSED_VERB\`, \`done\`, \`failed\`, \`needs-decision\`, or \`blocked\` event so the earlier working phase is superseded.
+Every keyed line carries exactly one \`[key=<slug>]\`, at the start of the line right after the verb as shown: a key later in the line is prose, so the event opens unkeyed and the main firstmate cannot close it by that key, and a second key on the same line opens nothing, so two decisions or phases need two lines.
 When a keyed phase ends without another reportable state, append \`resolved [key=<work-slug>]: {why it is no longer active}\`.
 \`resolved\` separately closes an escalated decision or blocker, and only a \`resolved\` line carrying that decision's exact key closes it: a later \`done\` or \`working\` event never does, even when the answer is what started that work.
 The main firstmate's answer normally writes that closing line at answer time; when a blocker or wait clears WITHOUT an answer from the main firstmate, append \`resolved: {how it cleared}\` yourself (keyed with \`[key=<slug>]\` if you opened it with one) as your domain resumes.
@@ -341,18 +355,25 @@ The report is the only thing that survives, so anything worth keeping must be in
    \`echo "{state}: {one short line}" >> $STATUS_FILE\`
    States: working, needs-decision, blocked, $PAUSED_VERB, done, failed.
    Each append wakes firstmate, so report sparingly: only phase changes a supervisor
-   would act on and the needs-decision/blocked/paused/done/failed states. No step-by-step
+   would act on and the needs-decision/blocked/$PAUSED_VERB/done/failed states. No step-by-step
    FYI progress lines; firstmate reads your pane for that.
-   Use \`$PAUSED_VERB: {why}\` - distinct from \`blocked:\` - ONLY when you are deliberately idling on a
-   known external wait you expect to clear on its own (an upstream release, a rate-limit reset):
-   firstmate then leaves your idle pane alone and rechecks it on a long cadence instead of
-   treating it as a possible wedge. Use \`blocked:\` when you are stuck and need help.
-   A long run you start and then wait on counts: the moment you start one (a CI wait, a slow suite,
-   a long build), append a line shaped like \`$PAUSED_VERB: integration tests running, duration unknown\`,
+   Use \`$PAUSED_VERB: {why}\` - distinct from \`blocked:\` - whenever you end your turn and wait on
+   something for longer than about four minutes: your own test run, CI, a long build, or an
+   external wait such as an upstream release or a rate-limit reset.
+   Firstmate's watcher reads only the verb of your last status line: a declared pause moves your
+   idle pane onto a long recheck cadence, while any other verb leaves it on the wedge check, which
+   escalates an idle pane within about four minutes. \`working:\` is for a phase change a supervisor
+   should see; it does NOT quiet the wedge check, however long the sentence or its time estimate.
+   Use \`blocked:\` when you are stuck and need help.
+   Declare a wait the moment it starts: append a line shaped like \`$PAUSED_VERB: integration tests running, duration unknown\`,
    then \`resolved: {what finished}\` when it ends, so a quiet pane never reads as a wedge.
+   A \`resolved\` line does not quiet the wedge check either, and any later line ends a pause:
+   after a decision is answered and you go back to waiting, append the \`$PAUSED_VERB:\` line again.
 5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.
 6. If a decision belongs to a human (product choices, destructive actions),
    append \`needs-decision: {summary of options}\` and stop. Firstmate will reply with the decision.
+   To key a decision or blocker, put exactly one \`[key=<slug>]\` at the start of the line, right after the verb: \`needs-decision [key=<slug>]: {summary}\`.
+   A key later in the line is prose, so the decision opens unkeyed and firstmate cannot close it by that key; a second key on the same line opens nothing, so two decisions need two lines.
    A decision or blocker you opened stays open until a \`resolved\` line carrying its exact key lands; a later \`done:\` or \`working:\` line never closes it, even when the answer is what started that work.
    Firstmate's reply normally writes that closing line at answer time; when a blocker or wait clears WITHOUT a firstmate reply, append \`resolved: {how it cleared}\` yourself (same \`[key=<slug>]\` if you opened it with one) as you resume.
 7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
@@ -382,13 +403,21 @@ fi
 # delivery mode, validated above. The generated DOD opens with the fixed
 # "Delivery contract: mode=<mode>" line that bin/fm-spawn.sh checks against its own
 # explicit --mode before launching.
-CI_HAZARD_TESTS='   - Run only the tests your change touches; leave the full suite to CI, which shards it.'
+# ci_hazard_tests <where the PR states which testing was done>
+ci_hazard_tests() {
+  printf '%s' "   - When the project's CI shards its test suite, do not run that whole suite serially yourself:
+     a serial local pass of work CI spreads across parallel shards can take over an hour and proves
+     nothing extra. Run the focused tests for what you touched plus any new or changed test files,
+     and let CI be the full-suite authority. When the project's CI runs no test suite at all
+     (a Flutter app, say), the opposite holds: run the suite locally yourself.
+     Either way, say which you did in $1, so a reader sees a choice, not an omission."
+}
 CI_HAZARD_PR=$'\n   - A green PR describes the head the forge last saw, not what you intend to ship.'
 case "$MODE" in
   direct-PR)
     SETUP2=""
     RULE1='1. Never push to the default branch (push only your `fm/'"$ID"'` branch). Never merge a PR.'
-    HAZARD_TESTS=$CI_HAZARD_TESTS
+    HAZARD_TESTS=$(ci_hazard_tests 'the PR body')
     HAZARD_PR=$CI_HAZARD_PR
     IFS= read -r -d '' DOD <<EOF || true
 # Definition of done
@@ -418,7 +447,7 @@ EOF
     SETUP2="
 2. Run \`no-mistakes doctor\`; if it reports the repo is not initialized here, run \`no-mistakes init\`."
     RULE1='1. Never push to the default branch. Never merge a PR.'
-    HAZARD_TESTS=$CI_HAZARD_TESTS
+    HAZARD_TESTS=$(ci_hazard_tests "the run's \`--intent\` (the pipeline, not you, writes the PR)")
     HAZARD_PR=$CI_HAZARD_PR
     IFS= read -r -d '' DOD <<EOF || true
 # Definition of done
@@ -476,20 +505,27 @@ $RULE1
    States: working, needs-decision, blocked, $PAUSED_VERB, done, failed.
    Each append wakes firstmate, so report sparingly: only phase changes a supervisor
    would act on (setup done, bug reproduced, fix implemented, validation passed) and the
-   needs-decision/blocked/paused/done/failed states. No step-by-step FYI progress lines;
+   needs-decision/blocked/$PAUSED_VERB/done/failed states. No step-by-step FYI progress lines;
    firstmate reads your pane for that.
    A mid-task \`working:\` line (including setup complete) is nonterminal: do not end the
    turn after it; continue the same stage until a defined \`done:\` gate under Definition of done.
-   Use \`$PAUSED_VERB: {why}\` - distinct from \`blocked:\` - ONLY when you are deliberately idling on a
-   known external wait you expect to clear on its own (an upstream release, a rate-limit reset,
-   a scheduled window): firstmate then leaves your idle pane alone and rechecks it on a long
-   cadence instead of treating it as a possible wedge. Use \`blocked:\` when you are stuck and need help.
-   A long run you start and then wait on counts: the moment you start one (a CI wait, a slow suite,
-   a long build), append a line shaped like \`$PAUSED_VERB: integration tests running, duration unknown\`,
+   Use \`$PAUSED_VERB: {why}\` - distinct from \`blocked:\` - whenever you end your turn and wait on
+   something for longer than about four minutes: your own test run, a pipeline run to its next
+   gate, CI, a long build, or an external wait such as an upstream release or a rate-limit reset.
+   Firstmate's watcher reads only the verb of your last status line: a declared pause moves your
+   idle pane onto a long recheck cadence, while any other verb leaves it on the wedge check, which
+   escalates an idle pane within about four minutes. \`working:\` is for a phase change a supervisor
+   should see; it does NOT quiet the wedge check, however long the sentence or its time estimate.
+   Use \`blocked:\` when you are stuck and need help.
+   Declare a wait the moment it starts: append a line shaped like \`$PAUSED_VERB: integration tests running, duration unknown\`,
    then \`resolved: {what finished}\` when it ends, so a quiet pane never reads as a wedge.
+   A \`resolved\` line does not quiet the wedge check either, and any later line ends a pause:
+   after answering a gate and going back to waiting, append the \`$PAUSED_VERB:\` line again.
 5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.
 6. If a decision belongs above the implementation worker (product choices, destructive actions, ask-user findings),
    append \`needs-decision: {summary of options}\` and stop. Firstmate will apply the configured authority and reply with the decision.
+   To key a decision or blocker, put exactly one \`[key=<slug>]\` at the start of the line, right after the verb: \`needs-decision [key=<slug>]: {summary}\`.
+   A key later in the line is prose, so the decision opens unkeyed and firstmate cannot close it by that key; a second key on the same line opens nothing, so two decisions need two lines.
    A decision or blocker you opened stays open until a \`resolved\` line carrying its exact key lands; a later \`done:\` or \`working:\` line never closes it, even when the answer is what started that work.
    Firstmate's reply normally writes that closing line at answer time; when a blocker or wait clears WITHOUT a firstmate reply, append \`resolved: {how it cleared}\` yourself (same \`[key=<slug>]\` if you opened it with one) as you resume.
 7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
