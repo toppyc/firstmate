@@ -392,7 +392,7 @@ Treat any `OPEN DECISIONS` section from the drain as actionable reconciliation i
 Treat any `UNREAD STATUS` section as newly surfaced status that must be read this turn; those lines are not re-printed after this presentation.
 After handling all emitted wakes and reconciling the OPEN DECISIONS and UNREAD STATUS sections, run the exact generation-bound `--ack-through` command printed as `WAKE_ACK_REQUIRED`; interruption before that acknowledgement deliberately leaves the work durable for idempotent re-handling.
 A status line is a wake event, not current state; use `bin/fm-crew-state.sh` when current state matters, especially before re-escalating an old decision, blocker, or pause.
-A declared `paused:` event means a bounded external wait expected to clear on its own, while `blocked:` means firstmate action is needed.
+A declared `paused:` event means a bounded wait expected to clear without firstmate acting (an external wait, or a crewmate's own long run, pipeline gate, or CI), while `blocked:` means firstmate action is needed.
 
 Handle actionable wakes as follows:
 

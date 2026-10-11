@@ -796,9 +796,10 @@ assert_line() {
 # long wait with a copyable line shape, anchor firstmate's relative paths to the
 # absolute home, and (ship only) the pipeline hazards, gated per delivery mode.
 test_briefs_teach_long_wait_paths_and_hazards() {
-  local home id kind brief path_line scoped_line green_line local_line
+  local home id kind brief path_line scoped_line no_suite_line say_line green_line local_line
   home="$TMP_ROOT/lessons-home"
-  scoped_line="   - Run only the tests your change touches; leave the full suite to CI, which shards it."
+  scoped_line="   - When the project's CI shards its test suite, do not run that whole suite serially yourself:"
+  no_suite_line="     (a Flutter app, say), the opposite holds: run the suite locally yourself."
   green_line="   - A green PR describes the head the forge last saw, not what you intend to ship."
   local_line="   - Nothing else runs the tests for this branch: run the relevant suites yourself before reporting ready in branch."
   mkdir -p "$home/data"
@@ -832,9 +833,17 @@ test_briefs_teach_long_wait_paths_and_hazards() {
     if [ "$kind" = local-only ]; then
       assert_line "$local_line" "$brief" "local-only: brief does not tell the worker to run the suites itself"
       assert_no_grep "$scoped_line" "$brief" "local-only: brief defers the full suite to a CI that never runs"
+      assert_no_grep "Either way, say which you did" "$brief" "local-only: brief asks for a PR note with no PR"
       assert_no_grep "$green_line" "$brief" "local-only: brief carries the green-PR hazard with no PR"
     else
       assert_line "$scoped_line" "$brief" "$kind: brief missing the scoped-tests hazard"
+      assert_line "$no_suite_line" "$brief" "$kind: brief does not run the suite locally when CI runs none"
+      if [ "$kind" = no-mistakes ]; then
+        say_line="     Either way, say which you did in the run's \`--intent\` (the pipeline, not you, writes the PR), so a reader sees a choice, not an omission."
+      else
+        say_line="     Either way, say which you did in the PR body, so a reader sees a choice, not an omission."
+      fi
+      assert_line "$say_line" "$brief" "$kind: brief does not say where the PR records which tests ran"
       assert_line "$green_line" "$brief" "$kind: brief missing the green-PR hazard"
       assert_no_grep "$local_line" "$brief" "$kind: brief carries the local-only test line"
     fi
@@ -846,6 +855,109 @@ test_briefs_teach_long_wait_paths_and_hazards() {
   assert_grep '`awaiting: integration tests running, duration unknown`' "$home/data/brief-lessons-verb/brief.md" \
     "long-wait shape did not follow the configured pause verb"
   pass "fm-brief.sh: briefs teach the long-wait shape, absolute firstmate paths, and ship pipeline hazards"
+}
+
+# brief_example <file> <prefix>: the first backticked example in <file> that
+# starts with <prefix>, so the shapes a brief teaches can be fed to the classifier.
+brief_example() {
+  local out
+  out=$(awk -v p="\`$2" '
+    { i = index($0, p); if (!i) next
+      s = substr($0, i + 1); j = index(s, "`"); if (!j) next
+      print substr(s, 1, j - 1); exit }
+  ' "$1")
+  [ -n "$out" ] && printf '%s\n' "$out"
+}
+
+# The status shapes a brief teaches must be the shapes the watcher acts on: the
+# pause line quiets the wedge check under the configured verb, working: is never
+# offered as a substitute, and a decision key sits at the start of the line,
+# once, where the classifier opens a closable keyed decision.
+test_status_protocol_teaches_quiet_waits_and_one_key_per_line() {
+  local home verb kind id brief pause_line key_line status
+  home="$TMP_ROOT/status-protocol-home"
+  mkdir -p "$home/data"
+  for verb in paused awaiting; do
+    for kind in no-mistakes direct-PR local-only scout secondmate; do
+      id="status-protocol-$verb-$kind"
+      case "$kind" in
+        scout) FM_HOME="$home" FM_CLASSIFY_PAUSED_VERB=$verb \
+          "$ROOT/bin/fm-brief.sh" "$id" some-proj --scout >/dev/null 2>&1 ;;
+        secondmate) FM_HOME="$home" FM_CLASSIFY_PAUSED_VERB=$verb FM_SECONDMATE_CHARTER=ops \
+          "$ROOT/bin/fm-brief.sh" "$id" --secondmate --no-projects >/dev/null 2>&1 ;;
+        *) FM_HOME="$home" FM_CLASSIFY_PAUSED_VERB=$verb \
+          "$ROOT/bin/fm-brief.sh" "$id" some-proj --mode "$kind" >/dev/null 2>&1 ;;
+      esac
+      brief="$home/data/$id/brief.md"
+      assert_present "$brief" "$verb/$kind: brief was not scaffolded"
+      assert_no_grep 'ONLY when' "$brief" "$verb/$kind: brief still restricts the pause verb"
+
+      if [ "$kind" = secondmate ]; then
+        # The watcher never wedge-checks a secondmate pane and every charter
+        # status line wakes the parent, so the charter keeps external-wait-only
+        # pauses and gains only the key-placement rule.
+        assert_grep "only when your domain is deliberately idling on a known external wait" "$brief" \
+          "$verb/secondmate: charter widened the pause verb beyond external waits"
+        assert_no_grep 'wedge check' "$brief" "$verb/secondmate: charter claims a wedge check it never gets"
+        # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
+        assert_grep 'Every keyed line carries exactly one `[key=<slug>]`, at the start of the line right after the verb' "$brief" \
+          "$verb/secondmate: charter does not place exactly one key at the start of the line"
+        assert_grep 'so two decisions or phases need two lines' "$brief" \
+          "$verb/secondmate: charter does not split two keys onto two lines"
+        key_line=$(brief_example "$brief" 'working [key=') \
+          || fail "$verb/secondmate: charter shows no keyed working example"
+      else
+        assert_grep "Use \`$verb: {why}\` - distinct from \`blocked:\` - whenever you end your turn and wait on" "$brief" \
+          "$verb/$kind: brief does not make every turn-ending wait a declared pause"
+        assert_grep 'something for longer than about four minutes' "$brief" \
+          "$verb/$kind: brief gives no actionable wait threshold"
+        assert_grep 'it does NOT quiet the wedge check, however long the sentence' "$brief" \
+          "$verb/$kind: brief does not say working: leaves the wedge check armed"
+        assert_grep "append the \`$verb:\` line again." "$brief" \
+          "$verb/$kind: brief does not re-declare the pause after a resolved line"
+        assert_grep "needs-decision/blocked/$verb/done/failed states" "$brief" \
+          "$verb/$kind: brief hard-codes a pause verb in its reportable states"
+        # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
+        assert_grep 'put exactly one `[key=<slug>]` at the start of the line, right after the verb' "$brief" \
+          "$verb/$kind: brief does not place exactly one key at the start of the line"
+        assert_grep 'so two decisions need two lines' "$brief" \
+          "$verb/$kind: brief does not split two decisions onto two lines"
+
+        pause_line=$(brief_example "$brief" "$verb: integration tests") \
+          || fail "$verb/$kind: brief shows no declared-wait example"
+        status=0
+        FM_CLASSIFY_PAUSED_VERB=$verb bash -c '
+          . "$1/bin/fm-marker-lib.sh"; . "$1/bin/fm-classify-lib.sh"
+          status_is_paused "$2" && ! status_is_paused "working: next ~30-60min: full gates"
+        ' _ "$ROOT" "$pause_line" || status=$?
+        expect_code 0 "$status" "$verb/$kind: taught pause line '$pause_line' does not read as a pause"
+        key_line=$(brief_example "$brief" 'needs-decision [key=') \
+          || fail "$verb/$kind: brief shows no keyed decision example"
+      fi
+
+      # The taught key position opens a decision under the stated key, which is
+      # what an answer's --resolve-key must name; a key later in the line does not.
+      key_line=${key_line//<slug>/api-shape}
+      key_line=${key_line//<work-slug>/api-shape}
+      status=0
+      bash -c '
+        . "$1/bin/fm-marker-lib.sh"; . "$1/bin/fm-classify-lib.sh"
+        open_key() { printf "%s\n" "$1" | status_open_activities - | cut -f1; }
+        f=$(mktemp) || exit 1
+        printf "%s\n" "$2" > "$f"
+        case "$2" in
+          working*) [ "$(open_key "$2")" = api-shape ] || { rm -f "$f"; exit 1; } ;;
+          *) [ "$(status_open_decisions "$f" | cut -f1)" = api-shape ] || { rm -f "$f"; exit 1; } ;;
+        esac
+        printf "%s\n" "needs-decision: pick a shape [key=api-shape]" > "$f"
+        late=$(status_open_decisions "$f" | cut -f1)
+        rm -f "$f"
+        [ "$late" = default ]
+      ' _ "$ROOT" "$key_line" || status=$?
+      expect_code 0 "$status" "$verb/$kind: taught key line '$key_line' does not open the stated key"
+    done
+  done
+  pass "fm-brief.sh: status protocol teaches turn-ending pauses and one leading key per line"
 }
 
 # Regression guard for the existing safety contract: every ship mode must still
@@ -877,10 +989,9 @@ If the top-level path is the primary checkout or not the worktree you were launc
    firstmate reads your pane for that.
    A mid-task \`working:\` line (including setup complete) is nonterminal: do not end the
    turn after it; continue the same stage until a defined \`done:\` gate under Definition of done.
-   Use \`paused: {why}\` - distinct from \`blocked:\` - ONLY when you are deliberately idling on a
-   known external wait you expect to clear on its own (an upstream release, a rate-limit reset,
-   a scheduled window): firstmate then leaves your idle pane alone and rechecks it on a long
-   cadence instead of treating it as a possible wedge. Use \`blocked:\` when you are stuck and need help.
+   Use \`paused: {why}\` - distinct from \`blocked:\` - whenever you end your turn and wait on
+   should see; it does NOT quiet the wedge check, however long the sentence or its time estimate.
+   Use \`blocked:\` when you are stuck and need help.
 5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.
    A decision or blocker you opened stays open until a \`resolved\` line carrying its exact key lands; a later \`done:\` or \`working:\` line never closes it, even when the answer is what started that work.
    Firstmate's reply normally writes that closing line at answer time; when a blocker or wait clears WITHOUT a firstmate reply, append \`resolved: {how it cleared}\` yourself (same \`[key=<slug>]\` if you opened it with one) as you resume.
@@ -940,4 +1051,5 @@ test_pause_verb_override_renders_all_brief_scaffolds
 test_scout_and_secondmate_load_decision_hold_policy
 test_scout_and_secondmate_scaffold
 test_briefs_teach_long_wait_paths_and_hazards
+test_status_protocol_teaches_quiet_waits_and_one_key_per_line
 test_existing_ship_contract_is_unchanged
