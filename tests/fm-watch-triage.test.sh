@@ -1493,6 +1493,89 @@ test_live_worker_stated_wait_is_absorbed_for_its_duration() {
   pass "a live worker's stated wait is absorbed for its duration, across a moving pane, without four-minute re-fires"
 }
 
+# A multi-group-equivalent minute count is honoured exactly, not rounded to the
+# hour: [for=90m] keeps a live worker quiet for 5400s under a pause window wide
+# enough not to clamp it, and surfaces once just past that.
+test_stated_duration_90m_is_honoured_exactly() {
+  local dir state fakebin out capture_file window key pid i
+  [ "$(status_pause_declared_secs 'paused [for=90m]: x')" = 5400 ] \
+    || fail "[for=90m] did not read as 5400s"
+
+  dir=$(make_case stated-wait-90m-current); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; window="test:fm-stated-90m"
+  printf 'idle, the 90-minute soak is running elsewhere\n' > "$capture_file"
+  key=$(seed_live_declared_pane "$state" stated-90m "$window" "$capture_file" \
+    "paused [for=90m]: waiting on the soak" 4800)
+  : > "$out"
+  declared_watch_bg "$state" "$fakebin" "$window" "$capture_file" "$out" \
+    FM_FAKE_CREW_STATE='state: paused · source: status-log · waiting on the soak' \
+    FM_STALE_ESCALATE_SECS=1 FM_PAUSE_RESURFACE_SECS=7200
+  pid=$!
+  i=0
+  while [ "$i" -lt 20 ]; do
+    i=$((i + 1))
+    sleep 0.15
+    kill -0 "$pid" 2>/dev/null \
+      || { reap "$pid"; fail "a [for=90m] declaration 4800s old surfaced: $(cat "$out")"; }
+  done
+  [ -e "$state/.paused-$key" ] || { reap "$pid"; fail "a current [for=90m] wait was not absorbed on the pause cadence"; }
+  reap "$pid"
+  [ ! -s "$out" ] || fail "a current [for=90m] wait printed a wake: $(cat "$out")"
+  [ ! -s "$state/.wake-queue" ] || fail "a current [for=90m] wait queued a wake"
+
+  dir=$(make_case stated-wait-90m-expired); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  printf 'idle, the 90-minute soak should have finished\n' > "$capture_file"
+  seed_live_declared_pane "$state" stated-90m "$window" "$capture_file" \
+    "paused [for=90m]: waiting on the soak" 5460 >/dev/null
+  : > "$out"
+  declared_watch_bg "$state" "$fakebin" "$window" "$capture_file" "$out" \
+    FM_FAKE_CREW_STATE='state: paused · source: status-log · waiting on the soak' \
+    FM_STALE_ESCALATE_SECS=1 FM_PAUSE_RESURFACE_SECS=7200
+  pid=$!
+  wait_for_exit "$pid" 40 || { reap "$pid"; fail "a [for=90m] declaration 5460s old never surfaced"; }
+  [ "$(grep -c "declared wait of 5400s has run out" "$out")" -eq 1 ] \
+    || fail "an expired [for=90m] declaration did not surface once as run out: $(cat "$out")"
+  pass "[for=90m] is honoured as exactly 5400s: absorbed at 4800s, surfaced once at 5460s"
+}
+
+# A fractional group is truncated down to its whole unit by design (one parser,
+# shared with the pipeline step reader), so [for=1.5h] is a one-hour hint rather
+# than no hint. Asserted on the unclamped seconds, so it is the truncation and not
+# the pause-window clamp that is proven.
+test_fractional_stated_duration_truncates_down_1_5h_is_3600s() {
+  [ "$(status_pause_declared_secs 'paused [for=1.5h]: x')" = 3600 ] \
+    || fail "[for=1.5h] did not truncate down to 3600s"
+  [ "$(status_pause_declared_secs 'paused [for=1m5.5s]: x')" = 65 ] \
+    || fail "[for=1m5.5s] did not truncate down to 65s"
+  pass "a fractional stated duration truncates down: 1.5h is 3600s"
+}
+
+# An unparseable tag is ignored, never guessed: [for=banana] leaves a live
+# worker's pause exactly as loud as an untagged one, surfacing at first sight as
+# a stopped crew rather than being absorbed.
+test_unparseable_stated_duration_falls_back_to_undeclared_handling() {
+  local dir state fakebin out capture_file window pid line n=0
+  status_pause_declared_secs 'paused [for=banana]: x' >/dev/null \
+    && fail "[for=banana] was read as a stated duration"
+  for line in 'paused [for=banana]: x' 'paused: x'; do
+    n=$((n + 1))
+    dir=$(make_case "stated-wait-banana-$n"); state="$dir/state"; fakebin="$dir/fakebin"
+    out="$dir/watch.out"; capture_file="$dir/pane.txt"; window="test:fm-stated-banana"
+    printf 'idle, waiting on something\n' > "$capture_file"
+    seed_live_declared_pane "$state" stated-banana "$window" "$capture_file" "$line" 60 >/dev/null
+    : > "$out"
+    declared_watch_bg "$state" "$fakebin" "$window" "$capture_file" "$out" \
+      FM_FAKE_CREW_STATE='state: paused · source: status-log · x' \
+      FM_STALE_ESCALATE_SECS=240 FM_PAUSE_RESURFACE_SECS=3600
+    pid=$!
+    wait_for_exit "$pid" 40 || { reap "$pid"; fail "a live pause '$line' was absorbed instead of surfacing"; }
+    grep -Fx "stale: $window" "$out" >/dev/null \
+      || fail "a live pause '$line' did not surface as a bare stopped-crew wake: $(cat "$out")"
+  done
+  pass "an unparseable [for=] tag is ignored and the pause is exactly as loud as an untagged one"
+}
+
 # A stated duration is honoured only while the crew's authoritative state still
 # reads as the wait it describes. A run that parks at a gate, or a crew whose
 # state cannot be read, under a still-current declaration surfaces at first sight
@@ -2592,6 +2675,9 @@ test_current_declared_pause_survives_a_moving_pane_under_a_live_worker
 test_busy_pane_under_a_stale_declaration_still_wedge_escalates
 test_pause_declared_duration_classifier
 test_live_worker_stated_wait_is_absorbed_for_its_duration
+test_stated_duration_90m_is_honoured_exactly
+test_fractional_stated_duration_truncates_down_1_5h_is_3600s
+test_unparseable_stated_duration_falls_back_to_undeclared_handling
 test_current_stated_wait_does_not_hide_a_parked_or_unreadable_crew
 test_stated_wait_surfaces_once_on_expiry_per_declaration
 test_expired_stated_wait_over_a_running_pipeline_resumes_the_wedge_check

@@ -158,10 +158,14 @@ status_is_paused_or_captain_held() {  # <status-line>
 # Grammar: a "[for=<duration>]" tag in the same positions a decision key may sit -
 # among the tags before the line's first colon, or among the leading tags at the
 # head of the note ("paused: [key=x] [for=45m] <why>") - and only on a pause line.
-# <duration> is one or more <integer><unit> groups with unit h, m or s ("90s",
-# "45m", "1h30m"); fm_duration_secs owns the parse. The first tag wins. A malformed,
-# zero, or absent tag is no hint at all, never a guess, so such a line is exactly
-# as loud as an undeclared pause.
+# <duration> is written as one or more <integer><unit> groups with unit h, m or s
+# ("90s", "45m", "1h30m"); fm_duration_secs owns the parse, the same Go-style
+# parser the pipeline step reader uses. Go-style fractions and sub-second units are
+# also accepted: each fractional group is truncated down to its whole unit ("1.5h"
+# counts as 3600s, "1m5.5s" as 65s) and sub-second groups contribute nothing. The
+# first tag wins. An unparseable tag ("banana", empty, a bare number such as "45",
+# a negative), a zero total, or an absent tag is no hint at all, never a guess, so
+# such a line is exactly as loud as an undeclared pause.
 #
 # Honouring: a stated duration is clamped to the caller's pause window
 # (FM_PAUSE_RESURFACE_SECS), so a generous estimate cannot mute a pane for longer
@@ -172,8 +176,9 @@ status_is_paused_or_captain_held() {  # <status-line>
 # cadence an undeclared pause gets.
 
 # Whole seconds in a Go-style duration ("45m", "1h30m", "1m5.5s", "350ms"): one or
-# more <digits>[.<digits>]<unit> groups, unit h, m, s, ms, us or ns, fractions and
-# sub-second units truncated. Fails on anything else rather than guessing.
+# more <digits>[.<digits>]<unit> groups, unit h, m, s, ms, us or ns, each fractional
+# group truncated down to its whole unit ("1.5h" is 3600) and sub-second groups
+# contributing nothing. Fails on anything else rather than guessing.
 fm_duration_secs() {  # <duration> -> seconds
   local d=$1 total=0 num frac
   [ -n "$d" ] || return 1

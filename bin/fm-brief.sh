@@ -55,7 +55,9 @@
 # any wait of more than about four minutes that the worker ends its turn on - its
 # own test run, a pipeline gate, CI, a long build - is declared with the verb and a
 # stated duration ("<verb> [for=30m]: <what>", grammar owned by fm-classify-lib.sh
-# "stated wait durations"), declared again after any later line such as a gate
+# "stated wait durations": integer h/m/s groups such as 45m, 90m or 1h30m, a
+# fraction truncated down so 1.5h counts as one hour, an unparseable tag ignored
+# and the pause left without a duration), declared again after any later line such as a gate
 # answer's resolved line (which ends the pause) or before a longer wait outlives
 # the hour a stated duration is honoured for, and resolved when the wait ends.
 # The secondmate charter keeps its narrower external-wait wording: the watcher
@@ -368,9 +370,12 @@ The report is the only thing that survives, so anything worth keeping must be in
    escalates an idle pane within about four minutes. \`working:\` is for a phase change a supervisor
    should see; it does NOT quiet the wedge check, however long the sentence or its time estimate.
    Use \`blocked:\` when you are stuck and need help.
-   Declare a wait the moment it starts, with an honest upper estimate in whole minutes or hours
-   (\`45m\`, \`1h\`): append a line shaped like \`$PAUSED_VERB [for=30m]: integration tests running\`,
+   Declare a wait the moment it starts, with an honest upper estimate:
+   append a line shaped like \`$PAUSED_VERB [for=30m]: integration tests running\`,
    then \`resolved: {what finished}\` when it ends, so a quiet pane never reads as a wedge.
+   Write the duration as integer h, m or s groups such as \`45m\`, \`90m\` or \`1h30m\`.
+   A fraction is truncated down, so \`1.5h\` counts as one hour - write \`90m\` instead.
+   An unparseable tag is ignored, leaving the pause without a duration.
    For a wait longer than an hour, append the \`$PAUSED_VERB [for=...]:\` line again before the hour is up.
    A \`resolved\` line does not quiet the wedge check either, and any later line ends a pause:
    after a decision is answered and you go back to waiting, append the \`$PAUSED_VERB [for=...]:\` line again.
@@ -523,9 +528,12 @@ $RULE1
    escalates an idle pane within about four minutes. \`working:\` is for a phase change a supervisor
    should see; it does NOT quiet the wedge check, however long the sentence or its time estimate.
    Use \`blocked:\` when you are stuck and need help.
-   Declare a wait the moment it starts, with an honest upper estimate in whole minutes or hours
-   (\`45m\`, \`1h\`): append a line shaped like \`$PAUSED_VERB [for=30m]: integration tests running\`,
+   Declare a wait the moment it starts, with an honest upper estimate:
+   append a line shaped like \`$PAUSED_VERB [for=30m]: integration tests running\`,
    then \`resolved: {what finished}\` when it ends, so a quiet pane never reads as a wedge.
+   Write the duration as integer h, m or s groups such as \`45m\`, \`90m\` or \`1h30m\`.
+   A fraction is truncated down, so \`1.5h\` counts as one hour - write \`90m\` instead.
+   An unparseable tag is ignored, leaving the pause without a duration.
    For a wait longer than an hour, append the \`$PAUSED_VERB [for=...]:\` line again before the hour is up.
    A \`resolved\` line does not quiet the wedge check either, and any later line ends a pause:
    after answering a gate and going back to waiting, append the \`$PAUSED_VERB [for=...]:\` line again.
