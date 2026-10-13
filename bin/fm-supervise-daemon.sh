@@ -45,7 +45,8 @@
 #     escalated only after it has been idle for STALE_ESCALATE_SECS
 #     (configurable), rechecked once. A wedged crewmate is therefore detected
 #     within STALE_ESCALATE_SECS + a tick, never lost. A declared pause instead
-#     gets its own longer PAUSE_RESURFACE_SECS recheck, never a wedge escalation.
+#     gets its own longer PAUSE_RESURFACE_SECS recheck, never a wedge escalation,
+#     plus one recheck when a stated [for=] duration runs out.
 #     Crewmates are autonomous, so a delayed stale response does not stall a
 #     healthy crewmate's own progress.
 #     Buffered escalation delivery also has a max-defer alarm: if a digest stays
@@ -959,7 +960,7 @@ _oldest_line_age() {  # <buf> -> seconds since the oldest buffered item first ar
 #  3) heartbeat scan: every HEARTBEAT_SCAN_SECS, grep state/*.status for a
 #     captain-relevant line the per-wake classifier missed and escalate it.
 housekeeping() {  # <state>
-  local state=$1 now due f key task win marker age last max_defer oldest pause_secs
+  local state=$1 now due f key task win marker age last max_defer oldest pause_secs expiry decl_mtime window
   now=$(_now)
   migrate_watcher_pause_markers "$state"
 
@@ -1026,7 +1027,10 @@ housekeeping() {  # <state>
   # and never escalated as one - but it MUST re-surface, so a forgotten pause cannot
   # rot invisibly. Past the window: busy (resumed) or gone -> drop; still idle and
   # still declaring the pause -> escalate a recheck digest and reset the marker so
-  # the window repeats.
+  # the window repeats. A pause that stated its own duration is also due once when
+  # that duration runs out, anchored on the declaration itself, through the same
+  # shared expiry record the watcher uses (fm-classify-lib.sh "stated wait
+  # durations"); its escalation resets the window like any other recheck.
   pause_secs=${FM_PAUSE_RESURFACE_SECS:-$FM_PAUSE_RESURFACE_SECS_DEFAULT}
   for marker in "$state"/.subsuper-paused-*; do
     [ -e "$marker" ] || continue
@@ -1042,7 +1046,14 @@ housekeeping() {  # <state>
       continue
     fi
     age=$(( now - $(cat "$marker" 2>/dev/null || echo "$now") ))
-    [ "$age" -ge "$pause_secs" ] || continue
+    expiry='' decl_mtime=''
+    if window=$(status_pause_declared_window "$last" "$pause_secs") \
+      && decl_mtime=$(_stat_file_mtime "$state/$task.status") \
+      && [ $(( now - decl_mtime )) -ge "$window" ] \
+      && ! pause_expiry_reported "$state" "$task" "$decl_mtime"; then
+      expiry=$window
+    fi
+    [ -n "$expiry" ] || [ "$age" -ge "$pause_secs" ] || continue
     stale_window_is_busy "$win" "$state"
     case "$?" in
       0) rm -f "$marker" ;;
@@ -1050,7 +1061,12 @@ housekeeping() {  # <state>
       *)
         last=$(last_status_line "$state/$task.status")
         if [ -n "$last" ] && status_is_paused "$last"; then
-          escalate_add "$state" "paused ${age}s (awaiting external, recheck whether the wait still holds): $win"
+          if [ -n "$expiry" ]; then
+            escalate_add "$state" "paused $(( now - decl_mtime ))s (declared wait of ${expiry}s has run out, check the worker is still waiting and not wedged): $win"
+            pause_expiry_record "$state" "$task" "$decl_mtime"
+          else
+            escalate_add "$state" "paused ${age}s (awaiting external, recheck whether the wait still holds): $win"
+          fi
           _now > "$marker"
         else
           rm -f "$marker"

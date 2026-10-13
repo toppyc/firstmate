@@ -1079,7 +1079,7 @@ fm_wake_task_bookkeeping_paths() {  # <state> <task-id> [<endpoint>]
   fm_wake_signal_seen_path "$state" "$state/$id.status"; printf '\n'
   fm_wake_signal_seen_path "$state" "$state/$id.turn-ended"; printf '\n'
   key=$(printf '%s' "$id" | tr ':/.' '___')
-  for name in hb-surfaced subsuper-seen-status subsuper-stale subsuper-paused; do
+  for name in hb-surfaced subsuper-seen-status subsuper-stale subsuper-paused pause-expiry; do
     printf '%s/.%s-%s\n' "$state" "$name" "$key"
   done
   [ -n "$endpoint" ] || return 0

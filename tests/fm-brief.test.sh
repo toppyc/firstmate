@@ -730,7 +730,7 @@ test_herdr_lab_contract_applies_to_scouts_but_not_secondmates() {
 }
 
 test_pause_verb_override_renders_all_brief_scaffolds() {
-  local home kind id brief
+  local home kind id brief pause_use
   home="$TMP_ROOT/pause-verb-home"
   mkdir -p "$home/data"
 
@@ -753,12 +753,17 @@ test_pause_verb_override_renders_all_brief_scaffolds() {
     brief="$home/data/$id/brief.md"
     assert_grep "States: working, needs-decision, blocked, awaiting, done, failed." "$brief" \
       "$kind brief did not render the configured pause verb in its states list"
+    # Crewmate briefs teach the stated-duration shape; the charter keeps the bare verb.
     # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
-    assert_grep 'Use `awaiting: {why}`' "$brief" \
+    if [ "$kind" = secondmate ]; then pause_use='Use `awaiting: {why}`'; else pause_use='Use `awaiting [for=<duration>]: {why}`'; fi
+    assert_grep "$pause_use" "$brief" \
       "$kind brief did not instruct the configured pause status"
     # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
     assert_no_grep '`paused: {why}`' "$brief" \
       "$kind brief still instructs the default paused status"
+    # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
+    assert_no_grep '`paused \[for=<duration>\]: {why}`' "$brief" \
+      "$kind brief still instructs the default paused status with a duration"
     assert_grep 'a blocker or wait clears' "$brief" \
       "$kind brief did not require durable resolution when a blocker clears"
     assert_grep 'even when the answer is what started that work' "$brief" \
@@ -814,7 +819,7 @@ test_briefs_teach_long_wait_paths_and_hazards() {
     brief="$home/data/$id/brief.md"
     assert_present "$brief" "$kind: brief was not scaffolded"
     # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
-    assert_grep 'append a line shaped like `paused: integration tests running, duration unknown`' "$brief" \
+    assert_grep 'append a line shaped like `paused [for=30m]: integration tests running`' "$brief" \
       "$kind: brief does not show the shape of a declared long wait"
     # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
     assert_grep 'then `resolved: {what finished}` when it ends, so a quiet pane never reads as a wedge.' "$brief" \
@@ -852,7 +857,7 @@ test_briefs_teach_long_wait_paths_and_hazards() {
   FM_HOME="$home" FM_CLASSIFY_PAUSED_VERB=awaiting \
     "$ROOT/bin/fm-brief.sh" brief-lessons-verb some-proj --mode no-mistakes >/dev/null 2>&1
   # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
-  assert_grep '`awaiting: integration tests running, duration unknown`' "$home/data/brief-lessons-verb/brief.md" \
+  assert_grep '`awaiting [for=30m]: integration tests running`' "$home/data/brief-lessons-verb/brief.md" \
     "long-wait shape did not follow the configured pause verb"
   pass "fm-brief.sh: briefs teach the long-wait shape, absolute firstmate paths, and ship pipeline hazards"
 }
@@ -907,13 +912,13 @@ test_status_protocol_teaches_quiet_waits_and_one_key_per_line() {
         key_line=$(brief_example "$brief" 'working [key=') \
           || fail "$verb/secondmate: charter shows no keyed working example"
       else
-        assert_grep "Use \`$verb: {why}\` - distinct from \`blocked:\` - whenever you end your turn and wait on" "$brief" \
+        assert_grep "Use \`$verb [for=<duration>]: {why}\` - distinct from \`blocked:\` - whenever you end your turn and wait on" "$brief" \
           "$verb/$kind: brief does not make every turn-ending wait a declared pause"
         assert_grep 'something for longer than about four minutes' "$brief" \
           "$verb/$kind: brief gives no actionable wait threshold"
         assert_grep 'it does NOT quiet the wedge check, however long the sentence' "$brief" \
           "$verb/$kind: brief does not say working: leaves the wedge check armed"
-        assert_grep "append the \`$verb:\` line again." "$brief" \
+        assert_grep "append the \`$verb [for=...]:\` line again." "$brief" \
           "$verb/$kind: brief does not re-declare the pause after a resolved line"
         assert_grep "needs-decision/blocked/$verb/done/failed states" "$brief" \
           "$verb/$kind: brief hard-codes a pause verb in its reportable states"
@@ -923,14 +928,18 @@ test_status_protocol_teaches_quiet_waits_and_one_key_per_line() {
         assert_grep 'so two decisions need two lines' "$brief" \
           "$verb/$kind: brief does not split two decisions onto two lines"
 
-        pause_line=$(brief_example "$brief" "$verb: integration tests") \
+        # The taught shape is the shape the watcher honours: a pause whose stated
+        # duration it reads, which prose time estimates never are.
+        pause_line=$(brief_example "$brief" "$verb [for=30m]") \
           || fail "$verb/$kind: brief shows no declared-wait example"
         status=0
         FM_CLASSIFY_PAUSED_VERB=$verb bash -c '
           . "$1/bin/fm-marker-lib.sh"; . "$1/bin/fm-classify-lib.sh"
-          status_is_paused "$2" && ! status_is_paused "working: next ~30-60min: full gates"
+          status_is_paused "$2" && ! status_is_paused "working: next ~30-60min: full gates" \
+            && [ "$(status_pause_declared_secs "$2")" = 1800 ] \
+            && ! status_pause_declared_secs "working: next ~30-60min: full gates" >/dev/null
         ' _ "$ROOT" "$pause_line" || status=$?
-        expect_code 0 "$status" "$verb/$kind: taught pause line '$pause_line' does not read as a pause"
+        expect_code 0 "$status" "$verb/$kind: taught pause line '$pause_line' does not read as a 30-minute pause"
         key_line=$(brief_example "$brief" 'needs-decision [key=') \
           || fail "$verb/$kind: brief shows no keyed decision example"
       fi
@@ -989,7 +998,7 @@ If the top-level path is the primary checkout or not the worktree you were launc
    firstmate reads your pane for that.
    A mid-task \`working:\` line (including setup complete) is nonterminal: do not end the
    turn after it; continue the same stage until a defined \`done:\` gate under Definition of done.
-   Use \`paused: {why}\` - distinct from \`blocked:\` - whenever you end your turn and wait on
+   Use \`paused [for=<duration>]: {why}\` - distinct from \`blocked:\` - whenever you end your turn and wait on
    should see; it does NOT quiet the wedge check, however long the sentence or its time estimate.
    Use \`blocked:\` when you are stuck and need help.
 5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.

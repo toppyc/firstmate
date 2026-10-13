@@ -1393,6 +1393,302 @@ test_busy_pane_under_a_stale_declaration_still_wedge_escalates() {
   pass "a busy pane carrying a declaration is never absorbed as paused and still climbs the wedge ladder"
 }
 
+# --- a pause that states its own duration --------------------------------------
+#
+# The live 2026-10-11/12 problem: a pause declaration carried no expected duration,
+# so the watcher could not tell a two-minute wait from a forty-five-minute one. A
+# LIVE worker's declared pause surfaced at first sight like a stopped crew, and a
+# crew working through a pipeline run escalated as a possible wedge every
+# STALE_ESCALATE_SECS. A pause line may now state "[for=<duration>]"
+# (fm-classify-lib.sh "stated wait durations"); these cases prove the quieter
+# check still bites, and that the new quiet is bounded by the stated duration.
+
+# Seed one stale-ready pane under a LIVE claude agent (the agent probe reads the
+# pane command) whose status file holds <status-text>, declared <declared-age>
+# seconds ago. Prints the window key.
+seed_live_declared_pane() {  # <state> <id> <window> <capture-file> <status-text> <declared-age>
+  local state=$1 id=$2 window=$3 capture_file=$4 statusf key
+  statusf="$state/$id.status"
+  printf 'window=%s\nkind=ship\nharness=claude\nbackend=tmux\n' "$window" > "$state/$id.meta"
+  printf '%s\n' "$5" > "$statusf"
+  backdate_status "$statusf" "$6"
+  printf '%s' "$(seen_sig "$statusf")" > "$state/.seen-$(printf '%s' "$id" | tr '.' '_')_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  printf '%s' "$(hash_text "$(cat "$capture_file")")" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  printf '%s' "$key"
+}
+
+declared_watch_bg() {  # <state> <fakebin> <window> <capture-file> <out> [extra env...]
+  local state=$1 fakebin=$2 window=$3 capture_file=$4 out=$5
+  shift 5
+  env PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=claude FM_STATE_OVERRIDE="$state" \
+    FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_POLL=0.3 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$@" "$WATCH" >> "$out" &
+}
+
+test_pause_declared_duration_classifier() {
+  local cap=3600
+  [ "$(status_pause_declared_secs 'paused [for=45m]: batch running')" = 2700 ] \
+    || fail "a before-colon [for=45m] did not read as 2700s"
+  [ "$(status_pause_declared_secs 'paused: [key=batch] [for=1h30m] batch running')" = 5400 ] \
+    || fail "a note-head [for=1h30m] after a key did not read as 5400s"
+  [ "$(status_pause_declared_secs 'paused [key=batch] [for=90s]: batch running')" = 90 ] \
+    || fail "a [for=90s] after a before-colon key did not read as 90s"
+  status_pause_declared_secs 'paused: batch running, back in [for=45m]' >/dev/null \
+    && fail "a [for=] tag inside the prose was read as a stated duration"
+  status_pause_declared_secs 'paused: integration tests running, duration unknown' >/dev/null \
+    && fail "an untagged pause read as a stated duration"
+  local bad
+  for bad in 'paused [for=0m]: x' 'paused [for=45]: x' 'paused [for=soon]: x' 'paused [for=]: x' 'paused [for=-5m]: x'; do
+    status_pause_declared_secs "$bad" >/dev/null && fail "malformed stated duration '$bad' was honoured"
+  done
+  status_pause_declared_secs 'working [for=45m]: x' >/dev/null \
+    && fail "a [for=] tag on a non-pause line was honoured"
+  [ "$(status_pause_declared_window 'paused [for=2h]: x' "$cap")" = "$cap" ] \
+    || fail "a stated duration beyond the pause window was not clamped to it"
+  [ "$(status_pause_declared_window 'paused [for=10m]: x' "$cap")" = 600 ] \
+    || fail "a stated duration inside the pause window was altered"
+  status_pause_declared_window 'paused: x' "$cap" >/dev/null \
+    && fail "an untagged pause produced a stated window"
+  [ "$(FM_CLASSIFY_PAUSED_VERB=awaiting status_pause_declared_secs 'awaiting [for=10m]: x')" = 600 ] \
+    || fail "a stated duration did not follow the configured pause verb"
+  [ "$(fm_duration_secs 1m5.5s)" = 65 ] || fail "a fractional Go duration did not truncate to whole seconds"
+  [ "$(fm_duration_secs 350ms)" = 0 ] || fail "a sub-second Go duration did not read as zero"
+  pass "a pause's [for=] duration is read only from its tag positions, clamped, and never guessed"
+}
+
+# Proof the false alarm stops: a LIVE worker whose declaration states a long wait
+# is absorbed for it, including while its pane moves, instead of being surfaced
+# at first sight. The compressed wedge threshold means any four-minute-style
+# re-fire would land inside the observation window.
+test_live_worker_stated_wait_is_absorbed_for_its_duration() {
+  local dir state fakebin out capture_file window key pid i
+  dir=$(make_case stated-wait-live); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; window="test:fm-stated-live"
+  printf 'idle, the 45-minute batch is running elsewhere\n' > "$capture_file"
+  key=$(seed_live_declared_pane "$state" stated-live "$window" "$capture_file" \
+    "paused [for=45m]: waiting on the 45-minute batch" 120)
+  : > "$out"
+  declared_watch_bg "$state" "$fakebin" "$window" "$capture_file" "$out" \
+    FM_FAKE_CREW_STATE='state: paused · source: status-log · waiting on the 45-minute batch' \
+    FM_STALE_ESCALATE_SECS=1 FM_PAUSE_RESURFACE_SECS=3600
+  pid=$!
+  i=0
+  while [ "$i" -lt 30 ]; do
+    i=$((i + 1))
+    # Move the pane for the first half of the window, then let it settle, so both
+    # the new-hash and the repeat-hash paths are exercised.
+    [ "$i" -le 15 ] && printf 'idle, the 45-minute batch is running elsewhere, tick %s\n' "$i" > "$capture_file"
+    sleep 0.15
+    kill -0 "$pid" 2>/dev/null \
+      || { reap "$pid"; fail "a live worker's current 45m declaration surfaced: $(cat "$out")"; }
+  done
+  [ -e "$state/.paused-$key" ] || { reap "$pid"; fail "a live worker's current stated wait was not absorbed on the pause cadence"; }
+  [ ! -e "$state/.stale-since-$key" ] || { reap "$pid"; fail "a live worker's current stated wait started the wedge timer"; }
+  reap "$pid"
+  [ ! -s "$out" ] || fail "a live worker's current stated wait printed a wake: $(cat "$out")"
+  [ ! -s "$state/.wake-queue" ] || fail "a live worker's current stated wait queued a wake"
+  pass "a live worker's stated wait is absorbed for its duration, across a moving pane, without four-minute re-fires"
+}
+
+# A stated duration is honoured only while the crew's authoritative state still
+# reads as the wait it describes. A run that parks at a gate, or a crew whose
+# state cannot be read, under a still-current declaration surfaces at first sight
+# exactly as an undeclared live pause does, rather than waiting out the duration.
+test_current_stated_wait_does_not_hide_a_parked_or_unreadable_crew() {
+  local dir state fakebin out capture_file window verdict pid n=0
+  for verdict in \
+    'state: parked · source: run-step · parked at review: 1 finding(s) (ask-user: authority decision)' \
+    'state: unknown · source: pane · harness state unavailable (unknown none)'; do
+    n=$((n + 1))
+    dir=$(make_case "stated-wait-parked-$n"); state="$dir/state"; fakebin="$dir/fakebin"
+    out="$dir/watch.out"; capture_file="$dir/pane.txt"; window="test:fm-stated-parked"
+    printf 'idle at a gate the worker has not answered\n' > "$capture_file"
+    seed_live_declared_pane "$state" stated-parked "$window" "$capture_file" \
+      "paused [for=45m]: waiting on the pipeline" 60 >/dev/null
+    : > "$out"
+    declared_watch_bg "$state" "$fakebin" "$window" "$capture_file" "$out" \
+      FM_FAKE_CREW_STATE="$verdict" FM_STALE_ESCALATE_SECS=240 FM_PAUSE_RESURFACE_SECS=3600
+    pid=$!
+    wait_for_exit "$pid" 40 || { reap "$pid"; fail "a current stated wait hid a crew reading '$verdict'"; }
+    grep -Fx "stale: $window" "$out" >/dev/null \
+      || fail "a crew reading '$verdict' under a current stated wait did not surface as a stopped crew: $(cat "$out")"
+  done
+  pass "a current stated wait never hides a parked or unreadable crew"
+}
+
+# Proof the check still bites on expiry, and only once per declaration: past its
+# stated duration the live worker surfaces once, worded as an expired declaration;
+# re-arming over the same declaration stays quiet; a fresh declaration earns its
+# own expiry.
+test_stated_wait_surfaces_once_on_expiry_per_declaration() {
+  local dir state fakebin out capture_file window key pid round expired statusf
+  dir=$(make_case stated-wait-expiry); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; window="test:fm-stated-expiry"
+  statusf="$state/stated-expiry.status"
+  printf 'idle, the batch should have finished by now\n' > "$capture_file"
+  key=$(seed_live_declared_pane "$state" stated-expiry "$window" "$capture_file" \
+    "paused [for=2m]: waiting on the batch" 200)
+  : > "$out"
+
+  declared_watch_bg "$state" "$fakebin" "$window" "$capture_file" "$out" \
+    FM_FAKE_CREW_STATE='state: paused · source: status-log · waiting on the batch' \
+    FM_STALE_ESCALATE_SECS=1 FM_PAUSE_RESURFACE_SECS=3600
+  pid=$!
+  wait_for_exit "$pid" 40 || { reap "$pid"; fail "an expired stated wait under a live worker never surfaced"; }
+  grep -F "declared wait of 120s has run out" "$out" >/dev/null \
+    || fail "the expiry surface was not worded as an expired declaration: $(cat "$out")"
+  grep -F "possible wedge" "$out" >/dev/null && fail "the expiry surface was mislabeled a possible wedge"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the expiry surface"
+
+  round=1
+  while [ "$round" -le 4 ]; do
+    declared_watch_bg "$state" "$fakebin" "$window" "$capture_file" "$out" \
+      FM_FAKE_CREW_STATE='state: paused · source: status-log · waiting on the batch' \
+      FM_STALE_ESCALATE_SECS=1 FM_PAUSE_RESURFACE_SECS=3600
+    pid=$!
+    if wait_live "$pid" 12; then reap "$pid"; else wait "$pid"; fi
+    ack_stopped_cycle "$state" || fail "could not acknowledge re-arm round $round"
+    round=$((round + 1))
+  done
+  expired=$(grep -c "has run out" "$out")
+  [ "$expired" -eq 1 ] || fail "one expired declaration surfaced $expired times across re-arms: $(cat "$out")"
+  [ "$(grep -c "stale: $window" "$out")" -eq 1 ] \
+    || fail "an already-reported expiry kept waking on re-arm: $(cat "$out")"
+
+  # A re-declaration is newer than the one it replaces, as it always is in life.
+  printf 'paused [for=2m]: batch rerun after a flake\n' >> "$statusf"
+  backdate_status "$statusf" 150
+  printf '%s' "$(seen_sig "$statusf")" > "$state/.seen-stated-expiry_status"
+  declared_watch_bg "$state" "$fakebin" "$window" "$capture_file" "$out" \
+    FM_FAKE_CREW_STATE='state: paused · source: status-log · batch rerun after a flake' \
+    FM_STALE_ESCALATE_SECS=1 FM_PAUSE_RESURFACE_SECS=3600
+  pid=$!
+  wait_for_exit "$pid" 40 || { reap "$pid"; fail "a fresh declaration's own expiry never surfaced"; }
+  [ "$(grep -c "has run out" "$out")" -eq 2 ] || fail "a re-declaration did not earn its own expiry surface: $(cat "$out")"
+  pass "a stated wait surfaces once when it runs out, stays quiet on re-arm, and a re-declaration earns its own expiry"
+}
+
+# The other half of the bite: a stated wait over a running pipeline used to stay
+# absorbed for the whole hour a bare declaration is good for. It now surfaces at
+# its own stated expiry, and after that the pane is back on the ordinary wedge
+# ladder rather than parked on the pause cadence.
+test_expired_stated_wait_over_a_running_pipeline_resumes_the_wedge_check() {
+  local dir state fakebin out capture_file window key pid
+  dir=$(make_case stated-wait-working); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; window="test:fm-stated-working"
+  printf 'idle, pipeline running in the background\n' > "$capture_file"
+  key=$(seed_live_declared_pane "$state" stated-working "$window" "$capture_file" \
+    "paused [for=2m]: suite running under the pipeline" 200)
+  : > "$out"
+  declared_watch_bg "$state" "$fakebin" "$window" "$capture_file" "$out" \
+    FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)' \
+    FM_STALE_ESCALATE_SECS=240 FM_PAUSE_RESURFACE_SECS=3600
+  pid=$!
+  wait_for_exit "$pid" 40 || { reap "$pid"; fail "an expired stated wait over a running pipeline stayed absorbed"; }
+  grep -F "has run out" "$out" >/dev/null || fail "the pipeline-backed expiry was not worded as expired: $(cat "$out")"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the pipeline-backed expiry surface"
+
+  : > "$out"
+  declared_watch_bg "$state" "$fakebin" "$window" "$capture_file" "$out" \
+    FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)' \
+    FM_STALE_ESCALATE_SECS=1 FM_PAUSE_RESURFACE_SECS=3600
+  pid=$!
+  wait_for_exit "$pid" 40 || { reap "$pid"; fail "an expired stated wait over a running pipeline never resumed wedge escalation"; }
+  grep -F "possible wedge, escalation 1" "$out" >/dev/null \
+    || fail "after its expiry the pane did not return to the wedge ladder: $(cat "$out")"
+  [ ! -e "$state/.paused-$key" ] || fail "an expired stated wait stayed on the pause cadence"
+  pass "an expired stated wait over a running pipeline surfaces once, then resumes the ordinary wedge check"
+}
+
+# The run's own step as the duration source, for a worker that forgot to declare:
+# an idle working: pane behind an active no-mistakes step the pipeline reports
+# live re-arms its wedge timer instead of escalating, leaving the escalation count
+# alone. A step that goes quiet, or outlives the pause window, escalates exactly
+# as before, and continues the existing count into the deep-inspection demand.
+test_live_pipeline_step_rearms_the_wedge_timer_until_it_stops_accounting() {
+  local dir state fakebin out capture_file window key pid since verdict n
+  dir=$(make_case pipeline-step-live); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; window="test:fm-step-live"
+  printf 'idle, waiting on its own pipeline run\n' > "$capture_file"
+  key=$(seed_live_declared_pane "$state" step-live "$window" "$capture_file" \
+    "working: validation started" 30)
+  printf '%s' "$(hash_text "$(cat "$capture_file")")" > "$state/.stale-$key"
+  echo 2 > "$state/.wedge-escalations-$key"
+
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  : > "$out"
+  declared_watch_bg "$state" "$fakebin" "$window" "$capture_file" "$out" \
+    FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running) · step test active 300s (live)' \
+    FM_STALE_ESCALATE_SECS=240 FM_PAUSE_RESURFACE_SECS=3600
+  pid=$!
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "an idle pane behind a live pipeline step wedge-escalated: $(cat "$out")"
+  fi
+  since=$(cat "$state/.stale-since-$key" 2>/dev/null || echo 0)
+  reap "$pid"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the intentional live-step stop"
+  [ $(( $(date +%s) - since )) -lt 60 ] || fail "a live pipeline step did not re-arm the wedge timer"
+  [ "$(cat "$state/.wedge-escalations-$key")" = 2 ] || fail "a silent re-arm changed the escalation count"
+  [ ! -s "$state/.wake-queue" ] || fail "a live pipeline step queued a wake"
+
+  for verdict in \
+    'state: working · source: run-step · validating (running) · step test active 300s (quiet)' \
+    'state: working · source: run-step · validating (running) · step ci active 4000s (live)' \
+    'state: working · source: run-step · validating (running)' \
+    'state: working · source: pane · harness busy (step test active 300s (live))'; do
+    echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+    n=$(cat "$state/.wedge-escalations-$key")
+    : > "$out"
+    declared_watch_bg "$state" "$fakebin" "$window" "$capture_file" "$out" \
+      FM_FAKE_CREW_STATE="$verdict" FM_STALE_ESCALATE_SECS=240 FM_PAUSE_RESURFACE_SECS=3600
+    pid=$!
+    wait_for_exit "$pid" 40 || { reap "$pid"; fail "a pipeline step that no longer accounts for the wait muted the wedge check: $verdict"; }
+    grep -F "possible wedge, escalation $((n + 1))" "$out" >/dev/null \
+      || fail "'$verdict' did not continue the escalation ladder: $(cat "$out")"
+    ack_stopped_cycle "$state" || fail "could not acknowledge the '$verdict' escalation"
+  done
+  grep -F "demand-deep-inspection" "$out" >/dev/null \
+    || fail "the deep-inspection demand did not survive a silent re-arm: $(cat "$out")"
+  pass "a live pipeline step quiets an idle pane's wedge timer, and a quiet, overlong, or unreadable step still escalates"
+}
+
+# A foreground wait still bites. A busy pane past its turn-age bound escalates
+# with no declaration, and equally with a current stated duration AND a live
+# pipeline step behind it: neither new duration source reaches a busy pane.
+test_busy_foreground_wait_escalates_despite_stated_wait_and_live_step() {
+  local dir state fakebin out capture_file window key pid statusline
+  for statusline in 'working: setup complete' 'paused [for=45m]: holding the suite in the foreground'; do
+    dir=$(make_case "busy-foreground-$(printf '%s' "$statusline" | cksum | cut -d' ' -f1)")
+    state="$dir/state"; fakebin="$dir/fakebin"
+    out="$dir/watch.out"; capture_file="$dir/pane.txt"; window="test:fm-busy-foreground"
+    printf 'Working...' > "$capture_file"
+    printf 'window=%s\nkind=ship\nharness=pi\n' "$window" > "$state/busy-foreground.meta"
+    record_pi_busy "$state" busy-foreground
+    printf '%s\n' "$statusline" > "$state/busy-foreground.status"
+    backdate_status "$state/busy-foreground.status" 30
+    printf '%s' "$(seen_sig "$state/busy-foreground.status")" > "$state/.seen-busy-foreground_status"
+    key=$(printf '%s' "$window" | tr ':/.' '___')
+    printf '%s' "$(hash_text "Working...")" > "$state/.hash-$key"
+    printf '1\n' > "$state/.count-$key"
+    touch -t 200001010000 "$state/busy-foreground.meta"
+    echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+    : > "$out"
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+      FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+      FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running) · step test active 300s (live)' \
+      FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 FM_PAUSE_RESURFACE_SECS=3600 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+      FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+    pid=$!
+    wait_for_exit "$pid" 40 || { reap "$pid"; fail "a busy foreground wait ('$statusline') was muted"; }
+    grep -F "possible wedge" "$out" >/dev/null \
+      || fail "a busy foreground wait ('$statusline') did not escalate as a possible wedge: $(cat "$out")"
+  done
+  pass "a busy foreground wait escalates with or without a current stated wait and a live pipeline step"
+}
+
 # --- consecutive wedge escalations on the same pane demand deep inspection ----
 # Root cause of the PR #252 incident's ~20 minutes of unnoticed green: each
 # wedge escalation fires, gets classified as "still validating" one poll later
@@ -2294,6 +2590,13 @@ test_current_declared_pause_absorbed_despite_prior_wedge_escalation
 test_stale_declared_pause_still_wedge_escalates
 test_current_declared_pause_survives_a_moving_pane_under_a_live_worker
 test_busy_pane_under_a_stale_declaration_still_wedge_escalates
+test_pause_declared_duration_classifier
+test_live_worker_stated_wait_is_absorbed_for_its_duration
+test_current_stated_wait_does_not_hide_a_parked_or_unreadable_crew
+test_stated_wait_surfaces_once_on_expiry_per_declaration
+test_expired_stated_wait_over_a_running_pipeline_resumes_the_wedge_check
+test_live_pipeline_step_rearms_the_wedge_timer_until_it_stops_accounting
+test_busy_foreground_wait_escalates_despite_stated_wait_and_live_step
 test_nonterminal_stale_repairs_missing_or_corrupt_timer
 test_triage_log_size_cap_accepts_spaced_wc_counts
 test_procevent_captured_result_surfaces_proactively

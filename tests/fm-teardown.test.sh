@@ -1365,7 +1365,8 @@ SH
 # here the way each writer names it: the watcher's signal seen markers
 # (bin/fm-wake-lib.sh fm_wake_signal_seen_path), the heartbeat backstop's
 # surfaced marker (bin/fm-push-transition-lib.sh), the away-mode daemon's
-# task-keyed markers (bin/fm-supervise-daemon.sh), and the watcher's
+# task-keyed markers (bin/fm-supervise-daemon.sh), the shared stated-wait expiry
+# record (bin/fm-classify-lib.sh pause_expiry_path), and the watcher's
 # endpoint-keyed pane and pause markers (bin/fm-watch.sh pause_key). A torn-down
 # task must leave none of them, while a neighbouring task's markers, including
 # one whose id shares this id as a prefix, must survive.
@@ -1378,9 +1379,10 @@ test_teardown_retires_supervision_bookkeeping() {
   : > "$state/task-x1.turn-ended"
   for name in .seen-task-x1_status .seen-task-x1_turn-ended .hb-surfaced-task-x1 \
     .subsuper-seen-status-task-x1 .subsuper-stale-task-x1 .subsuper-paused-task-x1 \
+    .pause-expiry-task-x1 \
     ".hash-$ep" ".count-$ep" ".stale-$ep" ".stale-since-$ep" ".wedge-escalations-$ep" \
     ".paused-$ep" ".paused-rechecked-$ep" ".paused-resurfaced-$ep" \
-    .seen-task-x10_status .hb-surfaced-task-x10 ".hash-$other" ".paused-$other"; do
+    .seen-task-x10_status .hb-surfaced-task-x10 .pause-expiry-task-x10 ".hash-$other" ".paused-$other"; do
     printf 'x\n' > "$state/$name"
   done
 
@@ -1394,7 +1396,7 @@ test_teardown_retires_supervision_bookkeeping() {
   left=$(find "$state" -mindepth 1 -maxdepth 1 -exec basename {} \; \
     | grep -E '(^|[._-])task-x1([._]|$)|firstmate_fm-task-x1$' || true)
   [ -z "$left" ] || fail "bookkeeping-retire: teardown left per-task records behind:"$'\n'"$left"
-  for name in .seen-task-x10_status .hb-surfaced-task-x10 ".hash-$other" ".paused-$other"; do
+  for name in .seen-task-x10_status .hb-surfaced-task-x10 .pause-expiry-task-x10 ".hash-$other" ".paused-$other"; do
     [ -e "$state/$name" ] || fail "bookkeeping-retire: teardown removed another task's marker $name"
   done
   pass "teardown retires every supervision marker for its task and endpoint, and no other task's"

@@ -38,6 +38,14 @@
 #      checks" from "checks green, waiting on merge" (see nm_ci_checks_state) -
 #      a ci-step log-tail check overrides working -> done once checks read
 #      green, so a green PR is never silently read as still-validating.
+#      A working verdict read from full `axi status` also carries the run's
+#      own liveness clue when the CLI reports one, as the detail segment
+#      "step <name> active <secs>s (live|quiet)": the active step's elapsed
+#      time and whether no-mistakes marks its last activity quiet (no step log
+#      or agent activity for longer than its step_quiet_warning). With several
+#      active steps it names the first, reports the longest elapsed time, and
+#      reads quiet if any is quiet; an unreadable table emits no segment.
+#      fm-classify-lib.sh's crew_pipeline_step_live is the consumer.
 #   3. Reconcile the status log: if its last line says needs-decision/blocked but
 #      the run-step shows the run moved on, the log is deterministically stale and
 #      is flagged superseded. A genuinely parked run plus a needs-decision log
@@ -255,6 +263,59 @@ log_reports_ci_ready() {
     *PR*"checks green"*|*"checks green"*PR*) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# The run's own liveness clue, from the active_steps table `axi status` prints
+# while a step is running or fixing:
+#   active_steps[N]{step,status,active_for,last_activity,agent_pid,round}:
+#     test,running,22s,"0s ago: claude producing output","37650",starting
+# Columns are located by name, and last_activity is quoted text that may hold
+# commas. Prints "step <name> active <secs>s (live|quiet)" - the segment format
+# the header above documents - or nothing when the table is absent or any row
+# cannot be read, so a malformed table is no evidence rather than a guess.
+nm_step_activity() {
+  local rows name='' secs=0 quiet=0 row_name active_for activity row_secs
+  rows=$(printf '%s\n' "$RUN_OUT" | awk '
+    function indent(s) { match(s, /^[ \t]*/); return RLENGTH }
+    function field(s, want,   i, n, c, q, cur) {
+      n = 1; q = 0; cur = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (c == "\"") { q = !q; continue }
+        if (c == "," && !q) { if (n == want) return cur; n++; cur = ""; continue }
+        cur = cur c
+      }
+      return (n == want) ? cur : "\001"
+    }
+    !table && /^[ \t]*active_steps[[][0-9]+[]][{][^}]*[}]:[ \t]*$/ {
+      hi = indent($0); h = $0; sub(/^[^{]*[{]/, "", h); sub(/[}].*$/, "", h)
+      nc = split(h, cols, ","); sc = 0; fc = 0; ac = 0
+      for (i = 1; i <= nc; i++) {
+        if (cols[i] == "step") sc = i
+        if (cols[i] == "active_for") fc = i
+        if (cols[i] == "last_activity") ac = i
+      }
+      if (!sc || !fc || !ac) exit 2
+      table = 1; next
+    }
+    table {
+      if ($0 ~ /^[ \t]*$/ || indent($0) <= hi) exit
+      r = $0; sub(/^[ \t]+/, "", r); sub(/[ \t]+$/, "", r)
+      s = field(r, sc); f = field(r, fc); a = field(r, ac)
+      if (s == "\001" || f == "\001" || a == "\001" || s == "") exit 2
+      gsub(/[ \t]/, "", f); sub(/^[ \t]+/, "", a)
+      printf "%s\t%s\t%s\n", s, f, (tolower(a) ~ /^quiet/) ? "quiet" : "live"
+    }
+  ') || return 0
+  [ -n "$rows" ] || return 0
+  while IFS="$(printf '\t')" read -r row_name active_for activity; do
+    row_secs=$(fm_duration_secs "$active_for") || return 0
+    [ -n "$name" ] || name=$row_name
+    [ "$row_secs" -le "$secs" ] || secs=$row_secs
+    [ "$activity" = live ] || quiet=1
+  done <<< "$rows"
+  if [ "$quiet" = 1 ]; then activity=quiet; else activity=live; fi
+  printf 'step %s active %ss (%s)' "$name" "$secs" "$activity"
 }
 
 nm_ci_step_status() {
@@ -528,6 +589,10 @@ if [ "$HAVE_RUN" = 1 ]; then
             CI_LOG_STATE=not-ready
             ;;
         esac
+      fi
+      if [ "$RUN_STATE" = working ]; then
+        step_activity=$(nm_step_activity)
+        [ -z "$step_activity" ] || RUN_DETAIL="$RUN_DETAIL${SEP}$step_activity"
       fi
     fi
   fi
