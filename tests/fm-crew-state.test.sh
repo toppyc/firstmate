@@ -511,6 +511,81 @@ test_active_run_is_authoritative() {
   pass "active run-step is authoritative"
 }
 
+# A working run read from full `axi status` carries the pipeline's own liveness
+# clue from its active_steps table, which the watcher's wedge timer reads as the
+# duration a forgotten declaration never stated. Columns are found by name, the
+# quoted activity text may hold commas, quiet is read from no-mistakes' own
+# prefix, and an absent or malformed table yields no clue rather than a guess.
+run_running_with_active_steps() {  # <branch> <active-steps-header> <row>...
+  local branch=$1 header=$2
+  shift 2
+  run_running "$branch"
+  printf '  %s\n' "$header"
+  printf '    %s\n' "$@"
+}
+
+test_active_step_activity_is_reported_from_the_run() {
+  reset_fakes
+  local d out; d=$(new_case active-step-activity)
+  make_repo_on_branch "$d/wt" fm/feat-act
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-act.meta" "window=fm:fm-feat-act" "worktree=$d/wt" "kind=ship"
+  FM_FAKE_AXI_STATUS="$(run_running_with_active_steps fm/feat-act \
+    'active_steps[1]{step,status,active_for,last_activity,agent_pid,round}:' \
+    'test,running,5m3s,"0s ago: claude producing output, still going","37650",starting')"
+  out=$(run_crew_state "$d" feat-act)
+  assert_contains "$out" "state: working" "live active step -> working"
+  assert_contains "$out" "step test active 303s (live)" "live active step activity was not reported"
+
+  FM_FAKE_AXI_STATUS="$(run_running_with_active_steps fm/feat-act \
+    'active_steps[1]{round,last_activity,step,active_for}:' \
+    'auto-fix 1/3,"quiet 12m: no step log",review,1h2m')"
+  out=$(run_crew_state "$d" feat-act)
+  assert_contains "$out" "step review active 3720s (quiet)" "a quiet step read by column name was not reported as quiet"
+
+  FM_FAKE_AXI_STATUS="$(run_running_with_active_steps fm/feat-act \
+    'active_steps[1]{step,status,last_activity}:' 'test,running,"0s ago"')"
+  out=$(run_crew_state "$d" feat-act)
+  assert_not_contains "$out" "active " "a table with no active_for column produced an activity clue"
+
+  FM_FAKE_AXI_STATUS="$(run_running_with_active_steps fm/feat-act \
+    'active_steps[1]{step,status,active_for,last_activity}:' 'test,running,soon,"0s ago"')"
+  out=$(run_crew_state "$d" feat-act)
+  assert_not_contains "$out" "active " "an unparseable active_for produced an activity clue"
+
+  FM_FAKE_AXI_STATUS="$(run_running fm/feat-act)"
+  out=$(run_crew_state "$d" feat-act)
+  assert_contains "$out" "state: working" "a run with no active_steps table -> working"
+  assert_not_contains "$out" "active " "a run with no active_steps table produced an activity clue"
+  pass "a working run reports its active step's elapsed time and the pipeline's own live/quiet clue"
+}
+
+# The watcher's wedge timer reads that clue through crew_pipeline_step_live; run it
+# over the REAL helper so the segment format both sides share cannot drift.
+test_pipeline_step_live_reads_the_real_helper() {
+  reset_fakes
+  local d; d=$(new_case pipeline-step-live-real)
+  make_repo_on_branch "$d/wt" fm/feat-live
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-live.meta" "window=fm:fm-feat-live" "worktree=$d/wt" "kind=ship"
+  FM_FAKE_AXI_STATUS="$(run_running_with_active_steps fm/feat-live \
+    'active_steps[1]{step,status,active_for,last_activity,agent_pid,round}:' \
+    'test,running,5m,"3s ago: claude producing output","37650",starting')"
+  PATH="$d/fakebin:$PATH" FM_STATE_OVERRIDE="$d/state" crew_pipeline_step_live feat-live 3600 \
+    || fail "a live active step read through the real helper did not account for the wait"
+  PATH="$d/fakebin:$PATH" FM_STATE_OVERRIDE="$d/state" crew_pipeline_step_live feat-live 300 \
+    && fail "an active step at the window's edge still accounted for the wait"
+  FM_FAKE_AXI_STATUS="$(run_running_with_active_steps fm/feat-live \
+    'active_steps[1]{step,status,active_for,last_activity,agent_pid,round}:' \
+    'test,running,5m,"quiet 11m: no step log","37650",starting')"
+  PATH="$d/fakebin:$PATH" FM_STATE_OVERRIDE="$d/state" crew_pipeline_step_live feat-live 3600 \
+    && fail "a quiet active step read through the real helper still accounted for the wait"
+  FM_FAKE_AXI_STATUS="$(run_parked fm/feat-live)"
+  PATH="$d/fakebin:$PATH" FM_STATE_OVERRIDE="$d/state" crew_pipeline_step_live feat-live 3600 \
+    && fail "a run parked at a gate still accounted for the wait"
+  pass "crew_pipeline_step_live accepts only a live, in-window active step from the real helper"
+}
+
 # (b) needs-decision log + a resumed (running/fixing) run = SUPERSEDED
 test_stale_needs_decision_superseded() {
   reset_fakes
@@ -1789,6 +1864,8 @@ test_refused_run_is_distinguishable_from_no_run() {
 }
 
 test_active_run_is_authoritative
+test_active_step_activity_is_reported_from_the_run
+test_pipeline_step_live_reads_the_real_helper
 test_stale_needs_decision_superseded
 test_stale_blocked_superseded
 test_genuine_parked_not_superseded

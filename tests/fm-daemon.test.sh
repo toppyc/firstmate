@@ -349,6 +349,59 @@ test_housekeeping_paused_resurfaces_and_resets() {
   pass "housekeeping re-surfaces a stale declared pause on the long cadence and resets its window"
 }
 
+# Away mode honours a pause's stated duration through the same shared expiry
+# record the watcher uses: a declaration still inside its [for=] window rides the
+# long cadence untouched, one past it is rechecked once on expiry (well before the
+# long cadence would have come round), re-running housekeeping does not repeat
+# it, and a re-declaration earns its own. An undeclared pause is unchanged.
+test_housekeeping_stated_wait_resurfaces_once_on_expiry() {
+  local dir state fakebin win pane key statusf stamp
+  dir=$(make_supercase paused-stated-expiry)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  win="sess:fm-held-w14"; pane="$dir/pane.txt"; statusf="$state/held-w14.status"
+  printf 'idle prompt $\n' > "$pane"
+  key=$(printf '%s' "held-w14" | tr ':/.' '___')
+  daemon_backdate() {  # <file> <secs>
+    if stamp=$(date -r "$(( $(date +%s) - $2 ))" +%Y%m%d%H%M.%S 2>/dev/null); then :; else
+      stamp=$(date -d "@$(( $(date +%s) - $2 ))" +%Y%m%d%H%M.%S); fi
+    touch -t "$stamp" "$1"
+  }
+  run_housekeeping() {
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+      FM_STATE_OVERRIDE="$state" FM_PAUSE_RESURFACE_SECS=3600 housekeeping "$state"
+  }
+
+  # Undeclared and current declarations: the pause marker is young, so nothing is due.
+  for line in 'paused: waiting on the batch' 'paused [for=10m]: waiting on the batch'; do
+    printf '%s\n' "$line" > "$statusf"
+    daemon_backdate "$statusf" 200
+    echo $(( $(date +%s) - 30 )) > "$state/.subsuper-paused-$key"
+    : > "$state/.subsuper-escalations"
+    run_housekeeping
+    [ ! -s "$state/.subsuper-escalations" ] || fail "'$line' was rechecked before anything was due: $(cat "$state/.subsuper-escalations")"
+  done
+
+  printf 'paused [for=2m]: waiting on the batch\n' > "$statusf"
+  daemon_backdate "$statusf" 200
+  echo $(( $(date +%s) - 30 )) > "$state/.subsuper-paused-$key"
+  : > "$state/.subsuper-escalations"
+  run_housekeeping
+  grep -F "declared wait of 120s has run out" "$state/.subsuper-escalations" >/dev/null 2>&1 \
+    || fail "an expired stated wait was not rechecked in away mode: $(cat "$state/.subsuper-escalations" 2>/dev/null)"
+  grep -F "possible wedge" "$state/.subsuper-escalations" >/dev/null 2>&1 && fail "an expired stated wait was mislabeled a possible wedge"
+  : > "$state/.subsuper-escalations"
+  run_housekeeping
+  [ ! -s "$state/.subsuper-escalations" ] || fail "one expired declaration was rechecked twice: $(cat "$state/.subsuper-escalations")"
+
+  # A re-declaration is newer than the one it replaces, as it always is in life.
+  printf 'paused [for=2m]: batch rerun after a flake\n' >> "$statusf"
+  daemon_backdate "$statusf" 150
+  run_housekeeping
+  grep -F "has run out" "$state/.subsuper-escalations" >/dev/null 2>&1 \
+    || fail "a re-declaration did not earn its own away-mode expiry recheck"
+  pass "away mode rechecks a stated wait once when it runs out, and a re-declaration earns its own"
+}
+
 # A pause whose pane became busy again (the crew resumed) drops its marker without
 # escalating, exactly like a resumed wedge.
 test_housekeeping_paused_resumed_cleared() {
@@ -1852,6 +1905,7 @@ test_housekeeping_seeds_pause_marker_from_status
 test_housekeeping_persistent_stale_escalates
 test_housekeeping_resumed_stale_cleared
 test_housekeeping_paused_resurfaces_and_resets
+test_housekeeping_stated_wait_resurfaces_once_on_expiry
 test_housekeeping_paused_resumed_cleared
 test_housekeeping_paused_unpaused_cleared
 test_housekeeping_stale_marker_transitions_to_pause

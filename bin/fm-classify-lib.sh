@@ -66,7 +66,9 @@ FM_CLASSIFY_PAUSED_VERB_DEFAULT='paused'
 # avoids nagging a deliberate wait while ensuring a forgotten hold cannot rot
 # invisibly - it re-surfaces once for a recheck every window. One hour by default;
 # both consumers read FM_PAUSE_RESURFACE_SECS with this default so the cadence has
-# one owner.
+# one owner. It is also the ceiling on every stated wait duration below - a
+# pause's own [for=] hint and an active pipeline step's elapsed time - so no
+# duration source can quiet a pane for longer than an undeclared pause already could.
 # shellcheck disable=SC2034 # Read by the watcher and daemon (fm-watch.sh, fm-supervise-daemon.sh), not this lib.
 FM_PAUSE_RESURFACE_SECS_DEFAULT=3600
 
@@ -142,6 +144,125 @@ status_is_paused_or_captain_held() {  # <status-line>
   [ -n "$line" ] || return 1
   verb=$(status_line_verb "$line")
   [ "$verb" = "${FM_CLASSIFY_CAPTAIN_HELD_VERB:-$FM_CLASSIFY_CAPTAIN_HELD_VERB_DEFAULT}" ]
+}
+
+# --- stated wait durations ---------------------------------------------------
+#
+# A pause with no duration tells a supervisor nothing about how long the idle pane
+# is expected to stay idle, so it cannot tell a two-minute wait from a
+# forty-five-minute one. A pause may therefore state its expected duration:
+#   paused [for=45m]: integration suite running
+# This section is the ONE owner of that grammar and of how the stated duration is
+# honoured; both consumers (bin/fm-watch.sh, bin/fm-supervise-daemon.sh) call it.
+#
+# Grammar: a "[for=<duration>]" tag in the same positions a decision key may sit -
+# among the tags before the line's first colon, or among the leading tags at the
+# head of the note ("paused: [key=x] [for=45m] <why>") - and only on a pause line.
+# <duration> is written as one or more <integer><unit> groups with unit h, m or s
+# ("90s", "45m", "1h30m"); fm_duration_secs owns the parse, the same Go-style
+# parser the pipeline step reader uses. Go-style fractions and sub-second units are
+# also accepted: each fractional group is truncated down to its whole unit ("1.5h"
+# counts as 3600s, "1m5.5s" as 65s) and sub-second groups contribute nothing. The
+# first tag wins. An unparseable tag ("banana", empty, a bare number such as "45",
+# a negative), a zero total, or an absent tag is no hint at all, never a guess, so
+# such a line is exactly as loud as an undeclared pause.
+#
+# Honouring: a stated duration is clamped to the caller's pause window
+# (FM_PAUSE_RESURFACE_SECS), so a generous estimate cannot mute a pane for longer
+# than an undeclared pause already could, and a longer wait is re-declared. While
+# the declaration (aged from its status-file mtime) is younger than its clamped
+# window the wait is current; once it runs out, its expiry surfaces exactly once
+# (pause_expiry_reported/pause_expiry_record) and the pane then falls back to the
+# cadence an undeclared pause gets.
+
+# Whole seconds in a Go-style duration ("45m", "1h30m", "1m5.5s", "350ms"): one or
+# more <digits>[.<digits>]<unit> groups, unit h, m, s, ms, us or ns, each fractional
+# group truncated down to its whole unit ("1.5h" is 3600) and sub-second groups
+# contributing nothing. Fails on anything else rather than guessing.
+fm_duration_secs() {  # <duration> -> seconds
+  local d=$1 total=0 num frac
+  [ -n "$d" ] || return 1
+  while [ -n "$d" ]; do
+    num=${d%%[!0-9]*}
+    [ -n "$num" ] && [ "${#num}" -le 9 ] || return 1
+    d=${d#"$num"}
+    case "$d" in
+      .*)
+        frac=${d#.}
+        frac=${frac%%[!0-9]*}
+        [ -n "$frac" ] || return 1
+        d=${d#."$frac"}
+        ;;
+    esac
+    case "$d" in
+      ms*|us*|ns*) d=${d#??} ;;
+      h*) total=$(( total + 10#$num * 3600 )); d=${d#h} ;;
+      m*) total=$(( total + 10#$num * 60 )); d=${d#m} ;;
+      s*) total=$(( total + 10#$num )); d=${d#s} ;;
+      *) return 1 ;;
+    esac
+  done
+  printf '%s' "$total"
+}
+
+# Seconds a pause line states with a well-formed [for=<duration>] tag; fails when
+# the line is not a pause or states no usable duration. Pure read of the line.
+status_pause_declared_secs() {  # <status-line> -> seconds
+  local line=$1 zone rest tok secs
+  status_is_paused "$line" || return 1
+  case "$line" in
+    *:*) zone=${line%%:*}; rest=${line#*:} ;;
+    *) zone=$line; rest= ;;
+  esac
+  # The note-head tags join the zone only while they stay tags, so a tag inside
+  # the prose is never read.
+  rest=${rest#"${rest%%[![:space:]]*}"}
+  while :; do
+    case "$rest" in
+      \[*\]*)
+        tok=${rest%%\]*}
+        zone="$zone $tok]"
+        rest=${rest#"$tok"\]}
+        rest=${rest#"${rest%%[![:space:]]*}"}
+        ;;
+      *) break ;;
+    esac
+  done
+  case "$zone" in
+    *\[for=*\]*) tok=${zone#*\[for=}; tok=${tok%%\]*} ;;
+    *) return 1 ;;
+  esac
+  secs=$(fm_duration_secs "$tok") || return 1
+  [ "$secs" -gt 0 ] || return 1
+  printf '%s' "$secs"
+}
+
+# The window a pause line's stated duration keeps current: its [for=] seconds
+# clamped to <cap>. Fails when the line states no usable duration, leaving the
+# caller on the cadence an undeclared pause gets.
+status_pause_declared_window() {  # <status-line> <cap-secs> -> seconds
+  local secs
+  secs=$(status_pause_declared_secs "$1") || return 1
+  [ "$secs" -le "$2" ] || secs=$2
+  printf '%s' "$secs"
+}
+
+# The record that a stated wait's expiry has been surfaced:
+# state/.pause-expiry-<task-key> holds the status-file mtime of the declaration
+# whose expiry a supervisor surfaced. Keyed by task and shared by the watcher and
+# the away-mode daemon, so whichever is triaging surfaces each declaration's
+# expiry once between them. It is never cleared by pane bookkeeping, because
+# identity does that job: any later status line rewrites the file, so a
+# re-declaration earns its own expiry and a stale record matches nothing.
+# Teardown retires it with the task (bin/fm-wake-lib.sh).
+pause_expiry_path() {  # <state> <task>
+  printf '%s/.pause-expiry-%s' "$1" "$(printf '%s' "$2" | tr ':/.' '___')"
+}
+pause_expiry_reported() {  # <state> <task> <declaration-mtime>
+  [ -n "$3" ] && [ "$(cat "$(pause_expiry_path "$1" "$2")" 2>/dev/null || true)" = "$3" ]
+}
+pause_expiry_record() {  # <state> <task> <declaration-mtime>
+  printf '%s' "$3" > "$(pause_expiry_path "$1" "$2")"
 }
 
 # --- durable keyed decisions ------------------------------------------------
@@ -1113,6 +1234,27 @@ crew_absorb_class() {  # <id>
     case "$src" in run-step|pane) printf 'working'; return ;; esac
   fi
   printf 'none'
+}
+
+# 0 when crew <id>'s authoritative current state is an active no-mistakes step the
+# pipeline itself still reports live, and that step has been active for less than
+# <cap> seconds. This is the stated wait duration for a crew that never declared
+# one: an idle pane waiting on its own pipeline is not a wedge while the pipeline's
+# step keeps reporting activity, and stops being covered the moment that step goes
+# quiet, parks at a gate, finishes, or outlives the cap. bin/fm-crew-state.sh owns
+# the "step <name> active <secs>s (live|quiet)" detail this reads; no such detail
+# (a coarse run read, an older no-mistakes, an unparseable step) is no evidence.
+# NOT a pure read, like crew_absorb_class: callers run it only when a wedge timer
+# is already due, never every poll.
+crew_pipeline_step_live() {  # <id> <cap-secs>
+  local line src re='step [^ ]+ active ([0-9]+)s \(live\)'
+  [ -n "$1" ] || return 1
+  line=$("$FM_CREW_STATE_BIN" "$1" 2>/dev/null) || return 1
+  case "$line" in "state: working "*) ;; *) return 1 ;; esac
+  src=${line#*source: }; src=${src%% *}
+  [ "$src" = run-step ] || return 1
+  [[ $line =~ $re ]] || return 1
+  [ "${BASH_REMATCH[1]}" -lt "$2" ]
 }
 
 # 0 if crew <id> shows POSITIVE evidence it is still working (crew_absorb_class

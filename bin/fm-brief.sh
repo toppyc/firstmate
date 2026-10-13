@@ -50,12 +50,16 @@
 # "blocked:": pause for a wait expected to clear without firstmate acting,
 # blocked when firstmate must act.
 # Crewmate ship and scout briefs also tell the worker that the watcher reads only
-# the verb: working:, however long the sentence, leaves an idle pane on the
-# ~4-minute wedge check (fm-watch.sh STALE_ESCALATE_SECS). So any wait of more than
-# about four minutes that the worker ends its turn on - its own test run, a
-# pipeline gate, CI, a long build - is declared with the verb ("<verb>: <what>,
-# duration unknown"), declared again after any later line such as a gate answer's
-# resolved line (which ends the pause), and resolved when the wait ends.
+# the verb and its [for=] duration tag: working:, however long the sentence, leaves
+# an idle pane on the ~4-minute wedge check (fm-watch.sh STALE_ESCALATE_SECS). So
+# any wait of more than about four minutes that the worker ends its turn on - its
+# own test run, a pipeline gate, CI, a long build - is declared with the verb and a
+# stated duration ("<verb> [for=30m]: <what>", grammar owned by fm-classify-lib.sh
+# "stated wait durations": integer h/m/s groups such as 45m, 90m or 1h30m, a
+# fraction truncated down so 1.5h counts as one hour, an unparseable tag ignored
+# and the pause left without a duration), declared again after any later line such as a gate
+# answer's resolved line (which ends the pause) or before a longer wait outlives
+# the hour a stated duration is honoured for, and resolved when the wait ends.
 # The secondmate charter keeps its narrower external-wait wording: the watcher
 # never wedge-checks a secondmate pane, and every secondmate status line wakes the
 # parent.
@@ -357,18 +361,24 @@ The report is the only thing that survives, so anything worth keeping must be in
    Each append wakes firstmate, so report sparingly: only phase changes a supervisor
    would act on and the needs-decision/blocked/$PAUSED_VERB/done/failed states. No step-by-step
    FYI progress lines; firstmate reads your pane for that.
-   Use \`$PAUSED_VERB: {why}\` - distinct from \`blocked:\` - whenever you end your turn and wait on
+   Use \`$PAUSED_VERB [for=<duration>]: {why}\` - distinct from \`blocked:\` - whenever you end your turn and wait on
    something for longer than about four minutes: your own test run, CI, a long build, or an
    external wait such as an upstream release or a rate-limit reset.
-   Firstmate's watcher reads only the verb of your last status line: a declared pause moves your
-   idle pane onto a long recheck cadence, while any other verb leaves it on the wedge check, which
+   Firstmate's watcher reads only the verb of your last status line and its \`[for=]\` tag: a pause
+   with a duration keeps your idle pane quiet for exactly that long, an hour at most, and surfaces
+   it once when the time runs out, while any other verb leaves it on the wedge check, which
    escalates an idle pane within about four minutes. \`working:\` is for a phase change a supervisor
    should see; it does NOT quiet the wedge check, however long the sentence or its time estimate.
    Use \`blocked:\` when you are stuck and need help.
-   Declare a wait the moment it starts: append a line shaped like \`$PAUSED_VERB: integration tests running, duration unknown\`,
+   Declare a wait the moment it starts, with an honest upper estimate:
+   append a line shaped like \`$PAUSED_VERB [for=30m]: integration tests running\`,
    then \`resolved: {what finished}\` when it ends, so a quiet pane never reads as a wedge.
+   Write the duration as integer h, m or s groups such as \`45m\`, \`90m\` or \`1h30m\`.
+   A fraction is truncated down, so \`1.5h\` counts as one hour - write \`90m\` instead.
+   An unparseable tag is ignored, leaving the pause without a duration.
+   For a wait longer than an hour, append the \`$PAUSED_VERB [for=...]:\` line again before the hour is up.
    A \`resolved\` line does not quiet the wedge check either, and any later line ends a pause:
-   after a decision is answered and you go back to waiting, append the \`$PAUSED_VERB:\` line again.
+   after a decision is answered and you go back to waiting, append the \`$PAUSED_VERB [for=...]:\` line again.
 5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.
 6. If a decision belongs to a human (product choices, destructive actions),
    append \`needs-decision: {summary of options}\` and stop. Firstmate will reply with the decision.
@@ -509,18 +519,24 @@ $RULE1
    firstmate reads your pane for that.
    A mid-task \`working:\` line (including setup complete) is nonterminal: do not end the
    turn after it; continue the same stage until a defined \`done:\` gate under Definition of done.
-   Use \`$PAUSED_VERB: {why}\` - distinct from \`blocked:\` - whenever you end your turn and wait on
+   Use \`$PAUSED_VERB [for=<duration>]: {why}\` - distinct from \`blocked:\` - whenever you end your turn and wait on
    something for longer than about four minutes: your own test run, a pipeline run to its next
    gate, CI, a long build, or an external wait such as an upstream release or a rate-limit reset.
-   Firstmate's watcher reads only the verb of your last status line: a declared pause moves your
-   idle pane onto a long recheck cadence, while any other verb leaves it on the wedge check, which
+   Firstmate's watcher reads only the verb of your last status line and its \`[for=]\` tag: a pause
+   with a duration keeps your idle pane quiet for exactly that long, an hour at most, and surfaces
+   it once when the time runs out, while any other verb leaves it on the wedge check, which
    escalates an idle pane within about four minutes. \`working:\` is for a phase change a supervisor
    should see; it does NOT quiet the wedge check, however long the sentence or its time estimate.
    Use \`blocked:\` when you are stuck and need help.
-   Declare a wait the moment it starts: append a line shaped like \`$PAUSED_VERB: integration tests running, duration unknown\`,
+   Declare a wait the moment it starts, with an honest upper estimate:
+   append a line shaped like \`$PAUSED_VERB [for=30m]: integration tests running\`,
    then \`resolved: {what finished}\` when it ends, so a quiet pane never reads as a wedge.
+   Write the duration as integer h, m or s groups such as \`45m\`, \`90m\` or \`1h30m\`.
+   A fraction is truncated down, so \`1.5h\` counts as one hour - write \`90m\` instead.
+   An unparseable tag is ignored, leaving the pause without a duration.
+   For a wait longer than an hour, append the \`$PAUSED_VERB [for=...]:\` line again before the hour is up.
    A \`resolved\` line does not quiet the wedge check either, and any later line ends a pause:
-   after answering a gate and going back to waiting, append the \`$PAUSED_VERB:\` line again.
+   after answering a gate and going back to waiting, append the \`$PAUSED_VERB [for=...]:\` line again.
 5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.
 6. If a decision belongs above the implementation worker (product choices, destructive actions, ask-user findings),
    append \`needs-decision: {summary of options}\` and stop. Firstmate will apply the configured authority and reply with the decision.
