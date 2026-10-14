@@ -304,3 +304,41 @@ assert_absent() {
 assert_present() {
   [ -e "$1" ] || fail "$2"
 }
+
+# --- waiting on the observable ----------------------------------------------
+#
+# A fixed sleep bets that a loaded runner schedules the process under test in
+# time, and on a saturated CI runner that bet occasionally loses. Wait instead
+# on the thing an assertion actually depends on - a file appearing, a marker
+# written, a process gone - so a wait returns as soon as its condition holds.
+
+# wait_until <command...>: run <command> until it succeeds, nonzero only if the
+# condition never held. It counts polls rather than reading the wall clock, so
+# its ceiling is at least 20s of running time, a suspend spends none, and a
+# starved runner whose every poll stretches still gets the full budget. The
+# ceiling only bounds how long a genuine failure takes to report: across 1235
+# waits in tests/fm-procevent.test.sh on macOS and Linux under twofold to
+# tenfold CPU oversubscription, with the tests at normal or lowest priority, no
+# checked wait used more than 135 of its 1000 polls; on a quiet machine the
+# slowest took 0.6s.
+wait_until() {
+  local polls=0
+  until "$@"; do
+    [ "$polls" -lt 1000 ] || return 1
+    polls=$((polls + 1))
+    sleep 0.02
+  done
+}
+
+# pid_gone <pid>: true once <pid> no longer exists.
+pid_gone() {
+  ! kill -0 "$1" 2>/dev/null
+}
+
+# quiet_window: negative assertions only - a short window in which a regression
+# (an escaped lock, an early publication) would have to show itself. It can miss
+# a slow regression but can never fail a correct build, so it is not a readiness
+# guess; anything a passing assertion depends on uses wait_until instead.
+quiet_window() {
+  sleep 0.3
+}
