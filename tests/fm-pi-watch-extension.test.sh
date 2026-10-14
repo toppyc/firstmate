@@ -122,21 +122,8 @@ expect_fixture_exit() {
   [ "$1" = 0 ] || fail "$3: expected exit 0, got $1"$'\n'"--- output ---"$'\n'"$2"
 }
 
-# wait_until <command...>: the shell twin of waitUntil, nonzero only if the
-# condition never held. It counts polls rather than reading the wall clock, so
-# its ceiling is at least the same 20s of running time and a suspend spends none.
-wait_until() {
-  local polls=0
-  until "$@"; do
-    [ "$polls" -lt 1000 ] || return 1
-    polls=$((polls + 1))
-    sleep 0.02
-  done
-}
-
-pid_gone() {
-  ! kill -0 "$1" 2>/dev/null
-}
+# The shell twins of waitUntil and pidGone, wait_until and pid_gone, come from
+# tests/lib.sh with the same 20s ceiling.
 
 install_pi_watch_extension_fixture() {
   local repo=$1
