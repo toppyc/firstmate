@@ -52,8 +52,12 @@ pe_register() {  # <home> <adapter> <source-id> -- <argv>...
 procevent_teardown() {
   local entry home seen=$'\n'
   # A failure while a lock-holding helper is active would otherwise deadlock
-  # the sweep below against a holder that waits for this suite to exit.
-  [ -z "${HOLDER_PID:-}" ] || kill "$HOLDER_PID" 2>/dev/null || true
+  # the sweep below against a holder that waits for this suite to exit. Only a
+  # helper still running as this shell's job is signaled: one already waited
+  # for has released its pid, which an unrelated process may since reuse.
+  case " $(jobs -pr | tr '\n' ' ') " in
+    *" ${HOLDER_PID:-none} "*) kill "$HOLDER_PID" 2>/dev/null || true ;;
+  esac
   for entry in ${PE_TRACKED[@]+"${PE_TRACKED[@]}"}; do
     home=${entry%%|*}
     case "$seen" in
