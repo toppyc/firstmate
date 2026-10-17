@@ -1213,12 +1213,19 @@ signal_reason_is_actionable() {  # <file> ...
 #             pane; the crew is legitimately mid-work on a static-looking pane
 #             (e.g. waiting on CI);
 #   paused  - the crew's authoritative current state is a declared external-wait
-#             pause (paused:), which is EXPECTED to idle;
+#             pause (paused:), which is EXPECTED to idle; or its validation run
+#             has PASSED (done from the run step) and the last status line is a
+#             declared paused: wait;
 #   none    - neither, so the wake must surface (a stopped/finished/parked/failed/
 #             torn-down/unknown crew, or an unreadable verdict).
 # One fm-crew-state.sh read serves BOTH absorb reasons at once. Reading the state
 # authoritatively (not the status log) is what keeps run-step precedence: a crew
 # that appended paused: but then STARTED a run reports working, never paused.
+# That precedence covers only a run that still has something to report. A passed
+# run is terminal, so a declared pause on top of it is the crew's own account of
+# a deliberate post-run hold, and only the paused: verb earns it: a finished crew
+# with any other last line, or a failed or parked run, still classes none. The
+# stated-duration bound and its expiry surface still apply (pause_state_class).
 # NOT a pure read: fm-crew-state.sh may make a bounded no-mistakes call, so callers
 # run it only on no-verb signal and first-sighting stale paths, never every wake.
 # FM_CREW_STATE_BIN lets tests stub the verdict.
@@ -1229,9 +1236,13 @@ crew_absorb_class() {  # <id>
   case "$line" in state:*) ;; *) printf 'none'; return ;; esac
   state=${line#state: }; state=${state%% *}
   if [ "$state" = paused ]; then printf 'paused'; return; fi
+  src=${line#*source: }; src=${src%% *}
   if [ "$state" = working ]; then
-    src=${line#*source: }; src=${src%% *}
     case "$src" in run-step|pane) printf 'working'; return ;; esac
+  fi
+  if [ "$state" = "done" ] && [ "$src" = run-step ] \
+    && status_is_paused "$(last_status_line "${STATE:-${FM_STATE_OVERRIDE:-}}/$id.status")"; then
+    printf 'paused'; return
   fi
   printf 'none'
 }
@@ -1268,7 +1279,7 @@ crew_is_provably_working() {  # <id>
   [ "$(crew_absorb_class "$1")" = working ]
 }
 
-# 0 if crew <id>'s authoritative current state is a declared external-wait pause.
+# 0 if crew <id> classes paused (crew_absorb_class): a declared external-wait pause.
 # The stale path absorbs such a crew (on a long re-surface cadence) instead of
 # escalating a possible wedge.
 crew_is_paused() {  # <id>

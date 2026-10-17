@@ -482,9 +482,10 @@ clear_pause_tracking() {  # <window>
 # for that long rather than the whole window, and is honoured for a LIVE agent
 # too: the worker has said how long its pane will sit idle, which a bare pause
 # never did, so a live worker's stated wait is absorbed instead of surfaced. The
-# crew state must still read working or paused, so a run that parks at a gate or
-# finishes under the declaration surfaces exactly as before. Once the stated wait
-# runs out it stays absorbed only until handle_paused_stale has surfaced its expiry,
+# crew must still class working or paused (crew_absorb_class), so a run that parks
+# at a gate or fails under the declaration surfaces exactly as before, while a
+# passed run whose last status line is the declaration classes paused. Once the
+# stated wait runs out it stays absorbed only until handle_paused_stale has surfaced its expiry,
 # after which the pane falls through to the undeclared handling below.
 pause_state_class() {  # <window> <task>
   local win=$1 task=$2 key last recheck_file class='' agent_alive declared_age window

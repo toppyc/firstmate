@@ -334,6 +334,39 @@ test_crew_absorb_class_classifier() {
   pass "crew_absorb_class: working/paused/none from one read; crew_is_paused and crew_is_provably_working agree"
 }
 
+# A passed run is terminal, so it no longer outranks a declared pause the way an
+# active run does: a finished crew whose last status line is paused: is classed
+# paused. Only that verb earns it, only a run-step done carries it, and an active
+# run still outranks a pause declared before it started.
+test_crew_absorb_class_terminal_run_yields_to_declared_pause() {
+  local dir state fakebin
+  dir=$(make_case absorb-terminal-pause); state="$dir/state"; fakebin="$dir/fakebin"
+  export FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STATE_OVERRIDE="$state"
+  export FM_FAKE_CREW_STATE
+  printf 'done: PR https://example.test/pr/1 checks green\npaused [key=hold] [for=1h]: held pending the captain\n' > "$state/a.status"
+  FM_FAKE_CREW_STATE='state: done · source: run-step · checks green: PR ready for review (still monitoring for merge/close)'
+  [ "$(crew_absorb_class a)" = paused ] || fail "a passed run with a declared pause was not classed paused"
+  ! crew_is_provably_working a || fail "a held finished crew was treated as provably working"
+  FM_FAKE_CREW_STATE='state: done · source: run-step · run passed; PR state not read'
+  [ "$(crew_absorb_class a)" = paused ] || fail "a passed run with an unread PR and a declared pause was not classed paused"
+  FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+  [ "$(crew_absorb_class a)" = working ] || fail "an active run started after a declared pause was not classed working"
+  FM_FAKE_CREW_STATE='state: parked · source: run-step · parked at review: 1 finding(s)'
+  [ "$(crew_absorb_class a)" = none ] || fail "a parked run under a declared pause was classed absorbable"
+  FM_FAKE_CREW_STATE='state: failed · source: run-step · run failed'
+  [ "$(crew_absorb_class a)" = none ] || fail "a failed run under a declared pause was classed absorbable"
+  FM_FAKE_CREW_STATE='state: done · source: run-step · checks green: PR ready for review'
+  for last in 'done: PR https://example.test/pr/1 checks green' 'blocked: need firstmate' \
+    'working: tidying up' 'resolved [key=hold]: captain ruled' 'captain-held [key=hold]: tracked by task-hold'; do
+    printf 'paused [for=1h]: earlier wait\n%s\n' "$last" > "$state/a.status"
+    [ "$(crew_absorb_class a)" = none ] || fail "a passed run whose last line is '$last' was classed absorbable"
+  done
+  rm -f "$state/a.status"
+  [ "$(crew_absorb_class a)" = none ] || fail "a passed run with no status log was classed absorbable"
+  unset FM_FAKE_CREW_STATE FM_STATE_OVERRIDE
+  pass "crew_absorb_class: a passed run yields to a declared paused: line only; active runs and every other verb are unchanged"
+}
+
 # signal_crew_provably_working: a no-verb "signal:" wake is benign ONLY when EVERY
 # task it references is provably working; if any crew has stopped, or no task can be
 # resolved, it surfaces. Files map to ids by stripping .status / .turn-ended.
@@ -1602,6 +1635,76 @@ test_current_stated_wait_does_not_hide_a_parked_or_unreadable_crew() {
   pass "a current stated wait never hides a parked or unreadable crew"
 }
 
+# A crew whose validation run has PASSED and which then declares a deliberate hold
+# (a green PR held for a captain ruling) is absorbed for the stated duration rather
+# than surfaced as stale every few minutes, across a moving pane, and once that
+# duration runs out it surfaces exactly once, as the expired declaration it is.
+test_held_finished_crew_stated_wait_is_absorbed_then_surfaces_on_expiry() {
+  local dir state fakebin out capture_file window key pid i verdict
+  verdict='state: done · source: run-step · checks green: PR ready for review (still monitoring for merge/close)'
+  dir=$(make_case held-finished-live); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; window="test:fm-held-finished"
+  printf 'idle, PR green and held for the captain\n' > "$capture_file"
+  key=$(seed_live_declared_pane "$state" held-finished "$window" "$capture_file" \
+    "$(printf 'done: PR https://example.test/pr/1 checks green\npaused [key=hold] [for=1h]: held pending the captain')" 120)
+  : > "$out"
+  declared_watch_bg "$state" "$fakebin" "$window" "$capture_file" "$out" \
+    FM_FAKE_CREW_STATE="$verdict" FM_STALE_ESCALATE_SECS=1 FM_PAUSE_RESURFACE_SECS=3600
+  pid=$!
+  i=0
+  while [ "$i" -lt 30 ]; do
+    i=$((i + 1))
+    [ "$i" -le 15 ] && printf 'idle, PR green and held for the captain, tick %s\n' "$i" > "$capture_file"
+    sleep 0.15
+    kill -0 "$pid" 2>/dev/null \
+      || { reap "$pid"; fail "a held finished crew's current 1h declaration surfaced: $(cat "$out")"; }
+  done
+  [ -e "$state/.paused-$key" ] || { reap "$pid"; fail "a held finished crew was not absorbed on the pause cadence"; }
+  [ ! -e "$state/.stale-since-$key" ] || { reap "$pid"; fail "a held finished crew started the wedge timer"; }
+  reap "$pid"
+  [ ! -s "$out" ] || fail "a held finished crew printed a wake: $(cat "$out")"
+  [ ! -s "$state/.wake-queue" ] || fail "a held finished crew queued a wake"
+
+  dir=$(make_case held-finished-expiry); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  printf 'idle, PR green and held for the captain\n' > "$capture_file"
+  seed_live_declared_pane "$state" held-finished "$window" "$capture_file" \
+    "$(printf 'done: PR https://example.test/pr/1 checks green\npaused [for=2m]: held pending the captain')" 200 >/dev/null
+  : > "$out"
+  declared_watch_bg "$state" "$fakebin" "$window" "$capture_file" "$out" \
+    FM_FAKE_CREW_STATE="$verdict" FM_STALE_ESCALATE_SECS=1 FM_PAUSE_RESURFACE_SECS=3600
+  pid=$!
+  wait_for_exit "$pid" 40 || { reap "$pid"; fail "an expired hold over a passed run never surfaced"; }
+  grep -F "declared wait of 120s has run out" "$out" >/dev/null \
+    || fail "an expired hold over a passed run did not surface as an expired declaration: $(cat "$out")"
+  pass "a held finished crew is absorbed for its stated duration and surfaces once when it runs out"
+}
+
+# The disconfirming half: a passed run quiets nothing by itself. A finished crew
+# whose last line is not a declared pause - silently idle after a working: note,
+# blocked on firstmate, or reporting done - still surfaces at first sight.
+test_finished_crew_without_a_declared_pause_still_surfaces() {
+  local dir state fakebin out capture_file window last pid n=0
+  for last in 'working: tidying up after the run' 'blocked: need firstmate to rebase' \
+    'done: PR https://example.test/pr/1 checks green'; do
+    n=$((n + 1))
+    dir=$(make_case "finished-undeclared-$n"); state="$dir/state"; fakebin="$dir/fakebin"
+    out="$dir/watch.out"; capture_file="$dir/pane.txt"; window="test:fm-finished-undeclared"
+    printf 'idle after a passed run\n' > "$capture_file"
+    seed_live_declared_pane "$state" finished-undeclared "$window" "$capture_file" \
+      "$(printf 'paused [for=1h]: earlier wait\n%s' "$last")" 60 >/dev/null
+    : > "$out"
+    declared_watch_bg "$state" "$fakebin" "$window" "$capture_file" "$out" \
+      FM_FAKE_CREW_STATE='state: done · source: run-step · checks green: PR ready for review' \
+      FM_STALE_ESCALATE_SECS=240 FM_PAUSE_RESURFACE_SECS=3600
+    pid=$!
+    wait_for_exit "$pid" 40 || { reap "$pid"; fail "a passed run whose last line is '$last' was absorbed"; }
+    grep -Fx "stale: $window" "$out" >/dev/null \
+      || fail "a passed run whose last line is '$last' did not surface as stale: $(cat "$out")"
+  done
+  pass "a passed run with no declared pause still surfaces, whether idle, blocked, or done"
+}
+
 # Proof the check still bites on expiry, and only once per declaration: past its
 # stated duration the live worker surfaces once, worded as an expired declaration;
 # re-arming over the same declaration stays quiet; a fresh declaration earns its
@@ -2637,6 +2740,7 @@ test_classifier_primitives
 test_crew_is_provably_working_classifier
 test_status_is_paused_classifier
 test_crew_absorb_class_classifier
+test_crew_absorb_class_terminal_run_yields_to_declared_pause
 test_signal_crew_provably_working_classifier
 test_secondmate_status_signal_never_absorbed_classifier
 test_provably_working_signal_absorbed
@@ -2679,6 +2783,8 @@ test_stated_duration_90m_is_honoured_exactly
 test_fractional_stated_duration_truncates_down_1_5h_is_3600s
 test_unparseable_stated_duration_falls_back_to_undeclared_handling
 test_current_stated_wait_does_not_hide_a_parked_or_unreadable_crew
+test_held_finished_crew_stated_wait_is_absorbed_then_surfaces_on_expiry
+test_finished_crew_without_a_declared_pause_still_surfaces
 test_stated_wait_surfaces_once_on_expiry_per_declaration
 test_expired_stated_wait_over_a_running_pipeline_resumes_the_wedge_check
 test_live_pipeline_step_rearms_the_wedge_timer_until_it_stops_accounting
